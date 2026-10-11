@@ -114,18 +114,21 @@ k2.metric("Median rent", f"RM {f.price_rm.median():,.0f}" if len(f) else "–")
 k3.metric("Median RM psf", f"{f.psf_rm.median():.2f}" if f.psf_rm.notna().any() else "–")
 k4.metric("New in last 7 days", f"{(f.first_seen >= datetime.now(timezone.utc) - timedelta(days=7)).sum():,}")
 
-COLS = {"title": "Property", "price_rm": "Rent (RM)", "psf_rm": "RM psf", "floor_area_sqft": "Sqft",
+# Clickable property name: the name rides in the URL fragment and display_text shows it
+f = f.assign(property_link=f.url.fillna("") + "#" + f.title.fillna("Listing"))
+COLS = {"property_link": "Property", "price_rm": "Rent (RM)", "psf_rm": "RM psf", "floor_area_sqft": "Sqft",
         "bedrooms": "Beds", "bathrooms": "Baths", "property_type": "Type", "furnishing": "Furnishing",
         "district": "District", "area": "Area", "nearest_station": "Nearest station",
-        "posted_on": "Posted", "agent_name": "Agent", "url": "Link"}
-LINK = {"Link": st.column_config.LinkColumn("Link", display_text="Open")}
+        "posted_on": "Posted", "agent_name": "Agent"}
+LINK = {"Property": st.column_config.LinkColumn("Property", display_text=r"^[^#]*#(.*)$")}
 
 tab_list, tab_map, tab_drops, tab_district = st.tabs(["Listings", "Map", "Price changes", "By district"])
 
 with tab_list:
     st.dataframe(f.sort_values("price_rm")[list(COLS)].rename(columns=COLS),
                  column_config=LINK, hide_index=True, width="stretch", height=600)
-    st.download_button("Download CSV", f.to_csv(index=False).encode("utf-8-sig"), "listings.csv", "text/csv")
+    st.download_button("Download CSV", f.drop(columns="property_link").to_csv(index=False).encode("utf-8-sig"),
+                       "listings.csv", "text/csv")
 
 with tab_map:
     pts = f.dropna(subset=["latitude", "longitude"])
@@ -139,9 +142,9 @@ with tab_drops:
     else:
         ch["change_rm"] = ch.price_rm - ch.previous_price_rm
         ch["change_pct"] = (ch.change_rm / ch.previous_price_rm * 100).round(1)
-        show = {"title": "Property", "previous_price_rm": "Was (RM)", "price_rm": "Now (RM)",
+        show = {"property_link": "Property", "previous_price_rm": "Was (RM)", "price_rm": "Now (RM)",
                 "change_rm": "Change (RM)", "change_pct": "Change %", "price_changed_at": "Changed on",
-                "district": "District", "url": "Link"}
+                "district": "District"}
         st.dataframe(ch.sort_values("change_pct")[list(show)].rename(columns=show),
                      column_config=LINK, hide_index=True, width="stretch")
 
