@@ -1,0 +1,13 @@
+# Secrets - never commit
+.env
+.streamlit/secrets.toml
+
+# Local environment / browser profile
+.venv/
+.chrome-profile/
+__pycache__/
+
+# Scraped output and logs
+data/
+debug/
+logs/
