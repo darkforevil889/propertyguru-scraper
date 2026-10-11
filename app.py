@@ -1,4 +1,4 @@
-﻿"""Streamlit dashboard for scraped listings. Run: streamlit run app.py"""
+"""Streamlit dashboard for scraped listings. Run: streamlit run app.py"""
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,12 +12,12 @@ load_dotenv(Path(__file__).parent / ".env")
 SUPABASE_URL = os.environ.get("SUPABASE_URL") or st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = os.environ.get("SUPABASE_PUBLISHABLE_KEY") or st.secrets["SUPABASE_PUBLISHABLE_KEY"]
 
-st.set_page_config(page_title="KL Rental Tracker", page_icon="🏙️", layout="wide")
+st.set_page_config(page_title="KL Tracker", page_icon="🏙️", layout="wide")
 
 
 # ---------- login ----------
 def login_screen():
-    st.title("KL Rental Tracker")
+    st.title("KL Tracker")
     with st.form("login"):
         email = st.text_input("Email")
         password = st.text_input("Password", type="password")
@@ -107,7 +107,7 @@ if text:
     f = f[f.title.str.contains(text, case=False, na=False) | f.address.str.contains(text, case=False, na=False)]
 
 # ---------- page ----------
-st.title("KL Rental Tracker")
+st.title("KL Tracker")
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Listings", f"{len(f):,}")
 k2.metric("Median rent", f"RM {f.price_rm.median():,.0f}" if len(f) else "–")
