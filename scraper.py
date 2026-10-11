@@ -209,6 +209,7 @@ def main():
     db = create_client(os.environ["SUPABASE_URL"], secret)
 
     listings, new_count, details_done, details_failed, pages_failed = {}, 0, 0, 0, 0
+    blocked_streak = 0
     with sync_playwright() as p:
         browser = Browser(p)
         for search_key, search_url in SEARCHES.items():
@@ -238,15 +239,22 @@ def main():
                 for row in queued:
                     if args.no_details or (args.max_details and details_done >= args.max_details):
                         break
+                    if blocked_streak >= 3:  # listing pages keep getting blocked - don't waste hours retrying
+                        if not args.no_details:
+                            print("    3 listing pages blocked in a row - skipping listing pages for the rest of this run")
+                        args.no_details = True
+                        break
                     try:
                         detail = parse_detail(browser.data(row["url"]))
                         detail["details_scraped_at"] = datetime.now(timezone.utc).isoformat()
                         db.table("listings").update(detail).eq("listing_id", row["listing_id"]).execute()
                         row.update(detail)
                         details_done += 1
+                        blocked_streak = 0
                         print(f"    detail: {row['title']} ({row.get('furnishing') or 'furnishing n/a'})")
                     except Exception as e:
                         details_failed += 1
+                        blocked_streak += 1
                         print(f"    detail FAILED {row['url']}: {str(e).splitlines()[0]}")
                     polite_pause()
                 n += 1

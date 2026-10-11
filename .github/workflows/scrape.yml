@@ -11,6 +11,10 @@ on:
       max_details:
         description: "Max listing pages to open this run (0 = no limit)"
         default: "1500"
+      details:
+        description: "Open listing pages too? (Cloudflare blocks these on GitHub's servers)"
+        type: boolean
+        default: false
 
 concurrency:
   group: scrape        # never run two scrapes at once
@@ -45,6 +49,7 @@ jobs:
           python scraper.py
           --pages ${{ inputs.pages || '0' }}
           --max-details ${{ inputs.max_details || '1500' }}
+          ${{ inputs.details != true && '--no-details' || '' }}
 
       - name: Save screenshots of failed pages
         if: always()
