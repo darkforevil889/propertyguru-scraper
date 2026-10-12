@@ -49,6 +49,7 @@ jobs:
           python scraper.py
           --pages ${{ inputs.pages || '0' }}
           --max-details ${{ inputs.max_details || '1500' }}
+          --challenge-wait 30
           ${{ inputs.details != true && '--no-details' || '' }}
 
       - name: Save screenshots of failed pages

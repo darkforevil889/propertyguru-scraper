@@ -38,6 +38,59 @@ if "client" not in st.session_state:
 
 db = st.session_state.client
 
+with st.sidebar:
+    st.caption(f"Logged in as {st.session_state.email}")
+    if st.button("Log out"):
+        db.auth.sign_out()
+        del st.session_state["client"]
+        st.rerun()
+    tool = st.radio("Page", ["Listings", "Phone filter"], horizontal=True)
+
+
+# ---------- phone filter ----------
+def phone_filter_page():
+    from phone_filter import filter_file
+
+    st.title("Phone filter")
+    st.caption("Upload an Excel or CSV file. Every cell on every sheet is scanned; only Malaysian mobile numbers "
+               "are kept, cleaned to 0XXXXXXXXX, with duplicates removed. Nothing is saved.")
+    up = st.file_uploader("Excel / CSV file", type=["xlsx", "xls", "csv"])
+    if not up:
+        with st.expander("What gets kept and removed"):
+            st.markdown(
+                "- **Kept:** mobile numbers 010, 011, 012, 013, 014, 016, 017, 018, 019\n"
+                "- **Fixed:** `60123456789` / `+60 12-345 6789` → `0123456789`; "
+                "`123456789` (Excel dropped the 0) → `0123456789`\n"
+                "- **Removed:** landlines (`03 3783737`, `33838383`), 015 internet/VoIP numbers, "
+                "foreign numbers (`+65…`, `+1…`), incomplete numbers, duplicates")
+        return
+    try:
+        numbers, rejected, dupes = filter_file(up.name, up.getvalue())
+    except Exception as e:
+        st.error(f"Couldn't read this file: {e}")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Mobile numbers kept", f"{len(numbers):,}")
+    c2.metric("Duplicates removed", f"{dupes:,}")
+    c3.metric("Other numbers removed", f"{len(rejected):,}")
+
+    txt_name = Path(up.name).stem + ".txt"
+    st.download_button(f"Download {txt_name}", "\r\n".join(numbers).encode("utf-8"), txt_name, "text/plain",
+                       type="primary", disabled=not numbers)
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Kept")
+        st.dataframe(pd.DataFrame({"Number": numbers}), hide_index=True, height=400)
+    with right:
+        st.subheader("Removed")
+        st.dataframe(pd.DataFrame(rejected, columns=["Found in file", "Reason"]), hide_index=True, height=400)
+
+
+if tool == "Phone filter":
+    phone_filter_page()
+    st.stop()
+
 
 # ---------- data ----------
 @st.cache_data(ttl=600, show_spinner="Loading listings…")
@@ -67,11 +120,6 @@ def load_listings(_db):
 df = load_listings(db)
 
 with st.sidebar:
-    st.caption(f"Logged in as {st.session_state.email}")
-    if st.button("Log out"):
-        db.auth.sign_out()
-        del st.session_state["client"]
-        st.rerun()
     if st.button("Refresh data"):
         load_listings.clear()
         st.rerun()

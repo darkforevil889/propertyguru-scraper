@@ -35,12 +35,15 @@ def polite_pause(lo=3.0, hi=8.0):
     time.sleep(random.uniform(lo, hi))
 
 
+CHALLENGE_WAIT = 120  # seconds; set by --challenge-wait
+
+
 def load_next_data(page, url):
     """Navigate and return the page's __NEXT_DATA__ JSON, waiting out any Cloudflare check."""
     resp = page.goto(url, wait_until="domcontentloaded", timeout=60000)
     status = resp.status if resp else None
-    # Up to ~2 minutes: if a challenge appears you can solve it in the open Chrome window
-    for _ in range(120):
+    # If a challenge appears on your PC you can solve it in the open Chrome window meanwhile
+    for _ in range(CHALLENGE_WAIT):
         if page.locator("#__NEXT_DATA__").count():
             return json.loads(page.locator("#__NEXT_DATA__").inner_text())["props"]["pageProps"]["pageData"]["data"]
         page.wait_for_timeout(1000)
@@ -200,7 +203,11 @@ def main():
     ap.add_argument("--no-details", action="store_true", help="skip opening individual listing pages")
     ap.add_argument("--max-details", type=int, default=0, help="max listing pages to open this run (0 = no limit)")
     ap.add_argument("--csv", action="store_true", help="also save a CSV copy of this run in data/")
+    ap.add_argument("--challenge-wait", type=int, default=120,
+                    help="seconds to wait on a Cloudflare check before giving up on a page")
     args = ap.parse_args()
+    global CHALLENGE_WAIT
+    CHALLENGE_WAIT = args.challenge_wait
 
     load_dotenv(ROOT / ".env")
     secret = os.environ.get("SUPABASE_SECRET_KEY")
@@ -210,20 +217,26 @@ def main():
 
     listings, new_count, details_done, details_failed, pages_failed = {}, 0, 0, 0, 0
     blocked_streak = 0
+    stopped_early = False
     with sync_playwright() as p:
         browser = Browser(p)
         for search_key, search_url in SEARCHES.items():
-            total_pages, n = None, 1
+            total_pages, n, page_blocked_streak = None, 1, 0
             while (not args.pages or n <= args.pages) and (total_pages is None or n <= total_pages):
                 try:
                     data = browser.data(search_url.format(page=n))
                 except Exception as e:
                     pages_failed += 1
                     print(f"[{search_key}] page {n} SKIPPED: {str(e).splitlines()[0]}")
-                    if total_pages is None:  # can't even load page 1 - give up on this search
+                    page_blocked_streak += 1
+                    if total_pages is None or page_blocked_streak >= 3:
+                        # Blocked repeatedly: stop instead of burning hours on pages that won't load
+                        print(f"[{search_key}] {page_blocked_streak} search pages blocked in a row - stopping early")
+                        stopped_early = True
                         break
                     n += 1
                     continue
+                page_blocked_streak = 0
                 total_pages = (data.get("paginationData") or {}).get("totalPages") or 1
                 rows = {r["listing_id"]: r for r in map(parse_card, data.get("listingsData") or []) if r}
                 rows = [r for lid, r in rows.items() if lid not in listings]  # skip repeats across pages
@@ -261,7 +274,8 @@ def main():
         browser.close()
 
     print(f"Done: {len(listings)} listings seen, {new_count} new, {details_done} details saved, "
-          f"{details_failed} details failed, {pages_failed} search pages skipped.")
+          f"{details_failed} details failed, {pages_failed} search pages skipped"
+          f"{' (stopped early: blocked by Cloudflare)' if stopped_early else ''}.")
     rows = list(listings.values())
     if not (args.csv and rows):
         return
