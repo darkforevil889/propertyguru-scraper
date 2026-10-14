@@ -1,4 +1,5 @@
 """Streamlit dashboard for scraped listings. Run: streamlit run app.py"""
+import io
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -52,10 +53,10 @@ def phone_filter_page():
     from phone_filter import filter_file
 
     st.title("Phone filter")
-    st.caption("Upload an Excel or CSV file. Every cell on every sheet is scanned; only Malaysian mobile numbers "
-               "are kept, cleaned to 0XXXXXXXXX, with duplicates removed. Nothing is saved.")
-    up = st.file_uploader("Excel / CSV file", type=["xlsx", "xls", "csv"])
-    if not up:
+    st.caption("Upload one or more Excel or CSV files. Every cell on every sheet is scanned; only Malaysian mobile "
+               "numbers are kept, cleaned to 0XXXXXXXXX, with duplicates removed. Nothing is saved.")
+    uploads = st.file_uploader("Excel / CSV files", type=["xlsx", "xls", "csv"], accept_multiple_files=True)
+    if not uploads:
         with st.expander("What gets kept and removed"):
             st.markdown(
                 "- **Kept:** mobile numbers 010, 011, 012, 013, 014, 016, 017, 018, 019\n"
@@ -64,27 +65,78 @@ def phone_filter_page():
                 "- **Removed:** landlines (`03 3783737`, `33838383`), 015 internet/VoIP numbers, "
                 "foreign numbers (`+65…`, `+1…`), incomplete numbers, duplicates")
         return
-    try:
-        numbers, rejected, dupes = filter_file(up.name, up.getvalue())
-    except Exception as e:
-        st.error(f"Couldn't read this file: {e}")
+    # Process each file on its own (duplicates removed within each file)
+    results, used_names = [], set()
+    for up in uploads:
+        try:
+            numbers, rejected, dupes = filter_file(up.name, up.getvalue())
+        except Exception as e:
+            st.error(f"Couldn't read {up.name}: {e}")
+            continue
+        txt_name, i = Path(up.name).stem + ".txt", 2
+        while txt_name.lower() in used_names:  # two uploads with the same name
+            txt_name, i = f"{Path(up.name).stem} ({i}).txt", i + 1
+        used_names.add(txt_name.lower())
+        results.append({"file": up.name, "txt": txt_name, "numbers": numbers, "rejected": rejected, "dupes": dupes})
+    if not results:
         return
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Mobile numbers kept", f"{len(numbers):,}")
-    c2.metric("Duplicates removed", f"{dupes:,}")
-    c3.metric("Other numbers removed", f"{len(rejected):,}")
+    # Combined list: every file merged, duplicates across files removed too
+    combined, seen, cross_dupes = [], set(), 0
+    for r in results:
+        for n in r["numbers"]:
+            if n in seen:
+                cross_dupes += 1
+            else:
+                seen.add(n)
+                combined.append((n, r["file"]))
+    to_txt = lambda nums: "\r\n".join(nums).encode("utf-8")
 
-    txt_name = Path(up.name).stem + ".txt"
-    st.download_button(f"Download {txt_name}", "\r\n".join(numbers).encode("utf-8"), txt_name, "text/plain",
-                       type="primary", disabled=not numbers)
+    mode = "Separate"
+    if len(results) > 1:
+        mode = st.radio("Download as", ["One combined file", "Separate file for each upload"], horizontal=True)
+        mode = "Combined" if mode.startswith("One") else "Separate"
+
+    c1, c2, c3 = st.columns(3)
+    if mode == "Combined":
+        c1.metric("Mobile numbers kept", f"{len(combined):,}")
+        c2.metric("Duplicates removed", f"{sum(r['dupes'] for r in results) + cross_dupes:,}",
+                  help=f"Includes {cross_dupes:,} numbers that appeared in more than one file")
+    else:
+        c1.metric("Mobile numbers kept", f"{sum(len(r['numbers']) for r in results):,}")
+        c2.metric("Duplicates removed", f"{sum(r['dupes'] for r in results):,}",
+                  help="Duplicates are removed within each file; a number can appear in more than one file")
+    c3.metric("Other numbers removed", f"{sum(len(r['rejected']) for r in results):,}")
+
+    if mode == "Combined":
+        name = st.text_input("Combined file name", f"Combined {datetime.now():%Y-%m-%d}").strip() or "Combined"
+        name = name if name.lower().endswith(".txt") else name + ".txt"
+        st.download_button(f"Download {name} ({len(combined):,} numbers)", to_txt(n for n, _ in combined), name,
+                           "text/plain", type="primary", disabled=not combined, on_click="ignore")
+    else:
+        for r in results:
+            st.download_button(f"Download {r['txt']} ({len(r['numbers']):,} numbers)", to_txt(r["numbers"]),
+                               r["txt"], "text/plain", key=f"dl-{r['txt']}", type="primary",
+                               disabled=not r["numbers"], on_click="ignore")
+        if len(results) > 1:
+            import zipfile
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                for r in results:
+                    z.writestr(r["txt"], to_txt(r["numbers"]))
+            st.download_button("Download all as one ZIP", buf.getvalue(), f"Phone numbers {datetime.now():%Y-%m-%d}.zip",
+                               "application/zip", on_click="ignore")
+
     left, right = st.columns(2)
     with left:
         st.subheader("Kept")
-        st.dataframe(pd.DataFrame({"Number": numbers}), hide_index=True, height=400)
+        kept = (pd.DataFrame(combined, columns=["Number", "From file"]) if mode == "Combined" else
+                pd.DataFrame([(n, r["file"]) for r in results for n in r["numbers"]], columns=["Number", "From file"]))
+        st.dataframe(kept, hide_index=True, height=400)
     with right:
         st.subheader("Removed")
-        st.dataframe(pd.DataFrame(rejected, columns=["Found in file", "Reason"]), hide_index=True, height=400)
+        st.dataframe(pd.DataFrame([(raw, why, r["file"]) for r in results for raw, why in r["rejected"]],
+                                  columns=["Found in file", "Reason", "From file"]), hide_index=True, height=400)
 
 
 if tool == "Phone filter":
