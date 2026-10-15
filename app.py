@@ -45,7 +45,7 @@ with st.sidebar:
         db.auth.sign_out()
         del st.session_state["client"]
         st.rerun()
-    tool = st.radio("Page", ["Listings", "Phone filter"], horizontal=True)
+    tool = st.radio("Page", ["Listings", "Phone filter", "Price filter"])
 
 
 # ---------- phone filter ----------
@@ -139,8 +139,113 @@ def phone_filter_page():
                                   columns=["Found in file", "Reason", "From file"]), hide_index=True, height=400)
 
 
+# ---------- price filter ----------
+def price_filter_page():
+    import random
+    import time
+
+    import price_lookup as pl
+
+    st.title("Price filter")
+    st.caption("Upload Excel / CSV files named after properties (e.g. `The Conlay.xlsx`). Only the file **names** "
+               "are used: each is looked up on PropertyGuru and summarised from its current listings.")
+    uploads = st.file_uploader("Files named after properties", type=["xlsx", "xls", "csv"],
+                               accept_multiple_files=True, key="price_files")
+    if not uploads:
+        return
+    names = list(dict.fromkeys(pl.clean_name(Path(u.name).stem) for u in uploads))
+
+    # 1) Match names to PropertyGuru properties (fast, works anywhere)
+    matches = st.session_state.setdefault("pg_matches", {})
+    for n in names:
+        if n not in matches:
+            try:
+                matches[n] = pl.find_property(n)
+            except Exception as e:
+                matches[n] = []
+                st.warning(f"Lookup failed for {n}: {e}")
+
+    # 2) Listing stats (needs Chrome on this PC; ~50s per property, remembered for this session)
+    stats = st.session_state.setdefault("pg_stats", {})
+    todo = list(dict.fromkeys(m[0]["id"] for n in names if (m := matches[n]) and m[0]["id"] not in stats))
+    if todo:
+        st.info(f"Checking {len(todo)} propert{'y' if len(todo) == 1 else 'ies'} on PropertyGuru "
+                f"(about {len(todo) * 50 // 60 + 1} min). A Chrome window will open - please leave it open.")
+        if st.button("Start", type="primary"):
+            bar = st.progress(0.0)
+            try:
+                import tempfile
+                from patchright.sync_api import sync_playwright
+                import scraper
+                with sync_playwright() as p:
+                    ctx = p.chromium.launch_persistent_context(tempfile.mkdtemp(), channel="chrome",
+                                                               headless=False, no_viewport=True)
+                    page = ctx.pages[0]
+
+                    def fetch(url):
+                        data = scraper.load_next_data(page, url)
+                        time.sleep(random.uniform(1.5, 3))
+                        return data
+
+                    for i, pid in enumerate(todo):
+                        name = next(m[0]["name"] for m in matches.values() if m and m[0]["id"] == pid)
+                        bar.progress(i / len(todo), text=f"{name} ({i + 1}/{len(todo)})")
+                        try:
+                            stats[pid] = {k: pl.listing_stats(fetch, pid, k) for k in ("rent", "sale")}
+                        except Exception as e:
+                            st.warning(f"{name}: couldn't load listings ({str(e).splitlines()[0]})")
+                    ctx.close()
+            except Exception as e:
+                st.error("Couldn't open Chrome. Price ranges only work when the dashboard runs on your PC "
+                         f"(run_dashboard.bat), not on the online app. Details: {str(e).splitlines()[0]}")
+            bar.empty()
+            st.rerun()
+
+    # 3) Results table
+    rows = []
+    for n in names:
+        m = matches[n]
+        if not m:
+            rows.append({"File": n, "Property": None, "Location": "No match on PropertyGuru"})
+            continue
+        top, s = m[0], stats.get(m[0]["id"], {})
+        r, sa = s.get("rent", {}), s.get("sale", {})
+        rows.append({
+            "File": n,
+            "Property": pl.listings_url(top["id"], "rent") + "#" + top["name"],
+            "Location": top["address"],
+            "Map": top["map"],
+            "For rent now": (pl.listings_url(top["id"], "rent") + f"#{r['count']:,}") if r.get("count") is not None else None,
+            "Rent (RM / month)": pl.fmt_range(r.get("price_min"), r.get("price_max")),
+            "For sale now": (pl.listings_url(top["id"], "sale") + f"#{sa['count']:,}") if sa.get("count") is not None else None,
+            "Sale price (RM)": pl.fmt_range(sa.get("price_min"), sa.get("price_max")),
+            "Size (sqft)": pl.fmt_range(min([x for x in (r.get("sqft_min"), sa.get("sqft_min")) if x], default=None),
+                                        max([x for x in (r.get("sqft_max"), sa.get("sqft_max")) if x], default=None)),
+            "Bedrooms": pl.fmt_beds(r.get("beds", []) + sa.get("beds", [])),
+            "Also matched": ", ".join(x["name"] for x in m[1:3]),
+        })
+    table = pd.DataFrame(rows)
+    show_text = r"^[^#]*#(.*)$"
+    st.dataframe(table, hide_index=True, width="stretch", column_config={
+        "Property": st.column_config.LinkColumn("Property", display_text=show_text),
+        "Map": st.column_config.LinkColumn("Map", display_text="Open map"),
+        "For rent now": st.column_config.LinkColumn("For rent now", display_text=show_text),
+        "For sale now": st.column_config.LinkColumn("For sale now", display_text=show_text),
+    })
+    st.caption("Ranges come from current listings, with obvious typos (e.g. a RM 20,000 'sale') left out. "
+               "\"For rent now\" / \"For sale now\" = number of listings on PropertyGuru today. "
+               "\"Also matched\" shows other properties with similar names, in case the wrong one was picked.")
+    if stats:
+        if st.button("Check again (refresh prices)"):
+            st.session_state.pop("pg_stats", None)
+            st.rerun()
+
+
 if tool == "Phone filter":
     phone_filter_page()
+    st.stop()
+if tool == "Price filter":
+    price_filter_page()
     st.stop()
 
 
