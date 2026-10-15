@@ -153,7 +153,12 @@ def price_filter_page():
                                accept_multiple_files=True, key="price_files")
     if not uploads:
         return
-    names = list(dict.fromkeys(pl.clean_name(Path(u.name).stem) for u in uploads))
+    # Same name with different capitals / spacing / symbols counts once
+    by_key = {}
+    for u in uploads:
+        n = pl.clean_name(Path(u.name).stem)
+        by_key.setdefault(pl.name_key(n), n)
+    names = list(by_key.values())
 
     # 1) Match names to PropertyGuru properties (fast, works anywhere)
     matches = st.session_state.setdefault("pg_matches", {})
@@ -165,12 +170,12 @@ def price_filter_page():
                 matches[n] = []
                 st.warning(f"Lookup failed for {n}: {e}")
 
-    # 2) Listing stats (needs Chrome on this PC; ~50s per property, remembered for this session)
-    stats = st.session_state.setdefault("pg_stats", {})
+    # 2) Price ranges (needs Chrome on this PC; ~25s per property, remembered for this session)
+    stats = st.session_state.setdefault("pg_prices", {})
     todo = list(dict.fromkeys(m[0]["id"] for n in names if (m := matches[n]) and m[0]["id"] not in stats))
     if todo:
         st.info(f"Checking {len(todo)} propert{'y' if len(todo) == 1 else 'ies'} on PropertyGuru "
-                f"(about {len(todo) * 50 // 60 + 1} min). A Chrome window will open - please leave it open.")
+                f"(about {len(todo) * 25 // 60 + 1} min). A Chrome window will open - please leave it open.")
         if st.button("Start", type="primary"):
             bar = st.progress(0.0)
             try:
@@ -191,7 +196,7 @@ def price_filter_page():
                         name = next(m[0]["name"] for m in matches.values() if m and m[0]["id"] == pid)
                         bar.progress(i / len(todo), text=f"{name} ({i + 1}/{len(todo)})")
                         try:
-                            stats[pid] = {k: pl.listing_stats(fetch, pid, k) for k in ("rent", "sale")}
+                            stats[pid] = {k: pl.price_range(fetch, pid, k) for k in ("rent", "sale")}
                         except Exception as e:
                             st.warning(f"{name}: couldn't load listings ({str(e).splitlines()[0]})")
                     ctx.close()
@@ -201,43 +206,38 @@ def price_filter_page():
             bar.empty()
             st.rerun()
 
-    # 3) Results table
-    rows = []
+    # 3) Results table - one row per PropertyGuru property, even if several files point to it
+    rows, row_of = [], {}
     for n in names:
         m = matches[n]
         if not m:
             rows.append({"File": n, "Property": None, "Location": "No match on PropertyGuru"})
             continue
-        top, s = m[0], stats.get(m[0]["id"], {})
-        r, sa = s.get("rent", {}), s.get("sale", {})
-        rows.append({
+        top = m[0]
+        if top["id"] in row_of:
+            row_of[top["id"]]["File"] += f", {n}"
+            continue
+        rent, sale = stats.get(top["id"], {}).get("rent", (None, None)), stats.get(top["id"], {}).get("sale", (None, None))
+        row_of[top["id"]] = {
             "File": n,
             "Property": pl.listings_url(top["id"], "rent") + "#" + top["name"],
             "Location": top["address"],
             "Map": top["map"],
-            "For rent now": (pl.listings_url(top["id"], "rent") + f"#{r['count']:,}") if r.get("count") is not None else None,
-            "Rent (RM / month)": pl.fmt_range(r.get("price_min"), r.get("price_max")),
-            "For sale now": (pl.listings_url(top["id"], "sale") + f"#{sa['count']:,}") if sa.get("count") is not None else None,
-            "Sale price (RM)": pl.fmt_range(sa.get("price_min"), sa.get("price_max")),
-            "Size (sqft)": pl.fmt_range(min([x for x in (r.get("sqft_min"), sa.get("sqft_min")) if x], default=None),
-                                        max([x for x in (r.get("sqft_max"), sa.get("sqft_max")) if x], default=None)),
-            "Bedrooms": pl.fmt_beds(r.get("beds", []) + sa.get("beds", [])),
+            f"Rent RM {pl.RENT_MIN:,}–{pl.RENT_MAX:,} (per month)": pl.fmt_range(*rent),
+            "Sale price (RM)": pl.fmt_range(*sale),
             "Also matched": ", ".join(x["name"] for x in m[1:3]),
-        })
-    table = pd.DataFrame(rows)
-    show_text = r"^[^#]*#(.*)$"
-    st.dataframe(table, hide_index=True, width="stretch", column_config={
-        "Property": st.column_config.LinkColumn("Property", display_text=show_text),
+        }
+        rows.append(row_of[top["id"]])
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", column_config={
+        "Property": st.column_config.LinkColumn("Property", display_text=r"^[^#]*#(.*)$"),
         "Map": st.column_config.LinkColumn("Map", display_text="Open map"),
-        "For rent now": st.column_config.LinkColumn("For rent now", display_text=show_text),
-        "For sale now": st.column_config.LinkColumn("For sale now", display_text=show_text),
     })
-    st.caption("Ranges come from current listings, with obvious typos (e.g. a RM 20,000 'sale') left out. "
-               "\"For rent now\" / \"For sale now\" = number of listings on PropertyGuru today. "
-               "\"Also matched\" shows other properties with similar names, in case the wrong one was picked.")
+    st.caption(f"Rent range only counts listings between RM {pl.RENT_MIN:,} and RM {pl.RENT_MAX:,} a month. "
+               "Obvious typos (e.g. a RM 20,000 'sale') are left out. \"Also matched\" shows other properties "
+               "with similar names, in case the wrong one was picked.")
     if stats:
         if st.button("Check again (refresh prices)"):
-            st.session_state.pop("pg_stats", None)
+            st.session_state.pop("pg_prices", None)
             st.rerun()
 
 

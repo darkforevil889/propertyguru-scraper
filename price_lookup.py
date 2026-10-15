@@ -40,8 +40,28 @@ def find_property(name, limit=5):
     return out
 
 
+RENT_MIN, RENT_MAX = 5000, 90000  # only rentals in this band count towards the rent range
+
+
+def name_key(name):
+    """'A-B  c' and 'a b C' -> 'a b c' so near-identical file names count once."""
+    return re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+
+
 def listings_url(pid, kind, extra=""):
-    return f"{BASE}/property-for-{kind}?listingType={kind}&propertyId={pid}{extra}"
+    band = f"&minPrice={RENT_MIN}&maxPrice={RENT_MAX}" if kind == "rent" else ""
+    return f"{BASE}/property-for-{kind}?listingType={kind}&propertyId={pid}{band}{extra}"
+
+
+def price_range(fetch, pid, kind):
+    """Lowest and highest current price: just the price-sorted first pages (2 page loads)."""
+    prices = []
+    for order in ("asc", "desc"):
+        prices += [r["price"] for r in _rows(fetch(listings_url(pid, kind, f"&sort=price&order={order}")))]
+    if kind == "rent":
+        prices = [x for x in prices if x and RENT_MIN <= x <= RENT_MAX]
+    v = _trim(prices)
+    return (v[0], v[-1]) if v else (None, None)
 
 
 def _rows(data):
@@ -49,18 +69,8 @@ def _rows(data):
     for item in data.get("listingsData") or []:
         L = item.get("listingData") or {}
         if L.get("id"):
-            rows.append({"price": (L.get("price") or {}).get("value"), "sqft": L.get("floorArea"),
-                         "beds": L.get("bedrooms")})
+            rows.append({"price": (L.get("price") or {}).get("value")})
     return rows
-
-
-def _count(data, rows):
-    heading = ((data.get("metaData") or {}).get("metaTags") or {}).get("heading") or ""
-    m = re.match(r"\s*([\d,]+)", heading)
-    if m:
-        return int(m.group(1).replace(",", ""))
-    pages = (data.get("paginationData") or {}).get("totalPages") or 0
-    return len(rows) if pages <= 1 else None
 
 
 def _trim(values, low_ratio=0.4, high_ratio=2.5):
@@ -75,40 +85,8 @@ def _trim(values, low_ratio=0.4, high_ratio=2.5):
     return v
 
 
-def listing_stats(fetch, pid, kind):
-    """fetch(url) -> page data. Small projects: read every page. Big ones: read the sorted extremes."""
-    first = fetch(listings_url(pid, kind))
-    rows = _rows(first)
-    count = _count(first, rows)
-    pages = (first.get("paginationData") or {}).get("totalPages") or 0
-    if not rows:
-        return {"count": 0}
-    if pages <= 3:
-        for n in range(2, pages + 1):
-            rows += _rows(fetch(listings_url(pid, kind, f"&page={n}")))
-    else:
-        for sort in ("&sort=price&order=asc", "&sort=price&order=desc",
-                     "&sort=size&order=asc", "&sort=size&order=desc"):
-            rows += _rows(fetch(listings_url(pid, kind, sort)))
-    prices = _trim([r["price"] for r in rows])
-    sizes = _trim([r["sqft"] for r in rows], 0.3, 3)
-    beds = sorted({r["beds"] for r in rows if r["beds"] is not None})
-    return {"count": count,
-            "price_min": prices[0] if prices else None, "price_max": prices[-1] if prices else None,
-            "sqft_min": sizes[0] if sizes else None, "sqft_max": sizes[-1] if sizes else None,
-            "beds": beds, "exact": pages <= 3}
-
-
 def fmt_range(lo, hi, prefix="", suffix=""):
     if lo is None:
         return ""
     f = lambda x: f"{prefix}{x:,.0f}{suffix}"
     return f(lo) if lo == hi else f"{f(lo)} – {f(hi)}"
-
-
-def fmt_beds(beds):
-    b = sorted({max(x, 0) for x in beds})  # -1 / 0 = studio
-    if not b:
-        return ""
-    label = lambda x: "Studio" if x == 0 else str(x)
-    return label(b[0]) if len(b) == 1 else f"{label(b[0])} – {label(b[-1])}"
