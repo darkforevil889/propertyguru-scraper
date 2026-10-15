@@ -41,6 +41,7 @@ def find_property(name, limit=5):
 
 
 RENT_MIN, RENT_MAX = 5000, 90000  # only rentals in this band count towards the rent range
+SALE_MIN = 5_000_000              # only sales at or above this count towards the sale range
 
 
 def name_key(name):
@@ -49,7 +50,7 @@ def name_key(name):
 
 
 def listings_url(pid, kind, extra=""):
-    band = f"&minPrice={RENT_MIN}&maxPrice={RENT_MAX}" if kind == "rent" else ""
+    band = f"&minPrice={RENT_MIN}&maxPrice={RENT_MAX}" if kind == "rent" else f"&minPrice={SALE_MIN}"
     return f"{BASE}/property-for-{kind}?listingType={kind}&propertyId={pid}{band}{extra}"
 
 
@@ -60,6 +61,8 @@ def price_range(fetch, pid, kind):
         prices += [r["price"] for r in _rows(fetch(listings_url(pid, kind, f"&sort=price&order={order}")))]
     if kind == "rent":
         prices = [x for x in prices if x and RENT_MIN <= x <= RENT_MAX]
+    else:
+        prices = [x for x in prices if x and x >= SALE_MIN]
     v = _trim(prices)
     return (v[0], v[-1]) if v else (None, None)
 

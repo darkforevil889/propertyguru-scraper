@@ -224,7 +224,7 @@ def price_filter_page():
             "Location": top["address"],
             "Map": top["map"],
             f"Rent RM {pl.RENT_MIN:,}–{pl.RENT_MAX:,} (per month)": pl.fmt_range(*rent),
-            "Sale price (RM)": pl.fmt_range(*sale),
+            f"Sale RM {pl.SALE_MIN / 1e6:g}M and above": pl.fmt_range(*sale),
             "Also matched": ", ".join(x["name"] for x in m[1:3]),
         }
         rows.append(row_of[top["id"]])
@@ -232,7 +232,8 @@ def price_filter_page():
         "Property": st.column_config.LinkColumn("Property", display_text=r"^[^#]*#(.*)$"),
         "Map": st.column_config.LinkColumn("Map", display_text="Open map"),
     })
-    st.caption(f"Rent range only counts listings between RM {pl.RENT_MIN:,} and RM {pl.RENT_MAX:,} a month. "
+    st.caption(f"Rent range only counts listings between RM {pl.RENT_MIN:,} and RM {pl.RENT_MAX:,} a month; "
+               f"sale range only counts listings of RM {pl.SALE_MIN:,} and above (blank = none listed). "
                "Obvious typos (e.g. a RM 20,000 'sale') are left out. \"Also matched\" shows other properties "
                "with similar names, in case the wrong one was picked.")
     if stats:
