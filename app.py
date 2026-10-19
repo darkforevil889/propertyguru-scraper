@@ -110,7 +110,7 @@ with st.sidebar:
         st.session_state.logged_out = True
         write_cookie("", days=0)
         st.rerun()
-    tool = st.radio("Page", ["Listings", "WhatsApp", "Phone filter", "Price filter"])
+    tool = st.radio("Page", ["Listings", "Condo prices", "WhatsApp", "Phone filter", "Price filter"])
 
 
 # ---------- phone filter ----------
@@ -697,6 +697,94 @@ def scan_chats_tab():
         "Chat": l["chat"], "Message": l["text"][:200]} for l in listings]), hide_index=True, width="stretch")
 
 
+# ---------- condo prices (one row per condo: KLCC, Mont Kiara ...) ----------
+@st.cache_data(ttl=300, show_spinner="Loading condo prices…")
+def load_condo_summary(_db):
+    import json
+    return json.loads(_db.storage.from_(PHOTO_BUCKET).download("data/condo_summary.json"))
+
+
+def condo_prices_page():
+    import json
+    import subprocess
+    import sys
+
+    st.title("Condo prices")
+    st.caption("One row per condo: lowest / highest sale price, lowest / highest rent and smallest / largest size, "
+               "worked out from all current PropertyGuru listings (obvious typos left out).")
+
+    # Update button - only on the PC (PropertyGuru blocks cloud servers)
+    status_file = ROOT_DIR / "data" / "condo_summary_status.json"
+    on_pc = (ROOT_DIR / "condo_summary.py").exists() and bool(os.environ.get("SUPABASE_SECRET_KEY"))
+    if on_pc:
+        try:
+            stt = json.loads(status_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            stt = {}
+        recent = stt.get("at") and (datetime.now() - datetime.fromisoformat(stt["at"])).total_seconds() < 600
+        if stt.get("state") == "running" and recent:
+            st.info(f"⏳ Updating on this PC: {stt.get('area')} {stt.get('kind')} - page {stt.get('page')} of "
+                    f"{stt.get('pages') or '?'} (a full update takes about an hour). Reload to see progress.")
+        elif st.button("🔄 Update now (runs on this PC, ~1 hour)"):
+            (ROOT_DIR / "logs").mkdir(exist_ok=True)
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+            subprocess.Popen([sys.executable, "-u", str(ROOT_DIR / "condo_summary.py")], cwd=ROOT_DIR,
+                             creationflags=flags, stdout=open(ROOT_DIR / "logs" / "condo_summary.log", "a"),
+                             stderr=subprocess.STDOUT)
+            st.success("Started - it runs in the background; you can close this page.")
+
+    try:
+        data = load_condo_summary(db)
+    except Exception:
+        st.info("No condo prices yet - click **Update now** on the PC (first run takes about an hour).")
+        return
+    df = pd.DataFrame(data.get("rows") or [])
+    if df.empty:
+        st.info("No condo prices yet.")
+        return
+    updated = data.get("updated") or {}
+    if isinstance(updated, dict):
+        st.caption("Last updated: " + ", ".join(
+            f"{a} {pd.to_datetime(t, utc=True).tz_convert(MYT):%d %b %Y %H:%M}" for a, t in sorted(updated.items())))
+    if st.button("Refresh", key="condo-refresh"):
+        load_condo_summary.clear()
+        st.rerun()
+
+    f1, f2, f3 = st.columns([2, 2, 1])
+    areas = f1.multiselect("Area", sorted(df.area.unique()), default=sorted(df.area.unique()))
+    text = f2.text_input("Search condo name")
+    has = f3.radio("Show", ["All", "For sale", "For rent"], horizontal=False)
+    view = df[df.area.isin(areas)]
+    if text:
+        view = view[view.condo.str.contains(text, case=False, na=False)]
+    if has == "For sale":
+        view = view[view.sale_listings > 0]
+    elif has == "For rent":
+        view = view[view.rent_listings > 0]
+    st.caption(f"{len(view):,} condos")
+
+    cols = {"condo": "Condo", "area": "Area", "sale_min": "Sale from (RM)", "sale_max": "Sale to (RM)",
+            "sale_listings": "For sale", "rent_min": "Rent from (RM)", "rent_max": "Rent to (RM)",
+            "rent_listings": "For rent", "sqft_min": "Size from (sqft)", "sqft_max": "Size to (sqft)",
+            "psf_min": "RM psf from", "psf_max": "RM psf to", "bedrooms": "Bedrooms", "tenure": "Tenure",
+            "property_type": "Type", "sale_url": "Sale listings", "rent_url": "Rent listings"}
+    table = view[[c for c in cols if c in view.columns]].rename(columns=cols)
+    money = st.column_config.NumberColumn(format="%,d")
+    st.dataframe(table, hide_index=True, width="stretch", height=600, column_config={
+        **{c: money for c in ("Sale from (RM)", "Sale to (RM)", "Rent from (RM)", "Rent to (RM)",
+                               "Size from (sqft)", "Size to (sqft)", "RM psf from", "RM psf to")},
+        "Sale listings": st.column_config.LinkColumn(display_text="Open"),
+        "Rent listings": st.column_config.LinkColumn(display_text="Open"),
+    })
+    xbuf = io.BytesIO()
+    table.to_excel(xbuf, index=False)
+    st.download_button("Download Excel", xbuf.getvalue(), f"Condo prices {datetime.now():%Y-%m-%d}.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", on_click="ignore")
+
+
+if tool == "Condo prices":
+    condo_prices_page()
+    st.stop()
 if tool == "WhatsApp":
     whatsapp_page()
     st.stop()
