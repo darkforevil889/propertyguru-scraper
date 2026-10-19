@@ -11,3 +11,7 @@ __pycache__/
 data/
 debug/
 logs/
+
+# WhatsApp connector: login session + messages = full access to your WhatsApp - never commit
+wa_data/
+wa_exports/

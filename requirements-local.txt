@@ -1,0 +1,6 @@
+# Extra packages for the PC-only features (WhatsApp connector + reading screenshots).
+# The online app doesn't need these. Install on the PC with:  .venv\Scripts\pip install -r requirements-local.txt
+-r requirements.txt
+neonize==0.5.2
+rapidocr==3.9.2
+onnxruntime==1.30.0

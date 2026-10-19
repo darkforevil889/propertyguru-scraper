@@ -13,7 +13,7 @@ import pandas as pd
 
 MOBILE = re.compile(r"^(?:01[02346789]\d{7}|011\d{8})$")
 # A run of digits possibly broken up by spaces, dashes, dots or brackets, optionally starting with +
-CANDIDATE = re.compile(r"\+?\(?\d[\d\s\-.()]*\d")
+CANDIDATE = re.compile(r"\+?\(?\d[\d \t\-.()]*\d")  # never runs onto the next line
 EXCEL_FLOAT = re.compile(r"^\d+\.0+$")
 EXCEL_SCI = re.compile(r"^\d(?:\.\d+)?[eE]\+?\d+$")
 
@@ -55,7 +55,7 @@ def extract_from_text(text):
         groups = re.findall(r"\d+", raw)
         whole = "".join(groups)
         num, reason = normalise(whole, had_plus)
-        if num or len(groups) == 1 or len(whole) <= 12:
+        if num or len(groups) == 1:
             yield num, reason, raw
             continue
         # Several numbers separated only by spaces/dashes: join groups until a valid number forms
