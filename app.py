@@ -110,7 +110,7 @@ with st.sidebar:
         st.session_state.logged_out = True
         write_cookie("", days=0)
         st.rerun()
-    tool = st.radio("Page", ["Listings", "Condo prices", "WhatsApp", "Phone filter", "Price filter"])
+    tool = st.radio("Page", ["Listings", "Condo prices", "WhatsApp", "Chat bot", "Phone filter", "Price filter"])
 
 
 # ---------- phone filter ----------
@@ -782,6 +782,104 @@ def condo_prices_page():
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", on_click="ignore")
 
 
+# ---------- WhatsApp chat bot (auto-replies on a separate number) ----------
+def chat_bot_page():
+    import base64
+
+    import bot_brain
+    import bot_client
+
+    st.title("WhatsApp chat bot")
+    st.caption("Auto-replies on a SEPARATE WhatsApp number: finds listings, quotes condo prices, answers your FAQ and "
+               "collects owner listings (saved to WhatsApp → Saved listings). Replies to private chats only - never "
+               "groups, never messages anyone first. Runs on this PC: keep it on for instant replies.")
+    try:
+        s = bot_client.ensure_running()
+    except Exception as e:
+        st.error(str(e))
+        return
+
+    # 1) link the bot's number
+    if s["status"] not in ("ready", "connecting"):
+        @st.fragment(run_every="3s")
+        def link_box():
+            try:
+                cur = bot_client.ensure_running()
+            except Exception as e:
+                st.error(str(e))
+                return
+            if cur.get("status") in ("ready", "connecting"):
+                st.rerun(scope="app")
+            if cur.get("status") == "qr" and cur.get("qr"):
+                st.image(base64.b64decode(cur["qr"].split(",", 1)[1]), width=300)
+                st.markdown("On the **bot's phone** (the separate number): **WhatsApp → ⋮ / Settings → Linked devices "
+                            "→ Link a device**, then scan. It shows as **KL Tracker Bot**.")
+            elif cur.get("status") in ("error", "logged_out"):
+                st.error(cur.get("error") or "Disconnected.")
+                if st.button("Start again"):
+                    bot_client.logout()
+                    st.rerun(scope="app")
+            else:
+                st.info("Starting the bot… (about 30 seconds)")
+        link_box()
+        return
+
+    me = s.get("me") or {}
+    settings = bot_client.load_settings()
+    c1, c2, c3 = st.columns([3, 1, 1])
+    c1.success(f"Bot number connected: **+{me.get('number') or '?'}** · replies today: {s.get('replies_today', 0)}")
+    on = c2.toggle("Bot ON", value=settings["enabled"])
+    if on != settings["enabled"]:
+        settings["enabled"] = on
+        bot_client.save_settings(settings)
+        st.rerun()
+    if c3.button("Unlink number"):
+        bot_client.logout()
+        st.rerun()
+
+    # 2) AI brain
+    with st.expander("🧠 AI (free Groq key)", expanded=not os.environ.get("BOT_LLM_API_KEY")):
+        has_key = bool(os.environ.get("BOT_LLM_API_KEY"))
+        st.markdown(("✅ AI key saved - the bot replies with AI." if has_key else
+                     "⚠️ No AI key yet - the bot only gives simple keyword replies.") +
+                    "\n\nGet a free key: **console.groq.com → sign in → API Keys → Create API key**, paste it below. "
+                    "It's stored only in `.env` on this PC.")
+        key = st.text_input("Groq API key", type="password", placeholder="gsk_...")
+        if st.button("Save key") and key.strip():
+            bot_client.set_env("BOT_LLM_API_KEY", key.strip())
+            os.environ["BOT_LLM_API_KEY"] = key.strip()
+            st.success("Saved - new replies use AI straight away.")
+        test = st.text_input("Try the bot here (nothing is sent on WhatsApp)",
+                             placeholder="e.g. any 3 room Mont Kiara below 10k?")
+        if test:
+            with st.spinner("Thinking…"):
+                st.info(bot_brain.reply([{"role": "user", "content": test}], lambda **k: {"saved": "test - not saved"}))
+
+    # 3) FAQ
+    with st.expander("📝 Your agency info / FAQ (the bot answers from this)"):
+        current = bot_brain.faq()
+        new = st.text_area("FAQ", current, height=220, label_visibility="collapsed")
+        if st.button("Save FAQ") and new != current:
+            bot_brain.FAQ_FILE.parent.mkdir(exist_ok=True)
+            bot_brain.FAQ_FILE.write_text(new, encoding="utf-8")
+            st.success("Saved.")
+
+    # 4) conversations
+    st.subheader("Recent conversations")
+    convs = bot_client.conversations()
+    if not convs:
+        st.caption("No messages yet - send the bot's number a WhatsApp from another phone to test it.")
+    for cv in convs:
+        when = datetime.fromtimestamp(cv["last_ts"], MYT).strftime("%d %b %H:%M")
+        who = cv["name"] or cv["chat"].split("@")[0]
+        with st.expander(f"{who} · {when}"):
+            for role, text, ts in cv["messages"]:
+                st.markdown(f"**{'🤖 Bot' if role == 'assistant' else '👤 ' + who}:** {text}")
+
+
+if tool == "Chat bot":
+    chat_bot_page()
+    st.stop()
 if tool == "Condo prices":
     condo_prices_page()
     st.stop()

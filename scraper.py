@@ -109,6 +109,13 @@ class Browser:
                 self.start()  # fresh browser recovers from crashes / closed windows
 
 
+def _whole(v):
+    try:
+        return int(round(float(v))) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_card(item):
     L = item.get("listingData") or {}
     if not L.get("id"):
@@ -124,9 +131,9 @@ def parse_card(item):
     return {
         "listing_id": L["id"],
         "title": L.get("localizedTitle"),
-        "price_rm": price.get("value"),
+        "price_rm": _whole(price.get("value")),  # the database stores whole numbers (commercial can be 27892.8)
         "psf_rm": float(psf.group().replace(",", "")) if psf else None,
-        "floor_area_sqft": L.get("floorArea"),
+        "floor_area_sqft": _whole(L.get("floorArea")),
         "bedrooms": L.get("bedrooms"),
         "bathrooms": L.get("bathrooms"),
         "property_type": prop.get("subTypeText"),
