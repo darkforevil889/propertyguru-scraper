@@ -118,8 +118,19 @@ def summarise(area, rows):
     return sorted(out, key=lambda r: (r["condo"] or "").lower())
 
 
+def keep_awake(on=True):
+    """Stop Windows sleeping while the update runs (a sleeping PC paused the first run for hours)."""
+    try:
+        import ctypes
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0))
+    except Exception:
+        pass
+
+
 def run(areas):
     results, started = [], datetime.now(timezone.utc)
+    keep_awake(True)
     with sync_playwright() as p:
         browser = scraper.Browser(p)
 
@@ -132,8 +143,11 @@ def run(areas):
             rows = collect(fetch, area, "sale") + collect(fetch, area, "rent")
             condos = summarise(area, rows)
             print(f"[{area}] {len(rows)} listings -> {len(condos)} condos", flush=True)
+            if condos:
+                save(condos, started)  # each area is saved as soon as it's done
             results += condos
         browser.close()
+    keep_awake(False)
     return results, started
 
 
@@ -170,9 +184,7 @@ if __name__ == "__main__":
         raise SystemExit(f"Unknown area(s) {unknown}. Known: {list(AREAS)}")
     status(state="running", area=chosen[0], kind="sale", page=0, pages=None)
     try:
-        result, start = run(chosen)
-        if result:
-            save(result, start)
+        result, start = run(chosen)  # saves each area as it finishes
         status(state="done", condos=len(result), areas=chosen)
     except Exception as e:
         status(state="failed", error=str(e).splitlines()[0])
