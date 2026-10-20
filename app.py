@@ -815,10 +815,20 @@ def load_listings(_db):
               "bathrooms", "latitude", "longitude"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     # Furnishing etc. only come from the listing's own page; make "not opened yet" explicit
-    pending = df.details_scraped_at.isna()
+    df["search_key"] = df["search_key"].fillna("kl-rent-8k")
+    pending = df.details_scraped_at.isna() & (df.search_key == "kl-rent-8k")  # only this search opens listing pages
     df.loc[pending, "furnishing"] = "Pending (details not scraped yet)"
     df.loc[~pending, "furnishing"] = df.loc[~pending, "furnishing"].fillna("Not specified")
     return df
+
+
+# Listing categories (scraper.py SEARCHES keys)
+CATEGORIES = {
+    "Homes for rent (RM 8k+)": ("kl-rent-8k", "rent"),
+    "Commercial for rent (RM 8k+)": ("kl-commercial-rent-8k", "rent"),
+    "Homes for sale (RM 3M+)": ("kl-sale-3m", "sale"),
+    "Commercial for sale (RM 3M+)": ("kl-commercial-sale-3m", "sale"),
+}
 
 
 df = load_listings(db)
@@ -835,14 +845,25 @@ if df.empty:
 # ---------- filters ----------
 with st.sidebar:
     st.header("Filters")
+    category = st.radio("Category", list(CATEGORIES))
+    cat_key, cat_kind = CATEGORIES[category]
+    df = df[df.search_key == cat_key]
+    if df.empty:
+        st.info("No listings in this category yet - they appear after the next scrape.")
+        st.stop()
     active_days = st.slider("Seen in the last N days", 1, 60, 3,
                             help="Listings not seen recently were probably taken down.")
     pmin, pmax = int(df.price_rm.min()), int(df.price_rm.max())
-    price = st.slider("Monthly rent (RM)", pmin, pmax, (pmin, min(pmax, 50000)), step=500)
-    districts = st.multiselect("District", sorted(df.district.dropna().unique()))
-    beds = st.multiselect("Bedrooms", sorted(df.bedrooms.dropna().astype(int).unique()))
-    types = st.multiselect("Property type", sorted(df.property_type.dropna().unique()))
-    furnish = st.multiselect("Furnishing", sorted(df.furnishing.dropna().unique()))
+    if cat_kind == "rent":
+        price = st.slider("Monthly rent (RM)", pmin, max(pmax, pmin + 1), (pmin, min(max(pmax, pmin + 1), 50000)),
+                          step=500, key=f"price-{cat_key}")
+    else:
+        price = st.slider("Price (RM)", pmin, max(pmax, pmin + 1), (pmin, max(pmax, pmin + 1)), step=100_000,
+                          key=f"price-{cat_key}", format="%d")
+    districts = st.multiselect("District", sorted(df.district.dropna().unique()), key=f"dist-{cat_key}")
+    beds = st.multiselect("Bedrooms", sorted(df.bedrooms.dropna().astype(int).unique()), key=f"beds-{cat_key}")
+    types = st.multiselect("Property type", sorted(df.property_type.dropna().unique()), key=f"type-{cat_key}")
+    furnish = st.multiselect("Furnishing", sorted(df.furnishing.dropna().unique()), key=f"furn-{cat_key}")
     text = st.text_input("Search name / address")
 
 cutoff = datetime.now(timezone.utc) - timedelta(days=active_days)
@@ -860,15 +881,18 @@ if text:
 
 # ---------- page ----------
 st.title("KL Tracker")
+st.caption(category)
+price_word = "rent" if cat_kind == "rent" else "price"
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Listings", f"{len(f):,}")
-k2.metric("Median rent", f"RM {f.price_rm.median():,.0f}" if len(f) else "–")
+k2.metric(f"Median {price_word}", f"RM {f.price_rm.median():,.0f}" if len(f) else "–")
 k3.metric("Median RM psf", f"{f.psf_rm.median():.2f}" if f.psf_rm.notna().any() else "–")
 k4.metric("New in last 7 days", f"{(f.first_seen >= datetime.now(timezone.utc) - timedelta(days=7)).sum():,}")
 
 # Clickable property name: the name rides in the URL fragment and display_text shows it
 f = f.assign(property_link=f.url.fillna("") + "#" + f.title.fillna("Listing"))
-COLS = {"property_link": "Property", "price_rm": "Rent (RM)", "psf_rm": "RM psf", "floor_area_sqft": "Sqft",
+COLS = {"property_link": "Property", "price_rm": "Rent (RM)" if cat_kind == "rent" else "Price (RM)",
+        "psf_rm": "RM psf", "floor_area_sqft": "Sqft",
         "bedrooms": "Beds", "bathrooms": "Baths", "property_type": "Type", "furnishing": "Furnishing",
         "district": "District", "area": "Area", "nearest_station": "Nearest station",
         "posted_on": "Posted", "agent_name": "Agent"}

@@ -22,10 +22,23 @@ from patchright.sync_api import sync_playwright
 from supabase import create_client
 
 # Add more searches here later (e.g. Selangor). Key = short name stored with each listing.
+PG = "https://www.propertyguru.com.my"
 SEARCHES = {
-    "kl-rent-8k": ("https://www.propertyguru.com.my/property-for-rent?listingType=rent&page={page}"
+    "kl-rent-8k": (f"{PG}/property-for-rent?listingType=rent&page={{page}}"
                    "&isCommercial=false&regionCode=58jok&_freetextDisplay=Kuala+Lumpur&minPrice=8000"),
+    # KL shop lots / offices / warehouses / factories for rent from RM 8k a month
+    "kl-commercial-rent-8k": (f"{PG}/commercial-properties-for-rent?listingType=rent&isCommercial=true"
+                              "&regionCode=58jok&minPrice=8000&page={page}"),
+    # KL homes and commercial for sale from RM 3 million
+    "kl-sale-3m": f"{PG}/property-for-sale?listingType=sale&isCommercial=false&regionCode=58jok&minPrice=3000000&page={{page}}",
+    "kl-commercial-sale-3m": (f"{PG}/commercial-properties-for-sale?listingType=sale&isCommercial=true"
+                              "&regionCode=58jok&minPrice=3000000&page={page}"),
+    # Selangor equivalents - add when wanted (big: ~1,800 more pages):
+    #   regionCode=45nk1 with the same paths as above
 }
+# Searches whose listings also get their own page opened for full details (slow - one page per listing).
+# The big new searches only use the search result pages (price, size, type, location, tenure, agent, link).
+DETAIL_SEARCHES = {"kl-rent-8k"}
 ROOT = Path(__file__).parent
 DATA_DIR = ROOT / "data"
 TRACKED = "listing_id,price_rm,initial_price_rm,previous_price_rm,price_changed_at,first_seen,details_scraped_at"
@@ -205,7 +218,11 @@ def main():
     ap.add_argument("--csv", action="store_true", help="also save a CSV copy of this run in data/")
     ap.add_argument("--challenge-wait", type=int, default=120,
                     help="seconds to wait on a Cloudflare check before giving up on a page")
+    ap.add_argument("--only", default="", help=f"comma-separated search keys to run (default all: {','.join(SEARCHES)})")
     args = ap.parse_args()
+    chosen = [s.strip() for s in args.only.split(",") if s.strip()] or list(SEARCHES)
+    if unknown := [s for s in chosen if s not in SEARCHES]:
+        raise SystemExit(f"Unknown search(es) {unknown}. Known: {list(SEARCHES)}")
     global CHALLENGE_WAIT
     CHALLENGE_WAIT = args.challenge_wait
 
@@ -218,9 +235,15 @@ def main():
     listings, new_count, details_done, details_failed, pages_failed = {}, 0, 0, 0, 0
     blocked_streak = 0
     stopped_early = False
+    try:  # keep Windows awake while scraping (a sleeping PC pauses the run for hours)
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
+    except Exception:
+        pass
     with sync_playwright() as p:
         browser = Browser(p)
-        for search_key, search_url in SEARCHES.items():
+        for search_key in chosen:
+            search_url = SEARCHES[search_key]
             total_pages, n, page_blocked_streak = None, 1, 0
             while (not args.pages or n <= args.pages) and (total_pages is None or n <= total_pages):
                 try:
@@ -249,7 +272,7 @@ def main():
                 polite_pause()
 
                 # Open this page's new listings right away, so a run that stops early still has full data
-                for row in queued:
+                for row in (queued if search_key in DETAIL_SEARCHES else []):
                     if args.no_details or (args.max_details and details_done >= args.max_details):
                         break
                     if blocked_streak >= 3:  # listing pages keep getting blocked - don't waste hours retrying
