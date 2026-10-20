@@ -13,6 +13,7 @@ import json
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 from functools import lru_cache
 from pathlib import Path
@@ -27,7 +28,7 @@ load_dotenv(ROOT / ".env")
 DEFAULT_FAQ = """\
 - We are a property agency in Kuala Lumpur (KLCC, Mont Kiara, Bangsar, Damansara Heights and more).
 - Office hours: Mon-Sat 9am-7pm. Messages outside these hours are answered the next working day.
-- Viewings: tell us the property and 2-3 times that suit you; an agent will confirm.
+- Viewings: tell me the property and 2-3 times that suit you; I will confirm.
 - Owners: send the location, sale or rent, price, size, bedrooms/bathrooms, furnishing and photos -
   we will list it for you.
 """
@@ -66,29 +67,84 @@ TOOLS = [
 ]
 
 
+def fix_mojibake(text):
+    """'Iâ€™m' -> 'I'm': text pasted through the wrong encoding."""
+    if "â€" in text or "Ã" in text:
+        try:
+            return text.encode("cp1252").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            for bad, good in (("â€™", "'"), ("â€˜", "'"), ("â€œ", '"'), ("â€\x9d", '"'), ("â€“", "-"), ("â€”", "-"),
+                              ("â€¦", "...")):
+                text = text.replace(bad, good)
+    return text
+
+
 def faq():
     try:
-        return FAQ_FILE.read_text(encoding="utf-8")
+        return fix_mojibake(FAQ_FILE.read_text(encoding="utf-8"))
     except OSError:
         return DEFAULT_FAQ
 
 
+PROFILE_FIELDS = {"agent_name": "Name", "agency": "Agency", "phone": "Phone", "extra": "Other details for the name card"}
+
+
+def profile():
+    """Your real details (set on the dashboard's Chat bot page)."""
+    try:
+        s = json.loads((BOT_DATA / "bot_settings.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        s = {}
+    return {k: (s.get("profile") or {}).get(k, "") for k in PROFILE_FIELDS}
+
+
 def system_prompt():
-    return f"""You are the WhatsApp assistant of a property agency in Kuala Lumpur, Malaysia.
-Reply like a friendly, professional agent on WhatsApp: short (1-6 lines), no markdown headings, at most a few emojis.
-Reply in the customer's language (English, Malay or Chinese - mixed is fine).
+    p = profile()
+    details = "\n".join(f"- {label}: {p[k]}" for k, label in PROFILE_FIELDS.items() if p[k]) or "- (none given)"
+    name = p.get("agent_name") or "the agent"
+    return f"""You ARE {name}, a property agent in Kuala Lumpur, Malaysia, chatting on WhatsApp. Speak in the first
+person as {name} ("I'll check and get back to you") - never say "an agent will reply" or that you are a bot/assistant.
+TEXT LIKE A REAL MALAYSIAN ON WHATSAPP, not like a customer-service bot:
+- SHORT. Usually 1 line, max 2 short lines. Like a quick text, not an email. No "Let me know if you need anything else".
+- Casual Manglish / Singlish mixed in naturally: "can lah", "ok boss", "got", "no problem", "wah", "eh", "ya",
+  "sure sure", "nvm", "ok noted", "one sec ah", "hmm". Don't overdo it - 1 or 2 per message.
+- Lowercase start is fine, small typos-free but relaxed. Max 1 emoji, often none.
+- If they're very formal, be polite but still short.
+- Reply in their language (English, Malay, Chinese or a mix).
+- Never write lists of features or long explanations unless they ask. Plain text only (WhatsApp bold = *one star*).
+- If you need to say 2 different things, put a blank line between them - each part is sent as its own bubble.
+Examples of the tone:
+  "hi boss, ya can. which area you looking?"
+  "wah nice. what budget ah?"
+  "ok noted, let me check and get back to you"
+  "haha no la, not sure about the score"
+
+Off-topic chat is welcome: small talk, food, weather, football, jokes, how's your day - just chat naturally like a
+person would. If they ask for live information you can't know (today's weather, news, scores, exchange rates), say
+casually you're not sure / haven't checked, don't make it up. For recommendations (food, shops, places) only name
+very well-known places you are sure exist (e.g. Village Park nasi lemak in Damansara Uptown, Nasi Lemak
+Antarabangsa in Kampung Baru); if unsure, talk generally instead of naming places. When it fits naturally, you can bring it back to
+property (e.g. "btw still looking for a place?") - but don't force it every time.
+
+STRICT RULE - never invent facts: no made-up names, phone numbers, emails, addresses, companies, licence numbers,
+prices or listings. Only use: your details below, the FAQ below, and what the tools return. If something isn't
+there, say you'll check and get back to them - do not guess. Don't bring up email or licence numbers yourself.
+Don't call the customer by a name unless they told you their name in this chat.
+
+Your details - a name card lists ONLY these lines, nothing else (no email, no licence number, no placeholders):
+{details}
 
 What you can do:
 1. Find properties: use search_listings. Never invent listings, prices or links - only share what the tool returns.
-   Show at most 5, each as: name - RM price - size - bedrooms - link. If nothing matches, say so and suggest widening.
-2. Condo prices (KLCC / Mont Kiara): use condo_price and quote the sale range, rent range and size range.
+   Show max 3, one short line each: name - RM price - sqft - beds - link. If nothing matches, say so and ask budget/area.
+2. Condo prices: when someone asks the price / "how much" / range of a condo (not a specific unit), ALWAYS call
+   condo_price first and give the ranges in ONE short line, like "sale ~Xm-Ym, rent Xk-Yk, X-Y sf" (with the real numbers). Only if not found, use search_listings.
 3. Owners with a property to rent out or sell: collect location (condo + unit if they will share), sale or rent,
-   price, size, bedrooms/bathrooms, furnishing and their name; ask them to send photos. Ask for missing details
-   a few at a time. Once you have location, sale/rent and price, call save_owner_listing, then thank them and say an
-   agent will follow up.
-4. General questions: answer from the agency info below. If you don't know, say an agent will reply soon.
-Never promise discounts, availability or viewing times yourself - an agent confirms those.
-If the customer asks for a human, say an agent will reply shortly.
+   price, size, bedrooms/bathrooms, furnishing and their name; ask them to send photos. Ask ONE or TWO missing details
+   at a time, casually ("which unit ah? and asking how much?"). Once you have location, sale/rent and price, call save_owner_listing, then thank them and say
+   you'll follow up.
+4. General questions: answer from the FAQ below. If you don't know, say you'll check and get back to them.
+Never confirm discounts, availability or exact viewing times yourself - say you'll check and confirm.
 
 Agency info (FAQ):
 {faq()}"""
@@ -142,23 +198,82 @@ def condo_price(name):
 
 
 # ---------- AI call ----------
+def _models():
+    """Main model first, then free backups - each has its own per-minute allowance on Groq."""
+    main = os.environ.get("BOT_LLM_MODEL", "openai/gpt-oss-120b")
+    backups = os.environ.get("BOT_LLM_BACKUP_MODELS", "openai/gpt-oss-20b,qwen/qwen3.8-27b")
+    return list(dict.fromkeys([main] + [m.strip() for m in backups.split(",") if m.strip()]))
+
+
 def _llm(messages):
     base = os.environ.get("BOT_LLM_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
-    body = json.dumps({"model": os.environ.get("BOT_LLM_MODEL", "openai/gpt-oss-120b"), "messages": messages,
-                       "tools": TOOLS, "tool_choice": "auto", "temperature": 0.3, "max_tokens": 700}).encode()
-    req = urllib.request.Request(f"{base}/chat/completions", data=body, headers={
-        "Content-Type": "application/json", "Authorization": f"Bearer {os.environ.get('BOT_LLM_API_KEY', '')}"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.load(r)["choices"][0]["message"]
+    wait = 0
+    for attempt in range(2):  # every model busy -> wait (as told by the server, max 20 s) and try once more
+        if wait:
+            time.sleep(wait)
+        for model in _models():
+            body = json.dumps({"model": model, "messages": messages, "tools": TOOLS, "tool_choice": "auto",
+                               "temperature": 0.3, "max_tokens": 450}).encode()
+            req = urllib.request.Request(f"{base}/chat/completions", data=body, headers={
+                "Content-Type": "application/json", "Authorization": f"Bearer {os.environ.get('BOT_LLM_API_KEY', '')}",
+                # Groq's firewall rejects Python's default user agent (error 1010)
+                "User-Agent": "KLTrackerBot/1.0", "Accept": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    return json.load(r)["choices"][0]["message"]
+            except urllib.error.HTTPError as e:
+                if e.code not in (429, 503):
+                    raise
+                try:
+                    wait = max(wait, min(20, float(e.headers.get("retry-after") or 5)))
+                except ValueError:
+                    wait = 5
+    raise RuntimeError("all AI models busy (rate limit)")
+
+
+GREETING = re.compile(r"^\s*(hi+|hello+|hey+|hai+|helo+|hallo|yo|morning|good\s*(morning|afternoon|evening|night)|"
+                      r"selamat\s*(pagi|petang|malam|tengahari)|assalamualaikum|salam|你好|您好|早上好|早安)\s*"
+                      r"(there|bro|sis|boss|sir|madam|dear)?\s*[!.~😊🙏👋]*\s*$", re.I)
+
+
+def greeting_reply(text):
+    """A bare 'hi' gets a bare 'hi' back (no AI)."""
+    m = GREETING.match(text or "")
+    if not m:
+        return None
+    word = m.group(1).lower()
+    if word.startswith("good") or word.startswith("selamat") or word == "morning":
+        return f"{m.group(1).strip().capitalize()} 😊"
+    if word in ("assalamualaikum", "salam"):
+        return "Waalaikumsalam 😊"
+    if word in ("你好", "您好", "早上好", "早安"):
+        return f"{word} 😊"
+    return "Hi 😊"
+
+
+def tidy(text):
+    """WhatsApp formatting: **bold** -> *bold*, no markdown headings."""
+    text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
+    text = re.sub(r"\[([^\]]*)\]\((https?://[^)\s]+)\)", r"\2", text)  # WhatsApp shows plain links only
+    text = re.sub(r"(?m)^#{1,6}\s*", "", text)
+    # safety net: the same sentence / chunk accidentally written twice in a row
+    text = re.sub(r"(.{15,}?)[\s.]*\1", r"\1", text)
+    return text.strip()
 
 
 def reply(history, save_owner_listing):
     """history: [{'role': 'user'|'assistant', 'content': str}, ...] (oldest first). Returns the reply text."""
+    if history and history[-1]["role"] == "user" and (g := greeting_reply(history[-1]["content"])):
+        return g
+    return tidy(_reply(history, save_owner_listing))
+
+
+def _reply(history, save_owner_listing):
     load_dotenv(ROOT / ".env", override=True)  # picks up a key saved from the dashboard
     if not os.environ.get("BOT_LLM_API_KEY"):
         return fallback(history[-1]["content"] if history else "")
     impl = {"search_listings": search_listings, "condo_price": condo_price, "save_owner_listing": save_owner_listing}
-    messages = [{"role": "system", "content": system_prompt()}] + history[-14:]
+    messages = [{"role": "system", "content": system_prompt()}] + history[-10:]
     try:
         for _ in range(4):  # allow a few tool calls
             msg = _llm(messages)
@@ -174,23 +289,32 @@ def reply(history, save_owner_listing):
                     result = {"error": str(e)[:200]}
                 messages.append({"role": "tool", "tool_call_id": c["id"],
                                  "content": json.dumps(result, ensure_ascii=False, default=str)[:6000]})
-        return "Thanks! An agent will get back to you shortly. 🙏"
-    except Exception:
-        return fallback(history[-1]["content"] if history else "")
+        return "Thanks! I'll check and get back to you shortly. 🙏"
+    except Exception as e:
+        print("AI call failed:", str(e)[:300], flush=True)  # shows in logs/wa_bot.log
+        text = fallback(history[-1]["content"] if history else "")
+        # never send the same menu twice in a row
+        if any(m["role"] == "assistant" and m["content"] == text for m in history[-4:]):
+            return "Noted 🙏 I'll get back to you shortly."
+        return text
 
 
 def fallback(text):
     """No AI available: simple, honest keyword replies."""
     t = (text or "").lower()
-    if any(w in t for w in ("price", "harga", "how much", "berapa")):
-        for word in re.findall(r"[a-z0-9@ ]{4,}", t):
-            r = condo_price(word.strip())
-            if isinstance(r, list) and r:
-                c = r[0]
-                rm = lambda v: f"RM{v:,}" if v else "-"
-                return (f"{c['condo']} ({c['area']}): sale {rm(c['sale_min'])} - {rm(c['sale_max'])}, "
-                        f"rent {rm(c['rent_min'])} - {rm(c['rent_max'])}, "
-                        f"size {c['sqft_min'] or '-'} - {c['sqft_max'] or '-'} sqft. An agent will follow up! 🙏")
-    return ("Hi! Thanks for your message 🙏 Reply with:\n1) the condo / area and budget you're looking for, or\n"
-            "2) your property details if you're an owner (location, sale/rent, price, photos).\n"
-            "An agent will get back to you shortly.")
+    if any(w in t for w in ("price", "harga", "how much", "berapa", "range")):
+        # the condo name = the message without price words / filler; only answer on a clear name match
+        name = re.sub(r"\b(how much|how|much|price|prices|harga|berapa|range|the|is|of|for|at|ah|ar|lah|leh|eh|"
+                      r"boss|bro|pls|please|can|check|what|whats|condo|unit|rent|rental|sale|sell|buy)\b", " ", t)
+        name = re.sub(r"[^a-z0-9@& ]", " ", name)
+        name = re.sub(r"\s+", " ", name).strip()
+        condo_price("x")  # makes sure the condo list is loaded
+        hits = [r for r in _condo_cache["rows"] if len(name) >= 3 and name in (r.get("condo") or "").lower()]
+        if hits:
+            c = hits[0]
+            k = lambda v: (f"{v / 1e6:.2f}".rstrip("0").rstrip(".") + "m") if v and v >= 1e6 else (
+                f"{v / 1e3:.1f}".rstrip("0").rstrip(".") + "k") if v else "-"
+            return (f"{c['condo']}: sale ~{k(c['sale_min'])}-{k(c['sale_max'])}, rent {k(c['rent_min'])}-"
+                    f"{k(c['rent_max'])}, {c['sqft_min'] or '-'}-{c['sqft_max'] or '-'} sf")
+        return "hmm let me check on that one and get back to you ya"
+    return "ok noted, one sec ah - let me check and get back to you"

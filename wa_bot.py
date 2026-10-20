@@ -110,9 +110,18 @@ def answer(chat):
     text = bot_brain.reply(history(chat), save_owner_listing)
     if not text:
         return
-    time.sleep(min(6, 1 + len(text) / 60))  # human-ish typing time
+    # Like a person: separate thoughts go out as separate bubbles, each after a short "typing" pause
+    parts = [p.strip() for p in text.split("\n\n") if p.strip()][:4]
     try:
-        client.send_message(info["jid"], text)
+        for i, part in enumerate(parts):
+            if i:
+                try:
+                    client.send_chat_presence(info["jid"], ChatPresence.CHAT_PRESENCE_COMPOSING,
+                                              ChatPresenceMedia.CHAT_PRESENCE_MEDIA_TEXT)
+                except Exception:
+                    pass
+            time.sleep(min(5, 1.2 + len(part) / 45))  # human-ish typing time
+            client.send_message(info["jid"], part)
         log(chat, info.get("name"), "assistant", text)
         state["replies_today"] += 1
     except Exception as e:

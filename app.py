@@ -855,7 +855,20 @@ def chat_bot_page():
             with st.spinner("Thinking…"):
                 st.info(bot_brain.reply([{"role": "user", "content": test}], lambda **k: {"saved": "test - not saved"}))
 
-    # 3) FAQ
+    # 3) the agent's real details - the bot never invents these
+    prof = bot_brain.profile()
+    with st.expander("👤 Your details (name card) - the bot only uses these, never makes them up",
+                     expanded=not prof.get("agent_name")):
+        new_prof = {k: st.text_input(label, prof.get(k, ""), key=f"prof-{k}")
+                    for k, label in bot_brain.PROFILE_FIELDS.items()}
+        st.caption("Leave a field empty if you don't want the bot to share it - it will say you'll send it yourself.")
+        if st.button("Save details"):
+            s2 = bot_client.load_settings()
+            s2["profile"] = {k: v.strip() for k, v in new_prof.items()}
+            bot_client.save_settings(s2)
+            st.success("Saved - the bot uses these from the next message.")
+
+    # 4) FAQ
     with st.expander("📝 Your agency info / FAQ (the bot answers from this)"):
         current = bot_brain.faq()
         new = st.text_area("FAQ", current, height=220, label_visibility="collapsed")
