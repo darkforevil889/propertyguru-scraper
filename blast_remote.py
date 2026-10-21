@@ -79,6 +79,11 @@ def heartbeat(db):
         data["ai_call"] = ai_call.status()
     except Exception:
         pass
+    try:  # WhatsApp scan progress, shown on the online WhatsApp page
+        import wa_scan
+        data["wa_scan"] = wa_scan.status()
+    except Exception:
+        pass
     db.table("pc_status").upsert({"name": "pc", "data": data}).execute()
 
 

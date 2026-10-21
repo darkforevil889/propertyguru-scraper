@@ -454,10 +454,13 @@ def whatsapp_page():
 def scan_chats_tab():
     import time
 
+    try:
+        import neonize  # noqa: F401 - only installed on the PC
+    except ImportError:
+        return scan_chats_remote()  # online dashboard: the PC scans, asked through Supabase
     import wa_client
     from phone_filter import extract_from_text
     from wa_export import make_zip
-    from wa_parser import group_by_owner, group_listings, uses_separators
 
     st.caption("Link your WhatsApp by QR code, pick chats (individual or groups), and turn property posts into "
                "listings (type, price, sqft, place, furnishing, phone numbers) with their photos. Scanning is "
@@ -554,120 +557,13 @@ def scan_chats_tab():
                                      "owner (one number, possibly several properties).")
 
     if picked and st.button("Scan messages", type="primary"):
-        run_dir = ROOT_DIR / "wa_exports" / datetime.now().strftime("%Y%m%d_%H%M%S")
-        by_key = {c["jid"]: c["jids"] for c in chats}
-        msgs = wa_client.messages([j for k in picked for j in by_key.get(k, [k])], time.time() - days * 86400)
-        files_msgs = [m for m in msgs if m["has_image"] or m["is_pdf"] or m["is_video"]]
-        if read_pictures and files_msgs:
-            from wa_ocr import is_chat_screenshot, read_pdf, read_text
-            with st.spinner(f"Downloading {len(files_msgs)} pictures / PDFs / videos…"):
-                files = wa_client.download([(m["chatId"], m["id"]) for m in files_msgs], run_dir / "media")
-            for m in files_msgs:
-                if m["id"] in files:
-                    m["photo"] = files[m["id"]]
-            # Read WhatsApp screenshots and PDFs; ordinary photos are skipped (they're only attached)
-            to_read = [m for m in files_msgs if m.get("photo") and
-                       (m["is_pdf"] or is_chat_screenshot(run_dir / "media" / m["photo"]))]
-            skipped = sum(1 for m in files_msgs if m.get("photo")) - len(to_read)
-            bar = st.progress(0.0, text="Reading screenshots / PDFs…")
-            for i, m in enumerate(to_read, 1):
-                bar.progress(i / len(to_read), text=f"Reading screenshots / PDFs… {i}/{len(to_read)} "
-                                                    f"({skipped} ordinary photos skipped)")
-                path = run_dir / "media" / m["photo"]
-                if m["is_pdf"]:
-                    m["pdf_text"] = read_pdf(path)
-                else:
-                    m["ocr_text"] = read_text(path)
-            bar.empty()
-        # Chats where you separate owners with a "." message are grouped per owner; others per message
-        by_chat = {}
-        for m in msgs:
-            by_chat.setdefault(m["chatId"], []).append(m)
-        listings = []
-        for chat_msgs in by_chat.values():
-            listings += (group_by_owner(chat_msgs, mine, settings.get("owner_overrides")) if uses_separators(chat_msgs)
-                         else group_listings(chat_msgs))
-        refs = [p for l in listings for p in l["photos"] if isinstance(p, tuple)]
-        if refs:
-            with st.spinner(f"Downloading {len(refs)} photos…"):
-                files = wa_client.download(refs, run_dir / "media")
-            for l in listings:
-                l["photos"] = [p if isinstance(p, str) else files[p[1]] for p in l["photos"]
-                               if isinstance(p, str) or p[1] in files]
-        for l in listings:  # sender's number in local 01x format when possible
-            nums = [n for n, _, _ in extract_from_text(l["sender_phone"] or "") if n]
-            l["sender_phone"] = nums[0] if nums else l["sender_phone"]
-            # Your own numbers are never an owner's: drop them from the message's numbers / the sender
-            l["phones"] = [p for p in l["phones"] if p not in mine]
-            if l["sender_phone"] in mine:
-                l["sender_phone"], l["sender_name"] = None, "you"
-        st.session_state.wa_result = {"listings": listings, "media": str(run_dir / "media"),
-                                      "messages": len(msgs), "saved": None}
-        # Upload each file ONCE to the private bucket (owner-photos/files/<file>); listings just refer to it.
-        # Supabase's free plan allows up to 50 MB per file - bigger videos stay in the ZIP only.
-        uploaded, upload_error, too_big = {}, None, 0
-        needed = list(dict.fromkeys(p for l in listings for p in l["photos"]))
-        if needed:
-            bar = st.progress(0.0, text="Uploading pictures / PDFs / videos…")
-            for i, p in enumerate(needed, 1):
-                bar.progress(i / len(needed), text=f"Uploading pictures / PDFs / videos… {i}/{len(needed)}")
-                src = run_dir / "media" / p
-                if not src.exists():
-                    continue
-                if src.stat().st_size > 50 * 1024 * 1024:
-                    too_big += 1
-                    continue
-                ext = p.rsplit(".", 1)[-1].lower()
-                ctype = {"pdf": "application/pdf", "mp4": "video/mp4"}.get(ext, "image/jpeg")
-                try:
-                    db.storage.from_(PHOTO_BUCKET).upload(f"files/{p}", src.read_bytes(),
-                                                          {"content-type": ctype, "upsert": "true"})
-                    uploaded[p] = f"files/{p}"
-                except Exception as e:
-                    upload_error = upload_error or str(e).splitlines()[0]
-            bar.empty()
-        # Save to Supabase (re-scans update the same rows instead of duplicating)
-        rows = [{"message_id": l["id"], "chat": l["chat"],
-                 "photo_paths": [uploaded[p] for p in l["photos"] if p in uploaded],
-                 "posted_at": datetime.fromtimestamp(l["posted_at"], timezone.utc).isoformat(),
-                 "sender_name": l["sender_name"], "sender_phone": l["sender_phone"], "listing_type": l["type"],
-                 "price_rm": l["price_rm"], "sqft": l["sqft"], "bedrooms": l["bedrooms"],
-                 "bathrooms": l["bathrooms"], "furnishing": l["furnishing"], "place": l["place"],
-                 "phones": "; ".join(l["phones"]), "photo_count": len(l["photos"]), "message_text": l["text"],
-                 "scanned_by": st.session_state.email,
-                 # added later (schema_owner_listings_v2.sql)
-                 "owner_name": l.get("owner_name"), "unit_no": l.get("unit_no"), "address": l.get("address"),
-                 "rental_rm": l.get("rental_rm"), "tenure": l.get("tenure"), "property_type": l.get("property_type"),
-                 "price_psf": l.get("price_psf"), "owner_no": l.get("owner_no")} for l in listings]
-        new_cols = ("owner_name", "unit_no", "address", "rental_rm", "tenure", "property_type", "price_psf", "owner_no")
-        notes = [f"{too_big} video(s) over 50 MB kept in the ZIP only"] if too_big else []
-        try:
-            try:
-                for i in range(0, len(rows), 500):
-                    db.table("owner_listings").upsert(rows[i:i + 500], on_conflict="message_id").execute()
-            except Exception as e:
-                if "column" not in str(e).lower():
-                    raise
-                # Online table not updated yet: save without the new fields, and say so
-                for i in range(0, len(rows), 500):
-                    db.table("owner_listings").upsert([{k: v for k, v in r.items() if k not in new_cols}
-                                                       for r in rows[i:i + 500]], on_conflict="message_id").execute()
-                notes.append("owner name / unit / rental not saved online yet - run schema_owner_listings_v2.sql")
-            # This scan replaces what earlier scans saved for the same chats (old, less accurate results)
-            try:
-                chats_scanned = list({l["chat"] for l in listings})
-                if chats_scanned:
-                    db.table("owner_listings").delete().in_("chat", chats_scanned) \
-                        .not_.in_("message_id", [r["message_id"] for r in rows]).execute()
-            except Exception:
-                pass  # needs the delete permission from schema_owner_listings_v2.sql
-            if upload_error:
-                notes.append(f"some files not uploaded ({upload_error})")
-            st.session_state.wa_result["saved"] = True if not notes else "; ".join(notes)
-            load_owner_listings.clear()
-        except Exception as e:
-            st.session_state.wa_result["saved"] = str(e).splitlines()[0]
-
+        import wa_scan
+        bar = st.progress(0.0, text="Starting…")
+        st.session_state.wa_result = wa_scan.scan(
+            db, picked, days, read_pictures, st.session_state.email,
+            progress=lambda text, frac=None: bar.progress(min(1.0, frac or 0.0), text=text))
+        bar.empty()
+        load_owner_listings.clear()
     res = st.session_state.get("wa_result")
     if not res:
         return
@@ -697,6 +593,101 @@ def scan_chats_tab():
         "Posted": datetime.fromtimestamp(l["posted_at"], MYT).strftime("%Y-%m-%d %H:%M"),
         "From picture": "📷" if l.get("from_picture") else "",
         "Chat": l["chat"], "Message": l["text"][:200]} for l in listings]), hide_index=True, width="stretch")
+
+
+def scan_chats_remote():
+    """Scan chats from the online dashboard: the chat list comes from the PC (copied up every minute); pressing
+    Scan asks the PC to do it (wa_scan.py) and the listings appear in Saved listings."""
+    import time
+
+    import wa_scan
+    from phone_filter import extract_from_text
+
+    st.caption("Pick chats (individual or groups) and turn property posts into listings with their photos. Your PC "
+               "does the scanning (it has your WhatsApp and reads the screenshots) - results appear in the "
+               "**Saved listings** tab.")
+    try:
+        pc = wa_scan.remote_chats(db)
+    except Exception as e:
+        st.error(f"Couldn't reach Supabase: {e}")
+        return
+    age = time.time() - (pc.get("at") or 0)
+    if not pc:
+        st.warning("🖥️ Your PC hasn't sent its WhatsApp chats yet - make sure it's on, then reload in a minute.")
+        return
+    if age > 300:
+        st.warning(f"🖥️ Your PC was last seen {age / 60:.0f} minutes ago - scans wait until it's back on.")
+    if pc.get("status") not in ("ready", "syncing"):
+        st.warning("WhatsApp isn't connected on your PC - open the dashboard on the PC and link it by QR code "
+                   "(WhatsApp page) once.")
+        return
+    me = pc.get("me") or {}
+    st.success(f"Connected on your PC as **{me.get('name') or '?'}** (+{me.get('number') or '?'}) · chat list "
+               f"updated {max(0, age) / 60:.0f} min ago")
+
+    # ----- a scan in progress / just finished -----
+    stt = wa_scan.status_remote(db)
+    waiting = [t for t in wa_scan.pending(db) if t["kind"] == "wa_scan"]
+    if waiting or (stt.get("state") == "running" and time.time() - stt.get("at", 0) < 900):
+        @st.fragment(run_every="5s")
+        def scan_progress():
+            s = wa_scan.status_remote(db)
+            if s.get("state") == "running" and time.time() - s.get("at", 0) < 900:
+                st.progress(min(1.0, s.get("frac") or 0.0), text=f"🖥️ Your PC is scanning: {s.get('text')}")
+            elif [t for t in wa_scan.pending(db) if t["kind"] == "wa_scan"]:
+                st.info("⏳ Sent to your PC - the scan starts within about 15 seconds.")
+            else:
+                load_owner_listings.clear()
+                st.rerun(scope="app")
+        scan_progress()
+        return
+    if stt.get("state") == "done" and time.time() - stt.get("at", 0) < 3600:
+        saved = stt.get("saved")
+        st.success(f"✅ Last scan: {stt.get('messages', 0):,} messages read, {stt.get('listings', 0):,} listings, "
+                   f"{stt.get('photos', 0):,} photos" + (" - see the **Saved listings** tab." if saved is True
+                                                         else f". Note: {saved}"))
+    elif stt.get("state") == "error":
+        st.error(f"Last scan stopped: {stt.get('error')}")
+
+    chats = pc.get("chats") or []
+    if not chats:
+        st.info("No chats on the PC yet.")
+        return
+    label = {c["jid"]: f"{'👥' if c['is_group'] else '👤'} {c['name'] or ('+' + c['phone'] if c['phone'] else c['jid'])}"
+                       f"{' (+' + c['phone'] + ')' if c['phone'] and c['name'] else ''} · {c['messages']} msgs"
+             for c in chats}
+    groups = [c["jid"] for c in chats if c["is_group"]]
+    settings = pc.get("settings") or {}
+    settings.setdefault("my_numbers", [])
+    settings.setdefault("listing_groups", [])
+    with st.expander("⚙️ My numbers & listing groups", expanded=not settings["listing_groups"]):
+        nums_text = st.text_area("My own numbers - never recorded as an owner's number (one per line)",
+                                 "\n".join(settings["my_numbers"]), height=90)
+        my_groups = st.multiselect("My listing groups (where owner listings are posted)", groups,
+                                   [g for g in settings["listing_groups"] if g in groups], format_func=label.get)
+        if st.button("Save settings"):
+            nums = list(dict.fromkeys(n for n, _, _ in extract_from_text(nums_text) if n))
+            wa_scan.request(db, "wa_settings", {"my_numbers": nums, "listing_groups": my_groups})
+            st.success("Sent to your PC - it's applied within about 15 seconds.")
+
+    c1, c2 = st.columns([3, 1])
+    views = (["My listing groups"] if settings["listing_groups"] else []) + ["Individual chats", "Groups", "All"]
+    kind = c2.radio("Show", views, label_visibility="collapsed")
+    if kind == "My listing groups":
+        options = [g for g in settings["listing_groups"] if g in label]
+        default = options
+    else:
+        options = [c["jid"] for c in chats if kind == "All" or (kind == "Groups") == c["is_group"]]
+        default = []
+    picked = c1.multiselect("Chats to scan (newest first)", options, default, format_func=label.get,
+                            key=f"rpick-{kind}")
+    days = st.slider("Messages from the last N days", 1, 365, 60)
+    read_pictures = st.checkbox("Read WhatsApp screenshots and PDFs", value=True,
+                                help="Done on your PC (about 1-3 seconds each); ordinary photos are attached only.")
+    if picked and st.button("Scan messages", type="primary"):
+        wa_scan.request(db, "wa_scan", {"chats": picked, "days": days, "read_pictures": read_pictures,
+                                        "by": st.session_state.get("email") or "online dashboard"})
+        st.rerun()
 
 
 # ---------- condo prices (one row per condo: KLCC, Mont Kiara ...) ----------
