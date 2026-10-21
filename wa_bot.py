@@ -221,6 +221,10 @@ def on_message(c, ev):
         schedule(chat, info, 25)  # owners often send several photos - answer once they pause
         return
     text = m.conversation or (m.extendedTextMessage.text if m.HasField("extendedTextMessage") else "")
+    if not text and m.HasField("interactiveResponseMessage"):  # they tapped a quick-reply button from a blast
+        text = m.interactiveResponseMessage.body.text
+    if not text and m.HasField("buttonsResponseMessage"):
+        text = m.buttonsResponseMessage.selectedDisplayText
     if not text.strip():
         return
     log(chat, name, "user", text.strip())

@@ -984,10 +984,38 @@ def whatsapp_blast_page():
                 head = (f"{'🧪 Test' if j.get('test') else '📣'} {datetime.fromtimestamp(j['created']):%d %b %I:%M %p}"
                         f" · {total} {'person' if total == 1 else 'people'} · {state}")
                 with st.expander(head, expanded=live and i < 3):
+                    unable = count["not on WhatsApp"] + count["failed"]
                     st.progress(len(res) / max(total, 1),
-                                text=f"✅ {count['sent']} sent · 🚫 {count['not on WhatsApp']} not on WhatsApp · "
-                                     f"⚠️ {count['failed']} failed · ⏳ {total - len(res)} still to send")
+                                text=f"✅ {count['sent']} sent · ❌ {unable} unable to message · "
+                                     f"⏳ {total - len(res)} still to send")
+                    if unable:
+                        names = {n["phone"]: n.get("name") for n in j["numbers"]}
+                        st.error(f"❌ **Unable to message {unable}:**\n\n" + "\n".join(
+                            f"- {p}{' ' + names[p] if names.get(p) else ''} - {r.get('error') or r['status']}"
+                            for p, r in res.items() if r.get("status") != "sent"))
+                        retry = [n for n in j["numbers"] if (res.get(n["phone"]) or {}).get("status") == "failed"]
+                        if retry and not live and st.button(f"🔁 Try the {len(retry)} failed again",
+                                                            key=f"retry-{j['id']}",
+                                                            help="Numbers not on WhatsApp are left out."):
+                            folder = wa_blast.FILES / j["id"]
+                            wa_blast.create(j["sender"], retry, j["message"],
+                                            [(f, (folder / f).read_bytes()) for f in j.get("files") or []
+                                             if (folder / f).exists()],
+                                            j.get("buttons") or wa_blast.clean_buttons(
+                                                [{"type": "url", **(j.get("button") or {}),
+                                                  "value": (j.get("button") or {}).get("url")}]),
+                                            j.get("button_style", "link"), j.get("footer", ""),
+                                            delay=j["delay"], daily_limit=j["daily_limit"],
+                                            window=wa_blast.window_of(j),
+                                            rest=((j.get("rest") or {}).get("every", 0),
+                                                  (j.get("rest") or {}).get("minutes", 0)))
+                            st.rerun()
+                    rest = j.get("rest") or {}
+                    w = wa_blast.window_of(j)
                     st.caption("From: " + wa_blast.SENDERS.get(j["sender"], j["sender"])
+                               + (f" · sends {wa_blast.clock(w[0])} - {wa_blast.clock(w[1])}" if w else "")
+                               + (f" · rests {rest['minutes'] // 60} h {rest['minutes'] % 60} min after every "
+                                  f"{rest['every']} messages" if rest.get("every") and rest.get("minutes") else "")
                                + (f" · attachments: {', '.join(j['files'])}" if j.get("files") else ""))
                     st.text(wa_blast.full_text(j, "{name}")[:600])
                     if live:
@@ -1002,8 +1030,10 @@ def whatsapp_blast_page():
                         if b[1].button("✖️ Cancel", key=f"can-{j['id']}"):
                             wa_blast.set_control(j["id"], "cancel")
                             st.rerun()
+                    label = {"sent": "✅ Sent", "not on WhatsApp": "❌ Unable to message",
+                             "failed": "❌ Unable to message"}
                     rows = [{"Number": n["phone"], "Name": n.get("name") or "",
-                             "Result": (res.get(n["phone"]) or {}).get("status", "waiting"),
+                             "Result": label.get((res.get(n["phone"]) or {}).get("status"), "⏳ Waiting"),
                              "Time": (datetime.fromtimestamp(res[n["phone"]]["at"]).strftime("%d %b %I:%M %p")
                                       if n["phone"] in res else ""),
                              "Problem": (res.get(n["phone"]) or {}).get("error", "")} for n in j["numbers"]]
@@ -1016,6 +1046,7 @@ def whatsapp_blast_page():
 
 def new_blast_form(wa_blast, wa_client, senders):
     import time
+    from datetime import time as dtime
 
     from phone_filter import extract_from_text
 
@@ -1061,45 +1092,93 @@ def new_blast_form(wa_blast, wa_client, senders):
     atts = st.file_uploader("Photos / videos / PDF (optional - the message goes with the first one)",
                             accept_multiple_files=True, key=f"blast-atts-{v}",
                             type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "pdf", "doc", "docx", "xls", "xlsx"])
-    b1, b2 = st.columns([1, 2])
-    label = b1.text_input("Button text (optional)", placeholder="WhatsApp me", key=f"blast-btn-{v}")
-    link = b2.text_input("Button link - a website, or just a phone number for a WhatsApp chat link",
-                         placeholder="0123456789  or  https://…", key=f"blast-link-{v}").strip()
-    if link and not link.lower().startswith("http"):
-        num = next((n for n, _, _ in extract_from_text(link) if n), None)
-        link = f"https://wa.me/6{num}" if num else "https://" + link
-    st.caption("Normal WhatsApp accounts can't send real buttons (only the paid WhatsApp Business API can), so it is "
-               "added as a tappable link at the end of the message.")
-    button = {"label": label, "url": link} if link else None
-    if msg.strip() or link:
+    st.markdown("**Buttons (optional, up to 3)**")
+    style = st.radio("How the buttons look", ["link", "real"], horizontal=True, key=f"blast-style-{v}",
+                     format_func={"link": "Links at the end of the message (works on every phone)",
+                                  "real": "Real buttons like WhatsApp Business (try a test first)"}.get)
+    if style == "real":
+        st.caption("⚠️ Real buttons are unofficial on a normal WhatsApp: most phones show them, but WhatsApp on a "
+                   "computer and some iPhones may not, and heavy use could get the number restricted. Send a test "
+                   "to your own phone first. A first photo goes on top of the message, like WhatsApp Business.")
+    kinds = {"": "No button", "url": "🔗 Link / WhatsApp chat", "call": "📞 Call", "reply": "💬 Quick reply"}
+    hints = {"url": "Website, or a phone number for a WhatsApp chat link", "call": "Phone number to call",
+             "reply": "(not needed - tapping it sends the button text back to you)"}
+    rows = []
+    for i in range(3):
+        c1, c2, c3 = st.columns([1.2, 1.2, 2])
+        kind = c1.selectbox(f"Button {i + 1}", list(kinds), format_func=kinds.get, key=f"blast-bk{i}-{v}")
+        label = c2.text_input("Text on the button", key=f"blast-bl{i}-{v}", disabled=not kind,
+                              placeholder={"url": "WhatsApp me", "call": "Call me", "reply": "Interested"}.get(kind, ""))
+        value = c3.text_input(hints.get(kind, "Link / number"), key=f"blast-bv{i}-{v}",
+                              disabled=kind in ("", "reply"),
+                              placeholder={"url": "0123456789  or  https://…", "call": "0123456789"}.get(kind, ""))
+        if kind:
+            rows.append({"type": kind, "label": label, "value": value})
+            if kind in ("url", "call") and value.strip() and not wa_blast.clean_buttons([rows[-1]]):
+                c3.caption("⚠️ Not a Malaysian mobile number")
+    buttons = wa_blast.clean_buttons(rows)
+    footer = st.text_input("Small grey text at the bottom (optional)", placeholder="Homex Property",
+                           key=f"blast-foot-{v}")
+    spec = {"message": msg, "buttons": buttons, "button_style": style, "footer": footer}
+    if msg.strip() or buttons:
         sample = numbers[0] if numbers else {"name": "Ali"}
         st.markdown("**Preview**" + (f" (for {sample.get('name') or 'someone without a name'})"))
-        st.info(wa_blast.full_text({"message": msg, "button": button}, sample.get("name")) or "(no text)")
+        if style == "real" and buttons:
+            st.info(wa_blast.full_text(spec, sample.get("name"), body_only=True)
+                    + (f"\n\n_{footer}_" if footer else "") + "\n\n"
+                    + "  ".join(f"[ {kinds[b['type']].split()[0]} {b['label']} ]" for b in buttons))
+        else:
+            st.info(wa_blast.full_text(spec, sample.get("name")) or "(no text)")
 
     st.subheader("3. When")
-    t1, t2, t3 = st.columns(3)
-    delay = t1.slider("Pause between people (seconds, random)", 15, 600, (45, 120), step=5)
+
+    def mins_secs(s):
+        return f"{s // 60} min {s % 60:02d} s" if s >= 60 else f"{s} s"
+
+    t1, t2 = st.columns(2)
+    delay = t1.slider("Pause between people (seconds, random)", 15, 900, (45, 120), step=5)
+    t1.caption(f"Waits {mins_secs(delay[0])} to {mins_secs(delay[1])} before the next person.")
     limit = t2.number_input("Max people per day", 1, 300, 40,
                             help="The rest carry on the next day. Keeping it low protects your number.")
-    hours = t3.slider("Only send between (hour of day)", 0, 24, (9, 21))
+
+    st.markdown("**Rest break**")
+    r1, r2, r3 = st.columns(3)
+    every = r1.number_input("Rest after every … messages (0 = no break)", 0, 500, 10)
+    rest_h = r2.number_input("Rest for … hours", 0, 23, 0, disabled=not every)
+    rest_m = r3.number_input("and … minutes", 0, 59, 15, disabled=not every)
+    rest_min = (rest_h * 60 + rest_m) if every else 0
+    if every and not rest_min:
+        st.caption("Rest time is 0, so there's no break.")
+
+    st.markdown("**Sending hours**")
+    w1, w2 = st.columns(2)
+    from_t = w1.time_input("Only send from", dtime(9, 0), step=60)
+    until_t = w2.time_input("until", dtime(21, 0), step=60)
+    window = (from_t.hour * 60 + from_t.minute, until_t.hour * 60 + until_t.minute)
+    if window[0] == window[1]:
+        w1.caption("Same time = sends any time of day.")
+
     when = st.radio("Start", ["Now", "At a set time"], horizontal=True)
     start_at = time.time()
     if when == "At a set time":
         d1, d2 = st.columns(2)
         day = d1.date_input("Date", datetime.now().date(), min_value=datetime.now().date())
-        at = d2.time_input("Time", (datetime.now() + timedelta(hours=1)).replace(minute=0).time(), step=900)
+        at = d2.time_input("Time (hour and minute)", (datetime.now() + timedelta(hours=1)).replace(minute=0).time(),
+                           step=60)
         start_at = datetime.combine(day, at).timestamp()
         if start_at < time.time():
             st.warning("That time has already passed - it would start right away.")
     if numbers:
-        mins = len(numbers) * (sum(delay) / 2 + 8) / 60
-        days = -(-len(numbers) // limit)
-        st.caption(f"About {mins:.0f} minutes of sending" + (f", spread over {days} days (max {limit} a day)"
-                                                             if days > 1 else "") + ".")
+        n = len(numbers)
+        secs = n * (sum(delay) / 2 + 8) + ((n - 1) // every * rest_min * 60 if every and rest_min else 0)
+        days = -(-n // limit)
+        st.caption(f"About {secs // 3600:.0f} h {secs % 3600 // 60:.0f} min of sending (including breaks)"
+                   + (f", spread over {days} days (max {limit} a day)" if days > 1 else "") + ".")
 
     files = [(a.name, a.getvalue()) for a in atts or []]
-    if not (msg.strip() or files or link):
+    if not (msg.strip() or files or buttons):
         return
+    look = dict(buttons=buttons, button_style=style, footer=footer)
     st.divider()
     t_col, go_col = st.columns(2)
     default_test = (wa_client.load_settings().get("my_numbers") or [""])[0] if sender == "main" else ""
@@ -1111,15 +1190,15 @@ def new_blast_form(wa_blast, wa_client, senders):
             st.error("Put a Malaysian mobile number in Test number.")
         else:
             wa_blast.create(sender, [{"phone": tn, "name": (numbers[0].get("name") if numbers else None)}],
-                            msg, files, button, test=True)
+                            msg, files, test=True, **look)
             st.success(f"Test sending to {tn} now - check that phone in a few seconds.")
     if not numbers:
         go_col.info("Add some numbers in step 1.")
         return
     ok = go_col.checkbox(f"Yes, send this to {len(numbers)} {'person' if len(numbers) == 1 else 'people'}")
     if go_col.button("📣 Start blast", type="primary", disabled=not ok):
-        wa_blast.create(sender, numbers, msg, files, button, start_at=start_at, delay=delay,
-                        daily_limit=limit, hours=hours)
+        wa_blast.create(sender, numbers, msg, files, start_at=start_at, delay=delay, **look,
+                        daily_limit=limit, window=window, rest=(every, rest_min))
         st.session_state.blast_v = v + 1  # fresh, empty form next time - no accidental second send
         st.success("Blast saved" + (f" - starts {datetime.fromtimestamp(start_at):%d %b %I:%M %p}"
                                     if when == "At a set time" else " - sending has started")

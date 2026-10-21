@@ -72,9 +72,36 @@ def lines_from_file(filename, data):
             for t in read_tables(filename, data) for row in t.to_numpy()]
 
 
-def create(sender, numbers, message, attachments=(), button=None, start_at=None, delay=(45, 120),
-           daily_limit=40, hours=(9, 21), test=False):
-    """Save a new blast; the sender picks it up within a few seconds (or at start_at). Returns its id."""
+def _intl(value):
+    """'012-345 6789' -> '60123456789' (None if it isn't a Malaysian mobile)."""
+    from phone_filter import extract_from_text
+    n = next((n for n, _, _ in extract_from_text(value or "") if n), None)
+    return "6" + n if n else None
+
+
+def clean_buttons(rows):
+    """Form rows [{'type': 'url'|'call'|'reply', 'label', 'value'}] -> usable buttons (max 3), bad rows dropped.
+    A link that is just a phone number becomes a WhatsApp chat link."""
+    out = []
+    for b in rows:
+        t, label, value = b.get("type"), (b.get("label") or "").strip(), (b.get("value") or "").strip()
+        if t == "url" and value:
+            if not value.lower().startswith("http"):
+                p = _intl(value)
+                value = f"https://wa.me/{p}" if p else "https://" + value
+            out.append({"type": "url", "label": label or "Open", "value": value})
+        elif t == "call" and _intl(value):
+            out.append({"type": "call", "label": label or "Call me", "value": "+" + _intl(value)})
+        elif t == "reply" and label:
+            out.append({"type": "reply", "label": label, "value": label})
+    return out[:3]
+
+
+def create(sender, numbers, message, attachments=(), buttons=(), button_style="link", footer="", start_at=None,
+           delay=(45, 120), daily_limit=40, window=(9 * 60, 21 * 60), rest=(0, 0), test=False):
+    """Save a new blast; the sender picks it up within a few seconds (or at start_at). Returns its id.
+    window = (from, until) in minutes of the day; rest = (every N sent messages, rest that many minutes).
+    button_style 'link' = buttons written as links at the end; 'real' = WhatsApp Business-style buttons."""
     DIR.mkdir(exist_ok=True)
     bid = datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
     files = []
@@ -85,9 +112,10 @@ def create(sender, numbers, message, attachments=(), button=None, start_at=None,
         (folder / safe).write_bytes(data)
         files.append(safe)
     spec = {"id": bid, "created": time.time(), "sender": sender, "numbers": numbers, "message": message,
-            "files": files, "button": button, "start_at": start_at or time.time(),
-            "delay": list(delay), "daily_limit": int(daily_limit), "hours": list(hours) if hours else None,
-            "test": test, "control": "run"}
+            "files": files, "buttons": list(buttons or []), "button_style": button_style, "footer": footer or "",
+            "start_at": start_at or time.time(),
+            "delay": list(delay), "daily_limit": int(daily_limit), "window": list(window) if window else None,
+            "rest": {"every": int(rest[0]), "minutes": int(rest[1])}, "test": test, "control": "run"}
     _write(DIR / f"{bid}.json", spec)
     return bid
 
@@ -124,6 +152,27 @@ def recently_sent(days):
     return done
 
 
+def clock(minutes):
+    """540 -> '9:00 AM'."""
+    return datetime(2000, 1, 1, minutes // 60 % 24, minutes % 60).strftime("%I:%M %p").lstrip("0")
+
+
+def window_of(spec):
+    """Sending hours as (from, until) minutes of the day, or None = any time (older blasts kept whole hours)."""
+    if spec.get("window"):
+        return spec["window"]
+    h = spec.get("hours")
+    return [h[0] * 60, h[1] * 60] if h else None
+
+
+def in_window(w, now=None):
+    now = now or datetime.now()
+    m, (a, b) = now.hour * 60 + now.minute, w
+    if a == b:
+        return True
+    return a <= m < b if a < b else (m >= a or m < b)  # e.g. 10 PM - 2 AM goes past midnight
+
+
 def state_of(job):
     """Human status for the dashboard."""
     prog, total = job.get("progress") or {}, len(job["numbers"])
@@ -136,6 +185,10 @@ def state_of(job):
         return "Paused"
     if time.time() < job["start_at"]:
         return f"Scheduled for {datetime.fromtimestamp(job['start_at']):%d %b %Y %I:%M %p}"
+    if time.time() < prog.get("rest_until", 0):
+        every = (job.get("rest") or {}).get("every")
+        return (f"Resting until {datetime.fromtimestamp(prog['rest_until']):%I:%M %p}".replace(" 0", " ")
+                + (f" (break after every {every} messages)" if every else ""))
     return prog.get("state") or "Waiting for WhatsApp to connect"
 
 
@@ -148,24 +201,89 @@ def personalise(text, name):
     return re.sub(r"[ ,]*\{name\}", "", text)
 
 
-def full_text(spec, name):
+def real_buttons(spec):
+    return spec.get("button_style") == "real" and bool(spec.get("buttons"))
+
+
+def full_text(spec, name, body_only=False):
+    """The message for one person. Unless body_only, buttons are written out as links at the end."""
     text = personalise(spec.get("message") or "", name).strip()
-    b = spec.get("button") or {}
+    if body_only:
+        return text
+    lines = []
+    b = spec.get("button") or {}  # blasts saved before multiple buttons existed
     if b.get("url"):
-        text += f"\n\n{(b.get('label') or 'Click here').strip()} 👉 {b['url'].strip()}"
-    return text.strip()
+        lines.append(f"{(b.get('label') or 'Click here').strip()} 👉 {b['url'].strip()}")
+    for b in spec.get("buttons") or []:
+        lines.append({"url": f"{b['label']} 👉 {b['value']}", "call": f"{b['label']} 📞 {b['value']}",
+                      "reply": f"👉 Reply \"{b['label']}\""}[b["type"]])
+    if spec.get("footer"):
+        lines.append(f"_{spec['footer']}_")
+    return (text + "\n\n" + "\n".join(lines)).strip() if lines else text
+
+
+def build_buttons(spec, text, image=None):
+    """WhatsApp Business-style message: text (+ picture on top), grey footer, up to 3 buttons underneath.
+    Unofficial on a normal WhatsApp - most phones show it, some (computer / some iPhones) may not."""
+    from neonize.proto.waE2E import WAWebProtobufsE2E_pb2 as P
+    IM = P.InteractiveMessage
+    kinds = {"url": ("cta_url", lambda b: {"display_text": b["label"], "url": b["value"], "merchant_url": b["value"]}),
+             "call": ("cta_call", lambda b: {"display_text": b["label"], "phone_number": b["value"]}),
+             "reply": ("quick_reply", lambda b: {"display_text": b["label"], "id": b["value"]})}
+    buttons = [IM.NativeFlowMessage.NativeFlowButton(name=kinds[b["type"]][0],
+                                                     buttonParamsJSON=json.dumps(kinds[b["type"]][1](b)))
+               for b in spec["buttons"]]
+    header = IM.Header(title="", hasMediaAttachment=image is not None)
+    if image is not None:
+        header.imageMessage.CopyFrom(image)
+    im = IM(header=header, body=IM.Body(text=text),
+            nativeFlowMessage=IM.NativeFlowMessage(buttons=buttons, messageParamsJSON="", messageVersion=1))
+    if spec.get("footer"):
+        im.footer.text = spec["footer"]
+    inner = P.Message(messageContextInfo=P.MessageContextInfo(deviceListMetadata=P.DeviceListMetadata(),
+                                                              deviceListMetadataVersion=2),
+                      interactiveMessage=im)
+    return P.Message(viewOnceMessage=P.FutureProofMessage(message=inner))
+
+
+def _send_file(client, jid, f, cap):
+    data, ext = f.read_bytes(), f.suffix.lower()
+    if ext in IMAGE:
+        client.send_image(jid, data, caption=cap)
+    elif ext in VIDEO:
+        try:
+            client.send_video(jid, data, caption=cap)
+        except Exception:  # video needs ffmpeg on this PC - send it as a file instead
+            client.send_document(jid, data, caption=cap, filename=f.name, title=f.name,
+                                 mimetype=mimetypes.guess_type(f.name)[0] or "video/mp4")
+    else:
+        client.send_document(jid, data, caption=cap, filename=f.name, title=f.name,
+                             mimetype=mimetypes.guess_type(f.name)[0] or "application/octet-stream")
+
+
+def why(e):
+    """An error from WhatsApp -> a short reason a person can understand."""
+    t = str(e).lower()
+    if any(k in t for k in ("timeout", "timed out", "websocket", "not connected", "connection", "eof", "context")):
+        return "WhatsApp connection problem"
+    if "blocked" in t or "forbidden" in t or "403" in t:
+        return "WhatsApp refused it (this person may have blocked you)"
+    return (str(e).strip().splitlines() or [type(e).__name__])[0][:150]
 
 
 def _send_one(client, spec, item):
+    """Returns {'status': 'sent' | 'not on WhatsApp' | 'failed', 'error': reason, 'at': time};
+    'retry': True means nothing went out yet and it is worth trying again (e.g. connection dropped)."""
     from neonize.utils.enum import ChatPresence, ChatPresenceMedia
     try:
         found = client.is_on_whatsapp("+6" + item["phone"])  # 0123456789 -> +60123456789
     except Exception as e:
-        return {"status": "failed", "error": str(e)[:200], "at": time.time()}
+        return {"status": "failed", "error": why(e), "at": time.time(), "retry": True}
     if not found or not found[0].IsIn:
-        return {"status": "not on WhatsApp", "at": time.time()}
+        return {"status": "not on WhatsApp", "error": "This number isn't on WhatsApp", "at": time.time()}
     jid = found[0].JID
     text = full_text(spec, item.get("name"))
+    sent_any = False
     try:
         try:
             client.send_chat_presence(jid, ChatPresence.CHAT_PRESENCE_COMPOSING,
@@ -174,29 +292,37 @@ def _send_one(client, spec, item):
             pass
         time.sleep(min(6, 2 + len(text) / 50))  # "typing..."
         files = [FILES / spec["id"] / f for f in spec.get("files") or []]
+        for f in files:
+            if not f.exists():
+                raise FileNotFoundError(f"attachment {f.name} is missing on this PC")
+        if real_buttons(spec):
+            # A first photo goes on top of the button message; other files go just before it
+            image = None
+            if files and files[0].suffix.lower() in IMAGE:
+                image = client.build_image_message(files[0].read_bytes()).imageMessage
+                files = files[1:]
+            for f in files:
+                _send_file(client, jid, f, None)
+                sent_any = True
+                time.sleep(random.uniform(1.5, 3.5))
+            client.send_message(jid, build_buttons(spec, full_text(spec, item.get("name"), body_only=True), image))
+            return {"status": "sent", "at": time.time()}
         if not files:
             try:
                 client.send_message(jid, text, link_preview="http" in text)
             except Exception:
                 client.send_message(jid, text)  # link preview fetch failed - plain text is fine
+            sent_any = True
         for i, f in enumerate(files):
-            cap, data, ext = (text or None) if i == 0 else None, f.read_bytes(), f.suffix.lower()
-            if ext in IMAGE:
-                client.send_image(jid, data, caption=cap)
-            elif ext in VIDEO:
-                try:
-                    client.send_video(jid, data, caption=cap)
-                except Exception:  # video needs ffmpeg on this PC - send it as a file instead
-                    client.send_document(jid, data, caption=cap, filename=f.name, title=f.name,
-                                         mimetype=mimetypes.guess_type(f.name)[0] or "video/mp4")
-            else:
-                client.send_document(jid, data, caption=cap, filename=f.name, title=f.name,
-                                     mimetype=mimetypes.guess_type(f.name)[0] or "application/octet-stream")
+            _send_file(client, jid, f, (text or None) if i == 0 else None)
+            sent_any = True
             if i < len(files) - 1:
                 time.sleep(random.uniform(1.5, 3.5))
         return {"status": "sent", "at": time.time()}
     except Exception as e:
-        return {"status": "failed", "error": str(e)[:200], "at": time.time()}
+        if sent_any:  # don't send the first part twice - just report it
+            return {"status": "failed", "error": f"Only part of it went through ({why(e)})", "at": time.time()}
+        return {"status": "failed", "error": why(e), "at": time.time(), "retry": "connection" in why(e)}
 
 
 def _keep_awake(on):
@@ -227,14 +353,15 @@ def worker(client, sender, state):
                 continue
             job = due[0]
             prog_path = DIR / f"{job['id']}.progress.json"
-            prog = job["progress"] or {"results": {}}
+            prog = job["progress"] or {}
             prog.setdefault("results", {})
+            prog.setdefault("tries", {})
             if not job.get("test"):
-                if now < next_at:
+                if now < next_at or now < prog.get("rest_until", 0):
                     continue
-                h = job.get("hours")
-                if h and not (h[0] <= datetime.now().hour < h[1]):
-                    prog["state"] = f"Waiting - only sends between {h[0]}:00 and {h[1]}:00"
+                w = window_of(job)
+                if w and not in_window(w):
+                    prog["state"] = f"Waiting - only sends between {clock(w[0])} and {clock(w[1])}"
                     _write(prog_path, prog)
                     continue
                 midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
@@ -246,9 +373,26 @@ def worker(client, sender, state):
                     _write(prog_path, prog)
                     continue
             item = next(n for n in job["numbers"] if n["phone"] not in prog["results"])
+            phone = item["phone"]
             prog["state"] = "Sending"
-            prog["results"][item["phone"]] = _send_one(client, job, item)
-            if len(prog["results"]) >= len(job["numbers"]):
+            res = _send_one(client, job, item)
+            if res.pop("retry", False):
+                prog["tries"][phone] = prog["tries"].get(phone, 0) + 1
+                if prog["tries"][phone] < 3:  # connection hiccup: try this person again in a minute
+                    prog["state"] = f"{res['error']} - trying again in a minute"
+                    _write(prog_path, prog)
+                    next_at = time.time() + 60
+                    continue
+                res["error"] += " (tried 3 times)"
+            prog["results"][phone] = res
+            left = len(job["numbers"]) - len(prog["results"])
+            rest = job.get("rest") or {}
+            if res["status"] == "sent" and not job.get("test") and rest.get("every") and rest.get("minutes"):
+                prog["since_rest"] = prog.get("since_rest", 0) + 1
+                if prog["since_rest"] >= rest["every"] and left:
+                    prog["since_rest"], prog["rest_until"] = 0, time.time() + rest["minutes"] * 60
+                    prog["state"] = "Resting"
+            if not left:
                 prog["state"], prog["finished"] = "Finished", time.time()
             _write(prog_path, prog)
             if not job.get("test"):
