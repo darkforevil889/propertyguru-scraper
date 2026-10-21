@@ -110,8 +110,8 @@ with st.sidebar:
         st.session_state.logged_out = True
         write_cookie("", days=0)
         st.rerun()
-    tool = st.radio("Page", ["Listings", "Condo prices", "WhatsApp", "WhatsApp blast", "Chat bot", "Phone filter",
-                             "Price filter"])
+    tool = st.radio("Page", ["Listings", "Condo prices", "WhatsApp", "WhatsApp blast", "Chat bot", "AI call",
+                             "Phone filter", "Price filter"], key="page")
 
 
 # ---------- phone filter ----------
@@ -937,42 +937,73 @@ def chat_bot_page():
 def whatsapp_blast_page():
     from collections import Counter
 
-    st.title("WhatsApp blast")
-    st.caption("Send one message - with photos / videos / PDF and a link button if you like - to a list of numbers, "
-               "one person at a time with a random pause in between, now or at a time you choose. It sends from "
-               "this PC, so keep the PC on until it finishes (it won't go to sleep while a blast is waiting).")
-    try:
-        import neonize  # noqa: F401
-        import bot_client
-        import wa_blast
-        import wa_client
-    except ImportError:
-        st.info("WhatsApp blast only works on the PC where your WhatsApp is linked (open the dashboard there).")
-        return
+    import importlib
+    import time
 
-    senders, me_of = {}, {}
-    for key, mod in (("main", wa_client), ("bot", bot_client)):
-        s = mod.status()
-        if not s and key == "main":
-            try:
-                s = wa_client.ensure_running()
-            except Exception:
-                s = None
-        if s and s.get("status") == "ready":
-            me_of[key] = (s.get("me") or {}).get("number") or ""
-            senders[key] = f"{wa_blast.SENDERS[key]} (+{me_of[key]})"
+    import wa_blast
+    wa_blast = importlib.reload(wa_blast)  # always the latest version, even if the dashboard has run for days
+
+    st.title("WhatsApp blast")
+    st.caption("Send one message - with photos / videos / PDF and auto replies if you like - to a list of numbers, "
+               "one person at a time with a random pause in between, now or at a time you choose. Your PC does the "
+               "sending, so keep it on until a blast finishes (it won't go to sleep while a blast is waiting).")
+    try:
+        import neonize  # noqa: F401 - only installed on the PC
+        on_pc = True
+    except ImportError:
+        on_pc = False
+
+    senders, default_test = {}, ""
+    if on_pc:  # here on the PC: blasts are files the sender reads directly
+        import bot_client
+        import wa_client
+        store = wa_blast
+        for key, mod in (("main", wa_client), ("bot", bot_client)):
+            s = mod.status()
+            if not s and key == "main":
+                try:
+                    s = wa_client.ensure_running()
+                except Exception:
+                    s = None
+            if s and s.get("status") == "ready":
+                senders[key] = f"{wa_blast.SENDERS[key]} (+{(s.get('me') or {}).get('number') or ''})"
+        default_test = (wa_client.load_settings().get("my_numbers") or [""])[0]
+    else:  # online: blasts go to Supabase and the PC picks them up (blast_remote.py)
+        import blast_remote
+        store = blast_remote.RemoteStore(db)
+        try:
+            pc = store.pc_status()
+        except Exception:
+            st.warning("Online blasting isn't set up yet - run **schema_blast_online.sql** once in Supabase "
+                       "(SQL Editor), then reload this page.")
+            return
+        age = time.time() - (pc.get("at") or 0)
+        for key in ("main", "bot"):
+            info = pc.get(key) or {}
+            if info.get("number") and (info.get("status") == "ready" or age > 120):
+                senders[key] = f"{wa_blast.SENDERS[key]} (+{info['number']})"
+        if not pc:
+            st.warning("🖥️ Your PC hasn't checked in yet - make sure it's on (KL Tracker starts by itself when you "
+                       "log in to Windows).")
+        elif age < 120:
+            st.success("🖥️ Your PC is on - blasts start sending within about 30 seconds.")
+        else:
+            ago = f"{age / 60:.0f} minutes" if age < 5400 else f"{age / 3600:.0f} hours"
+            st.warning(f"🖥️ Your PC was last seen {ago} ago. You can still set up blasts - they wait and send "
+                       "when the PC is back on (within your sending hours).")
+        default_test = (pc.get("my_numbers") or [""])[0]
 
     new, mine = st.tabs(["New blast", "My blasts"])
     with new:
         if not senders:
-            st.warning("No WhatsApp connected yet - link your number on the **WhatsApp** page first "
+            st.warning("No WhatsApp connected yet - link your number on the **WhatsApp** page on your PC first "
                        "(or the bot number on the **Chat bot** page), then come back.")
         else:
-            new_blast_form(wa_blast, wa_client, senders)
+            new_blast_form(store, senders, default_test)
     with mine:
         @st.fragment(run_every="10s")
         def blast_list():
-            all_jobs = wa_blast.jobs()
+            all_jobs = store.jobs()
             if not all_jobs:
                 st.info("No blasts yet.")
                 return
@@ -981,7 +1012,7 @@ def whatsapp_blast_page():
                 count = Counter(r.get("status") for r in res.values())
                 total, state = len(j["numbers"]), wa_blast.state_of(j)
                 live = state not in ("Finished", "Cancelled")
-                head = (f"{'🧪 Test' if j.get('test') else '📣'} {datetime.fromtimestamp(j['created']):%d %b %I:%M %p}"
+                head = (f"{'🧪 Test' if j.get('test') else '📣'} {datetime.fromtimestamp(j['created'], MYT):%d %b %I:%M %p}"
                         f" · {total} {'person' if total == 1 else 'people'} · {state}")
                 with st.expander(head, expanded=live and i < 3):
                     unable = count["not on WhatsApp"] + count["failed"]
@@ -997,18 +1028,11 @@ def whatsapp_blast_page():
                         if retry and not live and st.button(f"🔁 Try the {len(retry)} failed again",
                                                             key=f"retry-{j['id']}",
                                                             help="Numbers not on WhatsApp are left out."):
-                            folder = wa_blast.FILES / j["id"]
-                            wa_blast.create(j["sender"], retry, j["message"],
-                                            [(f, (folder / f).read_bytes()) for f in j.get("files") or []
-                                             if (folder / f).exists()],
-                                            j.get("buttons") or wa_blast.clean_buttons(
-                                                [{"type": "url", **(j.get("button") or {}),
-                                                  "value": (j.get("button") or {}).get("url")}]),
-                                            j.get("button_style", "link"), j.get("footer", ""),
-                                            delay=j["delay"], daily_limit=j["daily_limit"],
-                                            window=wa_blast.window_of(j),
-                                            rest=((j.get("rest") or {}).get("every", 0),
-                                                  (j.get("rest") or {}).get("minutes", 0)))
+                            store.create(j["sender"], retry, j["message"], store.attachments_of(j),
+                                         triggers=j.get("triggers") or [], delay=j["delay"],
+                                         daily_limit=j["daily_limit"], window=wa_blast.window_of(j),
+                                         rest=((j.get("rest") or {}).get("every", 0),
+                                               (j.get("rest") or {}).get("minutes", 0)))
                             st.rerun()
                     rest = j.get("rest") or {}
                     w = wa_blast.window_of(j)
@@ -1022,19 +1046,19 @@ def whatsapp_blast_page():
                         b = st.columns(4)
                         if j["control"] == "pause":
                             if b[0].button("▶️ Resume", key=f"res-{j['id']}"):
-                                wa_blast.set_control(j["id"], "run")
+                                store.set_control(j["id"], "run")
                                 st.rerun()
                         elif b[0].button("⏸️ Pause", key=f"pau-{j['id']}"):
-                            wa_blast.set_control(j["id"], "pause")
+                            store.set_control(j["id"], "pause")
                             st.rerun()
                         if b[1].button("✖️ Cancel", key=f"can-{j['id']}"):
-                            wa_blast.set_control(j["id"], "cancel")
+                            store.set_control(j["id"], "cancel")
                             st.rerun()
                     label = {"sent": "✅ Sent", "not on WhatsApp": "❌ Unable to message",
                              "failed": "❌ Unable to message"}
                     rows = [{"Number": n["phone"], "Name": n.get("name") or "",
                              "Result": label.get((res.get(n["phone"]) or {}).get("status"), "⏳ Waiting"),
-                             "Time": (datetime.fromtimestamp(res[n["phone"]]["at"]).strftime("%d %b %I:%M %p")
+                             "Time": (datetime.fromtimestamp(res[n["phone"]]["at"], MYT).strftime("%d %b %I:%M %p")
                                       if n["phone"] in res else ""),
                              "Problem": (res.get(n["phone"]) or {}).get("error", "")} for n in j["numbers"]]
                     table = pd.DataFrame(rows)
@@ -1044,7 +1068,8 @@ def whatsapp_blast_page():
         blast_list()
 
 
-def new_blast_form(wa_blast, wa_client, senders):
+def new_blast_form(wa_blast, senders, default_test=""):
+    """wa_blast = where blasts are kept: the wa_blast module on the PC, blast_remote.RemoteStore online."""
     import time
     from datetime import time as dtime
 
@@ -1084,6 +1109,8 @@ def new_blast_form(wa_blast, wa_client, senders):
 
     st.subheader("2. What")
     msg = st.text_area("Message", height=170, key=f"blast-msg-{v}",
+                       value="Hi I'm Kelvin Low property agent here focus on KLCC & Mont Kiara property, you have "
+                             "property want to rent or sell? or any other properties are welcome.",
                        placeholder="{Hi|Hello} {name}, this is Mr Low from Homex Property 😊\n"
                                    "Got a few new units at KLCC for rent, interested to view?")
     st.caption("`{name}` = the person's name (left out when you didn't give one). `{Hi|Hello|Hey}` = picks one "
@@ -1092,43 +1119,26 @@ def new_blast_form(wa_blast, wa_client, senders):
     atts = st.file_uploader("Photos / videos / PDF (optional - the message goes with the first one)",
                             accept_multiple_files=True, key=f"blast-atts-{v}",
                             type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "pdf", "doc", "docx", "xls", "xlsx"])
-    st.markdown("**Buttons (optional, up to 3)**")
-    style = st.radio("How the buttons look", ["link", "real"], horizontal=True, key=f"blast-style-{v}",
-                     format_func={"link": "Links at the end of the message (works on every phone)",
-                                  "real": "Real buttons like WhatsApp Business (try a test first)"}.get)
-    if style == "real":
-        st.caption("⚠️ Real buttons are unofficial on a normal WhatsApp: most phones show them, but WhatsApp on a "
-                   "computer and some iPhones may not, and heavy use could get the number restricted. Send a test "
-                   "to your own phone first. A first photo goes on top of the message, like WhatsApp Business.")
-    kinds = {"": "No button", "url": "🔗 Link / WhatsApp chat", "call": "📞 Call", "reply": "💬 Quick reply"}
-    hints = {"url": "Website, or a phone number for a WhatsApp chat link", "call": "Phone number to call",
-             "reply": "(not needed - tapping it sends the button text back to you)"}
-    rows = []
-    for i in range(3):
-        c1, c2, c3 = st.columns([1.2, 1.2, 2])
-        kind = c1.selectbox(f"Button {i + 1}", list(kinds), format_func=kinds.get, key=f"blast-bk{i}-{v}")
-        label = c2.text_input("Text on the button", key=f"blast-bl{i}-{v}", disabled=not kind,
-                              placeholder={"url": "WhatsApp me", "call": "Call me", "reply": "Interested"}.get(kind, ""))
-        value = c3.text_input(hints.get(kind, "Link / number"), key=f"blast-bv{i}-{v}",
-                              disabled=kind in ("", "reply"),
-                              placeholder={"url": "0123456789  or  https://…", "call": "0123456789"}.get(kind, ""))
-        if kind:
-            rows.append({"type": kind, "label": label, "value": value})
-            if kind in ("url", "call") and value.strip() and not wa_blast.clean_buttons([rows[-1]]):
-                c3.caption("⚠️ Not a Malaysian mobile number")
-    buttons = wa_blast.clean_buttons(rows)
-    footer = st.text_input("Small grey text at the bottom (optional)", placeholder="Homex Property",
-                           key=f"blast-foot-{v}")
-    spec = {"message": msg, "buttons": buttons, "button_style": style, "footer": footer}
-    if msg.strip() or buttons:
+    st.markdown("**Auto replies** - when someone answers this blast, the AI reads their reply and sends the "
+                "matching auto reply below.")
+    triggers = []
+    if st.toggle("Auto reply to people who answer", value=True, key=f"blast-trig-on-{v}"):
+        for i, (when0, reply0) in enumerate(wa_blast.DEFAULT_TRIGGERS):
+            c1, c2 = st.columns([1, 1])
+            when = c1.text_input(f"{i + 1}. When they…", when0, key=f"blast-tw{i}-{v}",
+                                 placeholder="(leave empty for no rule)")
+            reply = c2.text_area("…auto reply", reply0, key=f"blast-tr{i}-{v}", height=68, disabled=not when.strip())
+            if when.strip() and reply.strip():
+                triggers.append({"when": when.strip(), "reply": reply.strip()})
+        st.caption(f"Each person gets **one** auto reply - the first time their message fits a rule - only for "
+                   f"people from this blast, for {wa_blast.REPLY_DAYS} days, and not after you've replied to them "
+                   "yourself. Messages that fit no rule are left for you. Your own test numbers (\"my numbers\" on "
+                   "the WhatsApp page) get an auto reply every time, for testing.")
+    spec = {"message": msg}
+    if msg.strip():
         sample = numbers[0] if numbers else {"name": "Ali"}
         st.markdown("**Preview**" + (f" (for {sample.get('name') or 'someone without a name'})"))
-        if style == "real" and buttons:
-            st.info(wa_blast.full_text(spec, sample.get("name"), body_only=True)
-                    + (f"\n\n_{footer}_" if footer else "") + "\n\n"
-                    + "  ".join(f"[ {kinds[b['type']].split()[0]} {b['label']} ]" for b in buttons))
-        else:
-            st.info(wa_blast.full_text(spec, sample.get("name")) or "(no text)")
+        st.info(wa_blast.full_text(spec, sample.get("name")) or "(no text)")
 
     st.subheader("3. When")
 
@@ -1162,10 +1172,10 @@ def new_blast_form(wa_blast, wa_client, senders):
     start_at = time.time()
     if when == "At a set time":
         d1, d2 = st.columns(2)
-        day = d1.date_input("Date", datetime.now().date(), min_value=datetime.now().date())
-        at = d2.time_input("Time (hour and minute)", (datetime.now() + timedelta(hours=1)).replace(minute=0).time(),
-                           step=60)
-        start_at = datetime.combine(day, at).timestamp()
+        now = datetime.now(MYT)  # Malaysia time, also on the online server (which runs on UTC)
+        day = d1.date_input("Date", now.date(), min_value=now.date())
+        at = d2.time_input("Time (hour and minute)", (now + timedelta(hours=1)).replace(minute=0).time(), step=60)
+        start_at = datetime.combine(day, at, tzinfo=MYT).timestamp()
         if start_at < time.time():
             st.warning("That time has already passed - it would start right away.")
     if numbers:
@@ -1176,13 +1186,13 @@ def new_blast_form(wa_blast, wa_client, senders):
                    + (f", spread over {days} days (max {limit} a day)" if days > 1 else "") + ".")
 
     files = [(a.name, a.getvalue()) for a in atts or []]
-    if not (msg.strip() or files or buttons):
+    if not (msg.strip() or files):
         return
-    look = dict(buttons=buttons, button_style=style, footer=footer)
+    look = dict(triggers=triggers)
     st.divider()
     t_col, go_col = st.columns(2)
-    default_test = (wa_client.load_settings().get("my_numbers") or [""])[0] if sender == "main" else ""
-    test_to = t_col.text_input("Test number", default_test, placeholder="your own other number",
+    test_to = t_col.text_input("Test number", default_test if sender == "main" else "",
+                               placeholder="your own other number",
                                help="Sends the message once right now, so you can see how it looks.")
     if t_col.button("🧪 Send a test"):
         tn = next((n for n, _, _ in extract_from_text(test_to) if n), None)
@@ -1200,11 +1210,223 @@ def new_blast_form(wa_blast, wa_client, senders):
         wa_blast.create(sender, numbers, msg, files, start_at=start_at, delay=delay, **look,
                         daily_limit=limit, window=window, rest=(every, rest_min))
         st.session_state.blast_v = v + 1  # fresh, empty form next time - no accidental second send
-        st.success("Blast saved" + (f" - starts {datetime.fromtimestamp(start_at):%d %b %I:%M %p}"
+        st.success("Blast saved" + (f" - starts {datetime.fromtimestamp(start_at, MYT):%d %b %I:%M %p}"
                                     if when == "At a set time" else " - sending has started")
                    + ". Follow it on the **My blasts** tab.")
 
 
+# ---------- AI call (ipline.cn 呼出记录, grade A -> who really wants it) ----------
+def ai_call_page():
+    import importlib
+    import subprocess
+    import sys
+
+    st.title("AI call")
+    st.caption("Checks your ipline (获客通) 呼出记录 with 意向等级 A: listens to every recording, reads the text, and "
+               "keeps the people who said yes / ok / can or asked where / which property. Confused, hostile or "
+               "unclear ones are marked fake. Tick or untick to confirm, then download the ticked numbers.")
+    if not (ROOT_DIR / "ai_call.py").exists() or not os.environ.get("IPLINE_USER"):
+        st.info("AI call only works on your PC (it logs in to ipline from there).")
+        return
+    import ai_call
+    ai_call = importlib.reload(ai_call)
+
+    # ----- run a check in the background -----
+    stt = ai_call.status()
+    running = stt.get("state") == "running" and time_now() - stt.get("at", 0) < 600
+    with st.container(border=True):
+        c1, c2, c3 = st.columns([1, 1, 2])
+        start = c1.number_input("Start from page", 1, 999, 1, help="Page 1 = the newest calls")
+        pages = c2.number_input("How many pages (30 calls each)", 1, 200, 1)
+        c3.caption(f"About {pages * 3} minutes. Calls already checked are skipped, so you can run it again any "
+                   "time to pick up new calls.")
+        if running:
+            @st.fragment(run_every="5s")
+            def progress_box():
+                s = ai_call.status()
+                if s.get("state") != "running":
+                    st.rerun(scope="app")
+                st.info(f"⏳ Checking page {s.get('page')} (of {s.get('of_pages')}) - call {s.get('call')} of "
+                        f"{s.get('calls')}: {s.get('phone')}. You can leave this page; it carries on.")
+            with c3:
+                progress_box()
+        elif c3.button("▶️ Check calls", type="primary"):
+            (ROOT_DIR / "logs").mkdir(exist_ok=True)
+            ai_call.OUT.mkdir(parents=True, exist_ok=True)
+            ai_call._save(ai_call.STATUS, {"state": "running", "at": time_now(), "page": start, "call": 0,
+                                           "calls": "?", "of_pages": "?", "phone": "logging in…"})
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+            subprocess.Popen([sys.executable, "-u", str(ROOT_DIR / "ai_call.py"), "--pages", str(pages),
+                              "--start", str(start)], cwd=ROOT_DIR, creationflags=flags,
+                             stdout=open(ROOT_DIR / "logs" / "ai_call.log", "a", encoding="utf-8"),
+                             stderr=subprocess.STDOUT)
+            st.rerun()
+        if stt.get("state") == "error":
+            c3.error(f"Last check stopped: {stt.get('error')}")
+        elif stt.get("state") == "done" and stt.get("errors"):
+            c3.warning(f"Last check: {stt['errors']} call(s) couldn't be checked - run it again to retry them.")
+
+    rows = ai_call.results()
+    if not rows:
+        st.info("No calls checked yet - press **Check calls**.")
+        return
+    ticks = ai_call.load_ticks()
+    df = pd.DataFrame(rows)
+    for c in ("said", "reason", "heard", "ipline", "full", "called", "verdict"):
+        df[c] = df[c].fillna("") if c in df else ""
+    # Only what the person said after "Do you want to sell or rent your property?" - no hello / bye
+    df["ipline_said"] = [ai_call.after_q1(turns) if isinstance(turns, list) else ""
+                         for turns in (df["turns"] if "turns" in df else [None] * len(df))]
+    df["said"] = df.said.map(ai_call.clean_said)
+    df["ai_want"] = df.verdict == "interested"
+    df["keep"] = [ticks.get(i, w) for i, w in zip(df.call_id, df.ai_want)]
+    df["reviewed"] = df.call_id.isin(ticks.keys())
+    df["day"] = df.called.str[:10]
+
+    # ----- filters -----
+    f1, f2, f3 = st.columns([2, 2, 1])
+    show = f1.radio("Show", ["All", "AI says want", "AI says fake", "Not confirmed by me yet"], horizontal=True)
+    days = sorted(df.day.dropna().unique(), reverse=True)
+    pick_days = f2.multiselect("Call date", days, placeholder="All dates")
+    search = f3.text_input("Search number")
+    view = df
+    if show == "AI says want":
+        view = view[view.ai_want]
+    elif show == "AI says fake":
+        view = view[~view.ai_want]
+    elif show == "Not confirmed by me yet":
+        view = view[~view.reviewed]
+    if pick_days:
+        view = view[view.day.isin(pick_days)]
+    if search:
+        view = view[view.phone.str.contains(re.sub(r"\D", "", search), na=False)]
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Calls shown", f"{len(view):,}")
+    m2.metric("AI says want", f"{int(view.ai_want.sum()):,}")
+    m3.metric("Ticked ✔", f"{int(view.keep.sum()):,}")
+    m4.metric("Confirmed by you", f"{int(view.reviewed.sum()):,}")
+
+    b1, b2, _ = st.columns([1, 1, 3])
+    if b1.button("✔ Tick all shown"):
+        ticks.update({i: True for i in view.call_id})
+        ai_call.save_ticks(ticks)
+        st.rerun()
+    if b2.button("✖ Untick all shown"):
+        ticks.update({i: False for i in view.call_id})
+        ai_call.save_ticks(ticks)
+        st.rerun()
+
+    table = pd.DataFrame({
+        "✔ Keep": view.keep.map({True: "✅", False: "⬜"}).values, "Phone": view.phone.values,
+        "AI says": view.ai_want.map({True: "✅ Want", False: "❌ Fake"}).values,
+        "We heard": view.said.values, "ipline heard": view.ipline_said.values, "Why": view.reason.values,
+        "Called": view.called.values, "Sec": view.seconds.values,
+        "Checked by me": view.reviewed.map({True: "✔", False: ""}).values})
+    st.caption("👆 Click a **number** (or anywhere on its row) to listen to that call · click the **✔ Keep** box "
+               "to tick / untick it")
+    # Clicking an already-selected cell makes the table pop up a "cell viewer" box over it - not wanted here
+    st.markdown("<style>#portal .gdg-style, #portal .gdg-unstyle {display: none !important;}</style>",
+                unsafe_allow_html=True)
+    # The table keeps the same key, so a sort you made by clicking a heading survives clicks. A click is acted on
+    # when the selected cell changes (the table itself remembers the last selected cell).
+    tbl_key = f"aicall-{show}-{'|'.join(pick_days)}-{search}"
+    ids_now, keep_now = list(view.call_id), [bool(k) for k in view.keep]
+
+    def on_click():
+        cells = [tuple(c) for c in st.session_state[tbl_key]["selection"]["cells"]]
+        last = st.session_state.get("aicall_last_cell")
+        st.session_state.aicall_last_cell = cells
+        if not cells or cells == last:
+            return
+        row, col = int(cells[0][0]), cells[0][1]  # row = position in the original (unsorted) table
+        if row >= len(ids_now):
+            return
+        cid = ids_now[row]
+        if col == "✔ Keep":  # tick / untick
+            t = ai_call.load_ticks()
+            t[cid] = not keep_now[row]
+            ai_call.save_ticks(t)
+        else:  # open this call in "Listen to a call" and jump down to it
+            st.session_state.aicall_box = cid
+            st.session_state.aicall_scroll = True
+
+    st.dataframe(
+        table, hide_index=True, width="stretch", height=min(650, 38 + 35 * len(table)),
+        on_select=on_click, selection_mode="single-cell",
+        column_config={"✔ Keep": st.column_config.TextColumn(width="small"),
+                       "We heard": st.column_config.TextColumn(width="large",
+                                                               help="What the person said, as we heard it"),
+                       "ipline heard": st.column_config.TextColumn(width="large",
+                                                                   help="ipline's own text of the person's words"),
+                       "Why": st.column_config.TextColumn(width="medium")},
+        key=tbl_key)
+
+    keep = list(dict.fromkeys(view[view.keep].phone))
+
+    def to_blast(phones):
+        """Open the WhatsApp blast page with these numbers already in its number box."""
+        st.session_state.page = "WhatsApp blast"
+        st.session_state[f"blast-numbers-{st.session_state.get('blast_v', 0)}"] = "\n".join(phones)
+
+    d1, d2, d3 = st.columns(3)
+    d1.download_button(f"⬇️ Download ticked numbers ({len(keep)}) .txt", "\n".join(keep) + "\n",
+                       f"AI call interested {datetime.now():%Y-%m-%d}.txt", "text/plain", type="primary",
+                       disabled=not keep, on_click="ignore")
+    d2.button(f"📣 Send to WhatsApp blast ({len(keep)})", disabled=not keep, on_click=to_blast, args=(keep,),
+              help="Opens WhatsApp blast with these numbers filled in - just write the message and start")
+    d3.download_button("Download the table (Excel / CSV)",
+                       view.drop(columns=["ai_want", "reviewed", "day", "turns"], errors="ignore")
+                       .to_csv(index=False).encode("utf-8-sig"),
+                       f"AI call {datetime.now():%Y-%m-%d}.csv", "text/csv", on_click="ignore")
+    st.caption("The download uses the calls shown with the filters above.")
+
+    # ----- listen to one call -----
+    st.markdown('<div id="aicall-listen"></div>', unsafe_allow_html=True)
+    st.subheader("🎧 Listen to a call")
+    ids = list(view.call_id)
+    if st.session_state.get("aicall_box") not in ids:
+        st.session_state.aicall_box = ids[0] if ids else None
+    pick = st.selectbox("Call", ids, key="aicall_box", format_func=lambda i: (
+        lambda r: f"{r.phone} · {r.called} · {'✅ Want' if r.ai_want else '❌ Fake'} · {r.said[:60]}")(
+        view[view.call_id == i].iloc[0]))
+    jump = st.session_state.pop("aicall_scroll", False)
+    if pick:
+        r = view[view.call_id == pick].iloc[0]
+        st.markdown(f"### 📞 {r.phone}  ·  {'✅ Want' if r.ai_want else '❌ Fake'}")
+        st.caption(f"{r.called} · {r.reason}")
+        f = ai_call.audio_file(pick)
+        if f:
+            st.audio(str(f), format="audio/mpeg", autoplay=jump)
+        else:
+            st.caption("Recording not saved for this call.")
+        keep_now = bool(ticks.get(pick, r.ai_want))
+        if st.toggle("✔ Keep this number", value=keep_now, key=f"aicall-keep-{pick}") != keep_now:
+            ticks[pick] = not keep_now
+            ai_call.save_ticks(ticks)
+            st.rerun()
+    if jump:  # scroll the page down to this section
+        st.iframe("<script>setTimeout(() => {const el = window.parent.document.getElementById('aicall-listen');"
+                  "if (el) el.scrollIntoView({behavior: 'smooth', block: 'start'});}, 300);</script>", height=1)
+        st.caption("Three hearings of the same call - phone lines blur similar words, so they can differ. "
+                   "The AI goes by what they agree on; the recording above is the real thing.")
+        l1, l2, l3 = st.columns(3)
+        l1.markdown("**Person's voice clips, re-heard**")
+        l1.text(r.heard or "(nothing)")
+        l2.markdown("**Whole recording, re-heard**")
+        l2.text(r.full or "(nothing)")
+        l3.markdown("**ipline's own text**")
+        l3.text(r.ipline or "(nothing)")
+
+
+def time_now():
+    import time
+    return time.time()
+
+
+if tool == "AI call":
+    ai_call_page()
+    st.stop()
 if tool == "WhatsApp blast":
     whatsapp_blast_page()
     st.stop()

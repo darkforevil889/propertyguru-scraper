@@ -248,6 +248,62 @@ def on_message(c, ev):
                     src.IsFromMe, ev.Message):
         with db_lock:
             db.commit()
+    if not src.IsGroup and ts > time.time() - 600:
+        import wa_blast
+        if src.IsFromMe:  # you wrote to them from your phone -> blast auto replies stop for this person
+            if ev.Info.ID not in wa_blast.SENT_IDS:
+                to = jid_str(src.RecipientAlt) if src.HasField("RecipientAlt") else ""
+                phone = phone_of(to) or pn_of(c, src.Chat)
+                if phone:
+                    wa_blast.human_replied("main", phone)
+        else:
+            text = unwrap(ev.Message)[0]
+            phone = phone_of(alt) or pn_of(c, src.Chat)
+            if text and phone:
+                threading.Thread(target=blast_auto_reply, args=(c, src.Chat, phone, text), daemon=True).start()
+
+
+def pn_of(c, jid):
+    """Phone number for a chat - WhatsApp often gives only a hidden id ('...@lid'); the session maps it to a phone."""
+    s = jid_str(jid)
+    if phone_of(s):
+        return phone_of(s)
+    if not s.endswith("@lid"):
+        return None
+    try:
+        p = phone_of(jid_str(c.get_pn_from_lid(jid)))
+        if p:
+            return p
+    except Exception:
+        pass
+    try:
+        con = sqlite3.connect(f"file:{DATA / 'session.sqlite3'}?mode=ro", uri=True, timeout=5)
+        row = con.execute("SELECT pn FROM whatsmeow_lid_map WHERE lid = ?", (s.split("@")[0],)).fetchone()
+        con.close()
+        return str(row[0]).split("@")[0].split(":")[0] if row else None
+    except Exception:
+        return None
+
+
+def blast_auto_reply(c, chat_jid, phone, text):
+    """They answered a blast and one of its triggers fits -> send that auto reply, like a person would."""
+    import random
+    import wa_blast
+    from neonize.utils.enum import ChatPresence, ChatPresenceMedia
+    try:
+        time.sleep(random.uniform(3, 6))  # people often send 2-3 lines - give them a moment
+        answer = wa_blast.auto_reply("main", phone, text)
+        if not answer:
+            return
+        try:
+            c.send_chat_presence(chat_jid, ChatPresence.CHAT_PRESENCE_COMPOSING,
+                                 ChatPresenceMedia.CHAT_PRESENCE_MEDIA_TEXT)
+        except Exception:
+            pass
+        time.sleep(min(6, 1.5 + len(answer) / 40))
+        wa_blast.remember_sent(c.send_message(chat_jid, answer))
+    except Exception as e:
+        print("blast auto reply:", e, flush=True)
 
 
 # ---------- control API ----------

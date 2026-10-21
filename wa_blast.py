@@ -11,11 +11,13 @@ import mimetypes
 import os
 import random
 import re
+import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+MYT = timezone(timedelta(hours=8))  # Malaysia time - the online dashboard's server runs on UTC
 ROOT = Path(__file__).parent.resolve()
 DIR = ROOT / "wa_blast"
 FILES = DIR / "files"
@@ -72,61 +74,49 @@ def lines_from_file(filename, data):
             for t in read_tables(filename, data) for row in t.to_numpy()]
 
 
-def _intl(value):
-    """'012-345 6789' -> '60123456789' (None if it isn't a Malaysian mobile)."""
-    from phone_filter import extract_from_text
-    n = next((n for n, _, _ in extract_from_text(value or "") if n), None)
-    return "6" + n if n else None
+
+def safe_name(name):
+    return re.sub(r'[\\/:*?"<>|]+', "_", Path(name).name) or "file"
 
 
-def clean_buttons(rows):
-    """Form rows [{'type': 'url'|'call'|'reply', 'label', 'value'}] -> usable buttons (max 3), bad rows dropped.
-    A link that is just a phone number becomes a WhatsApp chat link."""
-    out = []
-    for b in rows:
-        t, label, value = b.get("type"), (b.get("label") or "").strip(), (b.get("value") or "").strip()
-        if t == "url" and value:
-            if not value.lower().startswith("http"):
-                p = _intl(value)
-                value = f"https://wa.me/{p}" if p else "https://" + value
-            out.append({"type": "url", "label": label or "Open", "value": value})
-        elif t == "call" and _intl(value):
-            out.append({"type": "call", "label": label or "Call me", "value": "+" + _intl(value)})
-        elif t == "reply" and label:
-            out.append({"type": "reply", "label": label, "value": label})
-    return out[:3]
+def new_spec(sender, numbers, message, files=(), triggers=(), start_at=None, delay=(45, 120), daily_limit=40,
+             window=(9 * 60, 21 * 60), rest=(0, 0), test=False):
+    """A blast as saved (here on the PC, or online in Supabase). files = attachment file names.
+    window = (from, until) in minutes of the day; rest = (every N sent messages, rest that many minutes);
+    triggers = [{'when', 'reply'}] - auto replies for people who answer the blast."""
+    return {"id": datetime.now(MYT).strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4], "created": time.time(),
+            "sender": sender, "numbers": numbers, "message": message, "files": list(files),
+            "triggers": [t for t in triggers or [] if t.get("when") and t.get("reply")],
+            "start_at": start_at or time.time(), "delay": list(delay), "daily_limit": int(daily_limit),
+            "window": list(window) if window else None, "rest": {"every": int(rest[0]), "minutes": int(rest[1])},
+            "test": test, "control": "run", "control_at": time.time()}
 
 
-def create(sender, numbers, message, attachments=(), buttons=(), button_style="link", footer="", start_at=None,
-           delay=(45, 120), daily_limit=40, window=(9 * 60, 21 * 60), rest=(0, 0), test=False):
-    """Save a new blast; the sender picks it up within a few seconds (or at start_at). Returns its id.
-    window = (from, until) in minutes of the day; rest = (every N sent messages, rest that many minutes).
-    button_style 'link' = buttons written as links at the end; 'real' = WhatsApp Business-style buttons."""
+def create(sender, numbers, message, attachments=(), **kw):
+    """Save a new blast on this PC; the sender picks it up within a few seconds (or at start_at). Returns its id."""
     DIR.mkdir(exist_ok=True)
-    bid = datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
-    files = []
+    spec = new_spec(sender, numbers, message, [safe_name(n) for n, _ in attachments], **kw)
     for name, data in attachments:
-        folder = FILES / bid
+        folder = FILES / spec["id"]
         folder.mkdir(parents=True, exist_ok=True)
-        safe = re.sub(r'[\\/:*?"<>|]+', "_", Path(name).name) or "file"
-        (folder / safe).write_bytes(data)
-        files.append(safe)
-    spec = {"id": bid, "created": time.time(), "sender": sender, "numbers": numbers, "message": message,
-            "files": files, "buttons": list(buttons or []), "button_style": button_style, "footer": footer or "",
-            "start_at": start_at or time.time(),
-            "delay": list(delay), "daily_limit": int(daily_limit), "window": list(window) if window else None,
-            "rest": {"every": int(rest[0]), "minutes": int(rest[1])}, "test": test, "control": "run"}
-    _write(DIR / f"{bid}.json", spec)
-    return bid
+        (folder / safe_name(name)).write_bytes(data)
+    _write(DIR / f"{spec['id']}.json", spec)
+    return spec["id"]
 
 
-def set_control(bid, control):
-    """'run' | 'pause' | 'cancel'."""
+def set_control(bid, control, at=None):
+    """'run' | 'pause' | 'cancel'. control_at = when it was changed (the newest change wins when syncing)."""
     path = DIR / f"{bid}.json"
     spec = _read(path)
     if spec:
-        spec["control"] = control
+        spec["control"], spec["control_at"] = control, at or time.time()
         _write(path, spec)
+
+
+def attachments_of(job):
+    """[(file name, bytes)] of a blast's attachments (for "Try the failed again")."""
+    folder = FILES / job["id"]
+    return [(f, (folder / f).read_bytes()) for f in job.get("files") or [] if (folder / f).exists()]
 
 
 def jobs():
@@ -136,16 +126,16 @@ def jobs():
         if p.name.endswith(".progress.json"):
             continue
         spec = _read(p)
-        if spec:
+        if isinstance(spec, dict) and spec.get("id"):  # skips replied_*.json and other bookkeeping files
             spec["progress"] = _read(DIR / f"{spec['id']}.progress.json", {}) or {}
             out.append(spec)
     return sorted(out, key=lambda j: j["created"], reverse=True)
 
 
-def recently_sent(days):
+def recently_sent(days, all_jobs=None):
     """Numbers that got a (non-test) blast in the last N days."""
     since, done = time.time() - days * 86400, set()
-    for j in jobs():
+    for j in all_jobs if all_jobs is not None else jobs():
         if not j.get("test"):
             done |= {p for p, r in (j["progress"].get("results") or {}).items()
                      if r.get("status") == "sent" and r.get("at", 0) >= since}
@@ -166,7 +156,7 @@ def window_of(spec):
 
 
 def in_window(w, now=None):
-    now = now or datetime.now()
+    now = now or datetime.now(MYT)
     m, (a, b) = now.hour * 60 + now.minute, w
     if a == b:
         return True
@@ -184,10 +174,10 @@ def state_of(job):
     if job["control"] == "pause":
         return "Paused"
     if time.time() < job["start_at"]:
-        return f"Scheduled for {datetime.fromtimestamp(job['start_at']):%d %b %Y %I:%M %p}"
+        return f"Scheduled for {datetime.fromtimestamp(job['start_at'], MYT):%d %b %Y %I:%M %p}"
     if time.time() < prog.get("rest_until", 0):
         every = (job.get("rest") or {}).get("every")
-        return (f"Resting until {datetime.fromtimestamp(prog['rest_until']):%I:%M %p}".replace(" 0", " ")
+        return (f"Resting until {datetime.fromtimestamp(prog['rest_until'], MYT):%I:%M %p}".replace(" 0", " ")
                 + (f" (break after every {every} messages)" if every else ""))
     return prog.get("state") or "Waiting for WhatsApp to connect"
 
@@ -201,12 +191,122 @@ def personalise(text, name):
     return re.sub(r"[ ,]*\{name\}", "", text)
 
 
-def real_buttons(spec):
-    return spec.get("button_style") == "real" and bool(spec.get("buttons"))
+# ---------- auto-reply triggers: "when they ... -> reply ..." for people who answer a blast ----------
+DEFAULT_TRIGGERS = [
+    ("say they want to rent or sell (rent / sell / sewa / jual / 出租 / 卖)",
+     "Where is the place ah? Do you have the details?"),
+    ("mention a property, condo or place name",
+     "Do you have the details and the size (sf)?"),
+    ("ask who this is or how I got their number",
+     "Hi, I'm Kelvin Low, property agent focusing on KLCC & Mont Kiara 😊 Do you have any property to rent or sell?"),
+    ("", ""),
+]
+REPLY_DAYS = 14  # people who answer a blast get auto replies for this long
+MAX_AUTO = 1     # auto replies per person per blast (your own test numbers: no limit)
+SENT_IDS = set()  # ids of messages this PC sent itself - so they are never mistaken for you typing on the phone
+_reply_lock = threading.Lock()
+
+
+def _local(phone):
+    digits = re.sub(r"\D", "", phone or "")
+    return "0" + digits[2:] if digits.startswith("60") else digits
+
+
+def _recent_job(sender, local):
+    """Newest blast from this number that reached this person in the last REPLY_DAYS days and has triggers."""
+    since = time.time() - REPLY_DAYS * 86400
+    for j in jobs():
+        r = ((j.get("progress") or {}).get("results") or {}).get(local) or {}
+        if j["sender"] == sender and j.get("triggers") and r.get("status") == "sent" and r.get("at", 0) >= since:
+            return j
+    return None
+
+
+def _pick_trigger(blast, text, rules):
+    """Ask the free AI which rule fits their reply -> index into rules, or None."""
+    import httpx
+    from dotenv import load_dotenv
+    load_dotenv(ROOT / ".env")
+    listing = "\n".join(f'{n}. When they {r["when"]} -> auto reply: "{r["reply"]}"'
+                        for n, (_, r) in enumerate(rules, 1))
+    prompt = (f'A Malaysian property agent sent this WhatsApp message to many people:\n"{blast}"\n\n'
+              f'One person replied:\n"{text}"\n\nAuto-reply rules:\n{listing}\n\n'
+              "Check every rule on its own:\n"
+              '- "fits": does the "When they ..." part clearly describe this reply?\n'
+              '- "redundant": would its auto reply ask for something the reply already gives (e.g. it asks where '
+              "the place is but they already named the place)?\n"
+              "People may write English, Malay, Chinese or a mix.\n"
+              'Reply ONLY with JSON: {"rules": [{"n": 1, "fits": true/false, "redundant": true/false}, ...]}')
+    for model in ("qwen/qwen3.8-27b", "openai/gpt-oss-20b", "openai/gpt-oss-120b"):
+        body = {"model": model, "temperature": 0, "max_tokens": 400, "response_format": {"type": "json_object"},
+                "messages": [{"role": "user", "content": prompt}]}
+        if "gpt-oss" in model:
+            body["reasoning_effort"] = "low"
+        try:
+            r = httpx.post("https://api.groq.com/openai/v1/chat/completions", json=body, timeout=40, headers={
+                "Authorization": f"Bearer {os.environ.get('BOT_LLM_API_KEY', '')}", "User-Agent": "KLTracker/1.0"})
+            if r.status_code != 200:
+                continue  # busy / limit / model gone - try the next one
+            checks = json.loads(re.search(r"\{.*\}", r.json()["choices"][0]["message"]["content"], re.S)
+                                .group(0)).get("rules") or []
+            ok = sorted(int(c["n"]) for c in checks
+                        if c.get("fits") is True and c.get("redundant") is not True and 1 <= int(c["n"]) <= len(rules))
+            return rules[ok[0] - 1][0] if ok else None  # first fitting rule in your order
+        except Exception:
+            continue
+    return None
+
+
+def my_numbers():
+    """Your own numbers (WhatsApp page settings) - used for testing, so they get auto replies every time."""
+    s = _read(ROOT / "wa_data" / "settings.json", {}) or {}
+    return {_local(n) for n in s.get("my_numbers") or [] if _local(n)}
+
+
+def auto_reply(sender, phone, text):
+    """Someone answered a recent blast -> the auto reply whose trigger fits their message, or None.
+    Anyone else gets MAX_AUTO auto reply (the first time a rule fits), never after you replied yourself;
+    your own test numbers get one every time."""
+    local = _local(phone)
+    if not local or not (text or "").strip():
+        return None
+    with _reply_lock:
+        j = _recent_job(sender, local)
+        if not j:
+            return None
+        tester = local in my_numbers()
+        path, key = DIR / f"replied_{sender}.json", f"{j['id']}|{local}"
+        state = _read(path, {}) or {}
+        mine = state.get(key) or {"used": [], "human": False}
+        if not tester and (mine.get("human") or len(mine["used"]) >= MAX_AUTO):
+            return None
+        rules = [(i, t) for i, t in enumerate(j["triggers"]) if t.get("reply") and (tester or i not in mine["used"])]
+        if not rules:
+            return None
+        i = _pick_trigger(personalise(j.get("message") or "", None), text.strip(), rules)
+        if i is None:
+            return None
+        if not tester:
+            mine["used"].append(i)
+            state[key] = mine
+            _write(path, state)
+        return j["triggers"][i]["reply"]
+
+
+def human_replied(sender, phone):
+    """You wrote to this person yourself -> no more auto replies to them for their latest blast."""
+    local = _local(phone)
+    with _reply_lock:
+        j = _recent_job(sender, local) if local else None
+        if j:
+            path, key = DIR / f"replied_{sender}.json", f"{j['id']}|{local}"
+            state = _read(path, {}) or {}
+            state.setdefault(key, {"used": [], "human": False})["human"] = True
+            _write(path, state)
 
 
 def full_text(spec, name, body_only=False):
-    """The message for one person. Unless body_only, buttons are written out as links at the end."""
+    """The message for one person (links of older blasts written out at the end)."""
     text = personalise(spec.get("message") or "", name).strip()
     if body_only:
         return text
@@ -222,43 +322,30 @@ def full_text(spec, name, body_only=False):
     return (text + "\n\n" + "\n".join(lines)).strip() if lines else text
 
 
-def build_buttons(spec, text, image=None):
-    """WhatsApp Business-style message: text (+ picture on top), grey footer, up to 3 buttons underneath.
-    Unofficial on a normal WhatsApp - most phones show it, some (computer / some iPhones) may not."""
-    from neonize.proto.waE2E import WAWebProtobufsE2E_pb2 as P
-    IM = P.InteractiveMessage
-    kinds = {"url": ("cta_url", lambda b: {"display_text": b["label"], "url": b["value"], "merchant_url": b["value"]}),
-             "call": ("cta_call", lambda b: {"display_text": b["label"], "phone_number": b["value"]}),
-             "reply": ("quick_reply", lambda b: {"display_text": b["label"], "id": b["value"]})}
-    buttons = [IM.NativeFlowMessage.NativeFlowButton(name=kinds[b["type"]][0],
-                                                     buttonParamsJSON=json.dumps(kinds[b["type"]][1](b)))
-               for b in spec["buttons"]]
-    header = IM.Header(title="", hasMediaAttachment=image is not None)
-    if image is not None:
-        header.imageMessage.CopyFrom(image)
-    im = IM(header=header, body=IM.Body(text=text),
-            nativeFlowMessage=IM.NativeFlowMessage(buttons=buttons, messageParamsJSON="", messageVersion=1))
-    if spec.get("footer"):
-        im.footer.text = spec["footer"]
-    inner = P.Message(messageContextInfo=P.MessageContextInfo(deviceListMetadata=P.DeviceListMetadata(),
-                                                              deviceListMetadataVersion=2),
-                      interactiveMessage=im)
-    return P.Message(viewOnceMessage=P.FutureProofMessage(message=inner))
+def remember_sent(resp):
+    """Note the id of a message this PC sent (see SENT_IDS)."""
+    try:
+        SENT_IDS.add(resp.ID)
+        if len(SENT_IDS) > 5000:
+            SENT_IDS.clear()
+    except Exception:
+        pass
+    return resp
 
 
 def _send_file(client, jid, f, cap):
     data, ext = f.read_bytes(), f.suffix.lower()
     if ext in IMAGE:
-        client.send_image(jid, data, caption=cap)
+        remember_sent(client.send_image(jid, data, caption=cap))
     elif ext in VIDEO:
         try:
-            client.send_video(jid, data, caption=cap)
+            remember_sent(client.send_video(jid, data, caption=cap))
         except Exception:  # video needs ffmpeg on this PC - send it as a file instead
-            client.send_document(jid, data, caption=cap, filename=f.name, title=f.name,
-                                 mimetype=mimetypes.guess_type(f.name)[0] or "video/mp4")
+            remember_sent(client.send_document(jid, data, caption=cap, filename=f.name, title=f.name,
+                                               mimetype=mimetypes.guess_type(f.name)[0] or "video/mp4"))
     else:
-        client.send_document(jid, data, caption=cap, filename=f.name, title=f.name,
-                             mimetype=mimetypes.guess_type(f.name)[0] or "application/octet-stream")
+        remember_sent(client.send_document(jid, data, caption=cap, filename=f.name, title=f.name,
+                                           mimetype=mimetypes.guess_type(f.name)[0] or "application/octet-stream"))
 
 
 def why(e):
@@ -295,23 +382,11 @@ def _send_one(client, spec, item):
         for f in files:
             if not f.exists():
                 raise FileNotFoundError(f"attachment {f.name} is missing on this PC")
-        if real_buttons(spec):
-            # A first photo goes on top of the button message; other files go just before it
-            image = None
-            if files and files[0].suffix.lower() in IMAGE:
-                image = client.build_image_message(files[0].read_bytes()).imageMessage
-                files = files[1:]
-            for f in files:
-                _send_file(client, jid, f, None)
-                sent_any = True
-                time.sleep(random.uniform(1.5, 3.5))
-            client.send_message(jid, build_buttons(spec, full_text(spec, item.get("name"), body_only=True), image))
-            return {"status": "sent", "at": time.time()}
         if not files:
             try:
-                client.send_message(jid, text, link_preview="http" in text)
+                remember_sent(client.send_message(jid, text, link_preview="http" in text))
             except Exception:
-                client.send_message(jid, text)  # link preview fetch failed - plain text is fine
+                remember_sent(client.send_message(jid, text))  # link preview fetch failed - plain text is fine
             sent_any = True
         for i, f in enumerate(files):
             _send_file(client, jid, f, (text or None) if i == 0 else None)
@@ -364,7 +439,7 @@ def worker(client, sender, state):
                     prog["state"] = f"Waiting - only sends between {clock(w[0])} and {clock(w[1])}"
                     _write(prog_path, prog)
                     continue
-                midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+                midnight = datetime.now(MYT).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
                 today = sum(1 for j in jobs() if j["sender"] == sender and not j.get("test")
                             for r in (j["progress"].get("results") or {}).values()
                             if r.get("status") == "sent" and r.get("at", 0) >= midnight)

@@ -5,6 +5,7 @@
 # Local environment / browser profile
 .venv/
 .chrome-profile/
+.ipline-profile/
 __pycache__/
 
 # Scraped output and logs

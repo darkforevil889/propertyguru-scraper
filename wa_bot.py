@@ -189,6 +189,25 @@ def on_logged_out(_, __):
     state.update(status="logged_out", error="Logged out from the phone.")
 
 
+def lid_phone(c, jid, jid_s):
+    """WhatsApp often gives only a hidden id ('...@lid') - the session maps it to the phone number."""
+    if not jid_s.endswith("@lid"):
+        return None
+    try:
+        p = jid_str(c.get_pn_from_lid(jid))
+        if p.endswith("@s.whatsapp.net"):
+            return p.split("@")[0].split(":")[0]
+    except Exception:
+        pass
+    try:
+        con = sqlite3.connect(f"file:{DATA / 'bot_session.sqlite3'}?mode=ro", uri=True, timeout=5)
+        row = con.execute("SELECT pn FROM whatsmeow_lid_map WHERE lid = ?", (jid_s.split("@")[0],)).fetchone()
+        con.close()
+        return str(row[0]).split("@")[0].split(":")[0] if row else None
+    except Exception:
+        return None
+
+
 @client.event(MessageEv)
 def on_message(c, ev):
     src = ev.Info.MessageSource
@@ -200,7 +219,7 @@ def on_message(c, ev):
     if ts and ts < time.time() - 3600:
         return  # old backlog after being offline long - don't answer stale messages
     phone_jid = jid_str(src.SenderAlt) if src.HasField("SenderAlt") else chat
-    phone = phone_jid.split("@")[0] if phone_jid.endswith("@s.whatsapp.net") else None
+    phone = phone_jid.split("@")[0] if phone_jid.endswith("@s.whatsapp.net") else lid_phone(c, src.Chat, chat)
     if phone and phone in settings()["ignore_numbers"]:
         return
     m = ev.Message
@@ -228,7 +247,32 @@ def on_message(c, ev):
     if not text.strip():
         return
     log(chat, name, "user", text.strip())
-    schedule(chat, info, 6)  # wait a moment in case they send more lines
+    threading.Thread(target=route_reply, args=(chat, info, phone, text), daemon=True).start()
+
+
+def route_reply(chat, info, phone, text):
+    """They answered a blast from this number and a trigger fits -> that auto reply; otherwise the AI as usual."""
+    import wa_blast
+    answer = wa_blast.auto_reply("bot", phone, text)
+    if answer:
+        send_option_reply(chat, info, answer)
+    else:
+        schedule(chat, info, 6)  # wait a moment in case they send more lines
+
+
+def send_option_reply(chat, info, answer):
+    time.sleep(3)
+    try:
+        client.send_chat_presence(info["jid"], ChatPresence.CHAT_PRESENCE_COMPOSING,
+                                  ChatPresenceMedia.CHAT_PRESENCE_MEDIA_TEXT)
+    except Exception:
+        pass
+    time.sleep(min(6, 1.5 + len(answer) / 40))
+    try:
+        client.send_message(info["jid"], answer)
+        log(chat, info.get("name"), "assistant", answer)
+    except Exception as e:
+        print("blast auto reply:", e, flush=True)
 
 
 # ---------- control API (dashboard) ----------
