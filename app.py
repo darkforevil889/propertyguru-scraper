@@ -1225,52 +1225,80 @@ def ai_call_page():
     st.caption("Checks your ipline (获客通) 呼出记录 with 意向等级 A: listens to every recording, reads the text, and "
                "keeps the people who said yes / ok / can or asked where / which property. Confused, hostile or "
                "unclear ones are marked fake. Tick or untick to confirm, then download the ticked numbers.")
-    if not (ROOT_DIR / "ai_call.py").exists() or not os.environ.get("IPLINE_USER"):
-        st.info("AI call only works on your PC (it logs in to ipline from there).")
-        return
     import ai_call
-    ai_call = importlib.reload(ai_call)
+    import ai_call_remote
+    import blast_remote
+    ai_call, ai_call_remote = importlib.reload(ai_call), importlib.reload(ai_call_remote)
+    # On the PC the check runs here; online the PC is asked through Supabase (ai_call_remote.py)
+    on_pc = (ROOT_DIR / "ai_call.py").exists() and bool(os.environ.get("IPLINE_USER"))
+
+    def pc_check_status():
+        if on_pc:
+            return ai_call.status()
+        return (blast_remote.RemoteStore(db).pc_status() or {}).get("ai_call") or {}
+
+    try:
+        stt = pc_check_status()
+        waiting = [] if on_pc else ai_call_remote.pending_requests(db)
+    except Exception:
+        st.warning("AI call online isn't set up yet - run **schema_ai_call_online.sql** once in Supabase "
+                   "(SQL Editor), then reload this page.")
+        return
 
     # ----- run a check in the background -----
-    stt = ai_call.status()
     running = stt.get("state") == "running" and time_now() - stt.get("at", 0) < 600
     with st.container(border=True):
         c1, c2, c3 = st.columns([1, 1, 2])
         start = c1.number_input("Start from page", 1, 999, 1, help="Page 1 = the newest calls")
         pages = c2.number_input("How many pages (30 calls each)", 1, 200, 1)
         c3.caption(f"About {pages * 3} minutes. Calls already checked are skipped, so you can run it again any "
-                   "time to pick up new calls.")
-        if running:
+                   "time to pick up new calls." + ("" if on_pc else " Your PC does the checking - keep it on."))
+        if running or waiting:
             @st.fragment(run_every="5s")
             def progress_box():
-                s = ai_call.status()
-                if s.get("state") != "running":
+                s = pc_check_status()
+                if s.get("state") == "running" and time_now() - s.get("at", 0) < 600:
+                    st.info(f"⏳ Checking page {s.get('page')} (of {s.get('of_pages')}) - call {s.get('call')} of "
+                            f"{s.get('calls')}: {s.get('phone')}. You can leave this page; it carries on.")
+                elif not on_pc and ai_call_remote.pending_requests(db):
+                    st.info("⏳ Sent to your PC - it starts within about 15 seconds (if the PC is on).")
+                else:
+                    load_ai_rows.clear()
                     st.rerun(scope="app")
-                st.info(f"⏳ Checking page {s.get('page')} (of {s.get('of_pages')}) - call {s.get('call')} of "
-                        f"{s.get('calls')}: {s.get('phone')}. You can leave this page; it carries on.")
             with c3:
                 progress_box()
         elif c3.button("▶️ Check calls", type="primary"):
-            (ROOT_DIR / "logs").mkdir(exist_ok=True)
-            ai_call.OUT.mkdir(parents=True, exist_ok=True)
-            ai_call._save(ai_call.STATUS, {"state": "running", "at": time_now(), "page": start, "call": 0,
-                                           "calls": "?", "of_pages": "?", "phone": "logging in…"})
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
-            subprocess.Popen([sys.executable, "-u", str(ROOT_DIR / "ai_call.py"), "--pages", str(pages),
-                              "--start", str(start)], cwd=ROOT_DIR, creationflags=flags,
-                             stdout=open(ROOT_DIR / "logs" / "ai_call.log", "a", encoding="utf-8"),
-                             stderr=subprocess.STDOUT)
+            if on_pc:
+                (ROOT_DIR / "logs").mkdir(exist_ok=True)
+                ai_call.OUT.mkdir(parents=True, exist_ok=True)
+                ai_call._save(ai_call.STATUS, {"state": "running", "at": time_now(), "page": start, "call": 0,
+                                               "calls": "?", "of_pages": "?", "phone": "logging in…"})
+                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+                subprocess.Popen([sys.executable, "-u", str(ROOT_DIR / "ai_call.py"), "--pages", str(pages),
+                                  "--start", str(start)], cwd=ROOT_DIR, creationflags=flags,
+                                 stdout=open(ROOT_DIR / "logs" / "ai_call.log", "a", encoding="utf-8"),
+                                 stderr=subprocess.STDOUT)
+            else:
+                ai_call_remote.request_check(db, start, pages)
             st.rerun()
         if stt.get("state") == "error":
             c3.error(f"Last check stopped: {stt.get('error')}")
         elif stt.get("state") == "done" and stt.get("errors"):
             c3.warning(f"Last check: {stt['errors']} call(s) couldn't be checked - run it again to retry them.")
 
-    rows = ai_call.results()
+    rows = ai_call.results() if on_pc else load_ai_rows(db)
     if not rows:
-        st.info("No calls checked yet - press **Check calls**.")
+        st.info("No calls checked yet - press **Check calls**." if on_pc else
+                "No calls here yet - press **Check calls**, or wait a minute for your PC to copy its results up.")
         return
-    ticks = ai_call.load_ticks()
+    remote_ticks = ai_call_remote.load_ticks(db)
+    ticks = {**ai_call.load_ticks(), **remote_ticks} if on_pc else remote_ticks
+
+    def save_ticks(changed):
+        """Ticks go to Supabase (shared with the online page); the PC keeps its own copy as well."""
+        ai_call_remote.save_ticks(db, changed)
+        if on_pc:
+            ai_call.save_ticks({**ai_call.load_ticks(), **changed})
     df = pd.DataFrame(rows)
     for c in ("said", "reason", "heard", "ipline", "full", "called", "verdict"):
         df[c] = df[c].fillna("") if c in df else ""
@@ -1309,12 +1337,10 @@ def ai_call_page():
 
     b1, b2, _ = st.columns([1, 1, 3])
     if b1.button("✔ Tick all shown"):
-        ticks.update({i: True for i in view.call_id})
-        ai_call.save_ticks(ticks)
+        save_ticks({i: True for i in view.call_id})
         st.rerun()
     if b2.button("✖ Untick all shown"):
-        ticks.update({i: False for i in view.call_id})
-        ai_call.save_ticks(ticks)
+        save_ticks({i: False for i in view.call_id})
         st.rerun()
 
     table = pd.DataFrame({
@@ -1344,9 +1370,7 @@ def ai_call_page():
             return
         cid = ids_now[row]
         if col == "✔ Keep":  # tick / untick
-            t = ai_call.load_ticks()
-            t[cid] = not keep_now[row]
-            ai_call.save_ticks(t)
+            save_ticks({cid: not keep_now[row]})
         else:  # open this call in "Listen to a call" and jump down to it
             st.session_state.aicall_box = cid
             st.session_state.aicall_scroll = True
@@ -1395,19 +1419,15 @@ def ai_call_page():
         r = view[view.call_id == pick].iloc[0]
         st.markdown(f"### 📞 {r.phone}  ·  {'✅ Want' if r.ai_want else '❌ Fake'}")
         st.caption(f"{r.called} · {r.reason}")
-        f = ai_call.audio_file(pick)
+        f = ai_call.audio_file(pick) if on_pc else ai_call_remote.audio_url(db, pick)
         if f:
             st.audio(str(f), format="audio/mpeg", autoplay=jump)
         else:
-            st.caption("Recording not saved for this call.")
+            st.caption("Recording not here yet." + ("" if on_pc else " Your PC copies it up within a minute."))
         keep_now = bool(ticks.get(pick, r.ai_want))
         if st.toggle("✔ Keep this number", value=keep_now, key=f"aicall-keep-{pick}") != keep_now:
-            ticks[pick] = not keep_now
-            ai_call.save_ticks(ticks)
+            save_ticks({pick: not keep_now})
             st.rerun()
-    if jump:  # scroll the page down to this section
-        st.iframe("<script>setTimeout(() => {const el = window.parent.document.getElementById('aicall-listen');"
-                  "if (el) el.scrollIntoView({behavior: 'smooth', block: 'start'});}, 300);</script>", height=1)
         st.caption("Three hearings of the same call - phone lines blur similar words, so they can differ. "
                    "The AI goes by what they agree on; the recording above is the real thing.")
         l1, l2, l3 = st.columns(3)
@@ -1417,11 +1437,21 @@ def ai_call_page():
         l2.text(r.full or "(nothing)")
         l3.markdown("**ipline's own text**")
         l3.text(r.ipline or "(nothing)")
+    if jump:  # scroll the page down to this section
+        st.iframe("<script>setTimeout(() => {const el = window.parent.document.getElementById('aicall-listen');"
+                  "if (el) el.scrollIntoView({behavior: 'smooth', block: 'start'});}, 300);</script>", height=1)
 
 
 def time_now():
     import time
     return time.time()
+
+
+@st.cache_data(ttl=60, show_spinner="Loading checked calls…")
+def load_ai_rows(_db):
+    """Checked calls from Supabase (online page) - refreshed every minute, or when a check finishes."""
+    import ai_call_remote
+    return ai_call_remote.load_rows(_db)
 
 
 if tool == "AI call":

@@ -47,7 +47,8 @@ def blast_sync_loop():
     import wa_blast
     load_dotenv(ROOT / ".env")
     db = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
-    n, last_error = 0, None
+    import ai_call_remote
+    n, last_error, last_ai_error = 0, None, None
     while True:
         try:
             importlib.reload(wa_blast)  # pick up code changes without restarting the keeper
@@ -62,8 +63,33 @@ def blast_sync_loop():
             if str(e) != last_error:  # e.g. tables not created yet - log once, keep trying
                 log(f"blast sync problem: {str(e)[:300]}")
                 last_error = str(e)
+        try:  # AI call: checked calls up to Supabase every minute, "Check calls" pressed online every 15 s
+            importlib.reload(ai_call_remote)
+            ai_call_remote.run_requests(db, start_ai_check)
+            if n % 4 == 0:
+                sent = ai_call_remote.sync(db)
+                if sent:
+                    log(f"ai call sync: {sent} calls sent up")
+            last_ai_error = None
+        except Exception as e:
+            if str(e) != last_ai_error:
+                log(f"ai call sync problem: {str(e)[:300]}")
+                last_ai_error = str(e)
         n += 1
         time.sleep(15)
+
+
+def start_ai_check(start, pages):
+    """Run ai_call.py in the background (asked for on the online dashboard)."""
+    import ai_call
+    ai_call.OUT.mkdir(parents=True, exist_ok=True)
+    ai_call._save(ai_call.STATUS, {"state": "running", "at": time.time(), "page": start, "call": 0,
+                                   "calls": "?", "of_pages": "?", "phone": "logging in…"})
+    python = ROOT / ".venv" / "Scripts" / "python.exe"
+    subprocess.Popen([str(python), "-u", str(ROOT / "ai_call.py"), "--pages", str(pages), "--start", str(start)],
+                     cwd=ROOT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                     stdout=open(LOGS / "ai_call.log", "a", encoding="utf-8"), stderr=subprocess.STDOUT)
+    log(f"ai call check started from the online page: page {start}, {pages} page(s)")
 
 
 def main():

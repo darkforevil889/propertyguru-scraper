@@ -74,6 +74,11 @@ def heartbeat(db):
     for key, mod in (("main", wa_client), ("bot", bot_client)):
         s = mod.status() or {}
         data[key] = {"status": s.get("status") or "off", "number": (s.get("me") or {}).get("number")}
+    try:  # AI call progress, shown on the online AI call page
+        import ai_call
+        data["ai_call"] = ai_call.status()
+    except Exception:
+        pass
     db.table("pc_status").upsert({"name": "pc", "data": data}).execute()
 
 
