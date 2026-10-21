@@ -48,8 +48,9 @@ def blast_sync_loop():
     load_dotenv(ROOT / ".env")
     db = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SECRET_KEY"])
     import ai_call_remote
+    import bot_remote
     import wa_scan
-    n, last_error, last_ai_error, last_wa_error = 0, None, None, None
+    n, last_error, last_ai_error, last_wa_error, last_bot_error = 0, None, None, None, None
     while True:
         try:
             importlib.reload(wa_blast)  # pick up code changes without restarting the keeper
@@ -86,6 +87,15 @@ def blast_sync_loop():
             if str(e) != last_wa_error:
                 log(f"whatsapp page sync problem: {str(e)[:300]}")
                 last_wa_error = str(e)
+        try:  # Chat bot page: changes / test questions from online every 15 s, status + conversations every 30 s
+            importlib.reload(bot_remote)
+            if not bot_remote.run_requests(db, log) and n % 2 == 0:
+                bot_remote.sync(db)
+            last_bot_error = None
+        except Exception as e:
+            if str(e) != last_bot_error:
+                log(f"chat bot page sync problem: {str(e)[:300]}")
+                last_bot_error = str(e)
         n += 1
         time.sleep(15)
 

@@ -826,7 +826,11 @@ def chat_bot_page():
     st.title("WhatsApp chat bot")
     st.caption("Auto-replies on a SEPARATE WhatsApp number: finds listings, quotes condo prices, answers your FAQ and "
                "collects owner listings (saved to WhatsApp → Saved listings). Replies to private chats only - never "
-               "groups, never messages anyone first. Runs on this PC: keep it on for instant replies.")
+               "groups, never messages anyone first. Runs on your PC: keep it on for instant replies.")
+    try:
+        import neonize  # noqa: F401 - only installed on the PC
+    except ImportError:
+        return chat_bot_remote()  # online dashboard: the bot runs on the PC, settings go through Supabase
     try:
         s = bot_client.ensure_running()
     except Exception as e:
@@ -914,6 +918,91 @@ def chat_bot_page():
     # 4) conversations
     st.subheader("Recent conversations")
     convs = bot_client.conversations()
+    if not convs:
+        st.caption("No messages yet - send the bot's number a WhatsApp from another phone to test it.")
+    for cv in convs:
+        when = datetime.fromtimestamp(cv["last_ts"], MYT).strftime("%d %b %H:%M")
+        who = cv["name"] or cv["chat"].split("@")[0]
+        with st.expander(f"{who} · {when}"):
+            for role, text, ts in cv["messages"]:
+                st.markdown(f"**{'🤖 Bot' if role == 'assistant' else '👤 ' + who}:** {text}")
+
+
+def chat_bot_remote():
+    """Chat bot page on the online dashboard: shows what the PC copied up (bot_remote.sync) and sends changes /
+    test questions to the PC (pc_tasks), which applies them within about 15 seconds."""
+    import time
+
+    import bot_brain
+    import bot_remote
+
+    try:
+        bot = bot_remote.state(db)
+        waiting = bot_remote.pending(db)
+    except Exception as e:
+        st.error(f"Couldn't reach Supabase: {e}")
+        return
+    if not bot:
+        st.warning("🖥️ Your PC hasn't sent the bot's status yet - make sure it's on, then reload in a minute.")
+        return
+    age = time.time() - (bot.get("at") or 0)
+    if age > 300:
+        st.warning(f"🖥️ Your PC was last seen {age / 60:.0f} minutes ago - the bot only replies while the PC is on, "
+                   "and changes made here wait until it's back.")
+    if bot.get("status") not in ("ready", "connecting"):
+        st.warning("The bot's WhatsApp isn't connected - link it by QR code on the PC (Chat bot page) once.")
+        return
+    if [t for t in waiting if t["kind"] == "bot_settings"]:
+        st.info("⏳ Your change was sent to the PC - it's applied within about 15 seconds. Reload to see it.")
+
+    me = bot.get("me") or {}
+    c1, c2 = st.columns([3, 1])
+    c1.success(f"Bot number connected: **+{me.get('number') or '?'}** · replies today: {bot.get('replies_today', 0)}"
+               f" · updated {max(0, age):.0f} s ago")
+    on = c2.toggle("Bot ON", value=bool(bot.get("enabled", True)))
+    if on != bool(bot.get("enabled", True)):
+        bot_remote.request(db, "bot_settings", {"enabled": on})
+        st.rerun()
+
+    with st.expander("🧠 AI", expanded=False):
+        st.markdown("✅ AI key saved on your PC - the bot replies with AI." if bot.get("has_key") else
+                    "⚠️ No AI key on your PC yet - add it on the PC's Chat bot page (it's kept there only).")
+        q = st.text_input("Try the bot here (nothing is sent on WhatsApp) - your PC answers in about 15-30 seconds",
+                          placeholder="e.g. any 3 room Mont Kiara below 10k?")
+        if st.button("Ask") and q.strip():
+            bot_remote.request(db, "bot_test", {"question": q.strip()})
+            st.session_state.bot_test_asked = q.strip()
+        asked = st.session_state.get("bot_test_asked")
+        if asked:
+            @st.fragment(run_every="5s")
+            def test_answer():
+                t = (bot_remote.state(db) or {}).get("test") or {}
+                if t.get("question") == asked:
+                    st.info(t.get("answer") or "(no answer)")
+                else:
+                    st.caption("⏳ Waiting for your PC to answer…")
+            test_answer()
+
+    prof = bot.get("profile") or {}
+    with st.expander("👤 Your details (name card) - the bot only uses these, never makes them up",
+                     expanded=not prof.get("agent_name")):
+        new_prof = {k: st.text_input(label, prof.get(k, ""), key=f"rprof-{k}")
+                    for k, label in bot_brain.PROFILE_FIELDS.items()}
+        st.caption("Leave a field empty if you don't want the bot to share it - it will say you'll send it yourself.")
+        if st.button("Save details"):
+            bot_remote.request(db, "bot_settings", {"profile": {k: v.strip() for k, v in new_prof.items()}})
+            st.success("Sent to your PC - the bot uses these within about 15 seconds.")
+
+    with st.expander("📝 Your agency info / FAQ (the bot answers from this)"):
+        current = bot.get("faq") or ""
+        new = st.text_area("FAQ", current, height=220, label_visibility="collapsed")
+        if st.button("Save FAQ") and new != current:
+            bot_remote.request(db, "bot_settings", {"faq": new})
+            st.success("Sent to your PC - saved within about 15 seconds.")
+
+    st.subheader("Recent conversations")
+    st.caption("Copied from your PC every 30 seconds.")
+    convs = bot.get("conversations") or []
     if not convs:
         st.caption("No messages yet - send the bot's number a WhatsApp from another phone to test it.")
     for cv in convs:
