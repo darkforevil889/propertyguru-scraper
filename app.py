@@ -110,7 +110,8 @@ with st.sidebar:
         st.session_state.logged_out = True
         write_cookie("", days=0)
         st.rerun()
-    tool = st.radio("Page", ["Listings", "Condo prices", "WhatsApp", "Chat bot", "Phone filter", "Price filter"])
+    tool = st.radio("Page", ["Listings", "Condo prices", "WhatsApp", "WhatsApp blast", "Chat bot", "Phone filter",
+                             "Price filter"])
 
 
 # ---------- phone filter ----------
@@ -459,8 +460,9 @@ def scan_chats_tab():
     from wa_parser import group_by_owner, group_listings, uses_separators
 
     st.caption("Link your WhatsApp by QR code, pick chats (individual or groups), and turn property posts into "
-               "listings (type, price, sqft, place, furnishing, phone numbers) with their photos. Read-only: "
-               "nothing is ever sent from your WhatsApp. Works on your PC only.")
+               "listings (type, price, sqft, place, furnishing, phone numbers) with their photos. Scanning is "
+               "read-only: nothing is sent from your WhatsApp except blasts you start on the WhatsApp blast "
+               "page. Works on your PC only.")
     try:
         s = wa_client.ensure_running()
     except Exception as e:
@@ -750,10 +752,37 @@ def condo_prices_page():
         load_condo_summary.clear()
         st.rerun()
 
-    f1, f2, f3 = st.columns([2, 2, 1])
-    areas = f1.multiselect("Area", sorted(df.area.unique()), default=sorted(df.area.unique()))
-    text = f2.text_input("Search condo name")
-    has = f3.radio("Show", ["All", "For sale", "For rent"], horizontal=False)
+    for c in ("sale_min", "sale_max", "rent_min", "rent_max", "sqft_min", "sqft_max", "sale_listings", "rent_listings"):
+        df[c] = pd.to_numeric(df.get(c), errors="coerce")
+    # "2 - 5", "Studio - 3" -> lowest / highest room count (studio = 0)
+    beds = df.bedrooms.fillna("").astype(str).str.lower().str.replace("studio", "0").str.findall(r"\d+")
+    df["bed_lo"] = beds.map(lambda b: int(b[0]) if b else None)
+    df["bed_hi"] = beds.map(lambda b: int(b[-1]) if b else None)
+
+    def range_slider(label, lo_col, hi_col, step, key):
+        """Price / size range like on Listings; a condo stays if its range overlaps the chosen one."""
+        lo, hi = df[lo_col].min(), df[hi_col].max()
+        if pd.isna(lo) or pd.isna(hi) or lo >= hi:
+            return None
+        lo, hi = int(lo // step * step), int(-(-hi // step) * step)
+        picked = st.slider(label, lo, hi, (lo, hi), step=step, key=key, format="%d")
+        return None if picked == (lo, hi) else (lo_col, hi_col, picked)
+
+    # ---------- filters (sidebar, like the Listings page) ----------
+    with st.sidebar:
+        st.header("Filters")
+        areas = st.multiselect("Area", sorted(df.area.unique()), default=sorted(df.area.unique()))
+        has = st.radio("Show", ["All", "For sale", "For rent"], horizontal=True)
+        ranges = [range_slider("Sale price (RM)", "sale_min", "sale_max", 100_000, "condo-sale"),
+                  range_slider("Monthly rent (RM)", "rent_min", "rent_max", 500, "condo-rent"),
+                  range_slider("Size (sqft)", "sqft_min", "sqft_max", 100, "condo-sqft")]
+        bed_opts = sorted({n for lo, hi in zip(df.bed_lo, df.bed_hi) if pd.notna(lo) and pd.notna(hi)
+                           for n in range(int(lo), int(hi) + 1)})
+        want_beds = st.multiselect("Bedrooms", bed_opts)
+        types = st.multiselect("Property type", sorted(df.property_type.dropna().unique()))
+        tenures = st.multiselect("Tenure", sorted(df.tenure.dropna().unique()))
+        text = st.text_input("Search condo name")
+
     view = df[df.area.isin(areas)]
     if text:
         view = view[view.condo.str.contains(text, case=False, na=False)]
@@ -761,7 +790,21 @@ def condo_prices_page():
         view = view[view.sale_listings > 0]
     elif has == "For rent":
         view = view[view.rent_listings > 0]
-    st.caption(f"{len(view):,} condos")
+    for r in filter(None, ranges):
+        lo_col, hi_col, (lo, hi) = r
+        view = view[(view[hi_col] >= lo) & (view[lo_col] <= hi)]
+    if want_beds:
+        view = view[[any(pd.notna(a) and pd.notna(b) and a <= n <= b for n in want_beds)
+                     for a, b in zip(view.bed_lo, view.bed_hi)]]
+    if types:
+        view = view[view.property_type.isin(types)]
+    if tenures:
+        view = view[view.tenure.isin(tenures)]
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Condos", f"{len(view):,}")
+    k2.metric("Median lowest sale", f"RM {view.sale_min.median():,.0f}" if view.sale_min.notna().any() else "–")
+    k3.metric("Median lowest rent", f"RM {view.rent_min.median():,.0f}" if view.rent_min.notna().any() else "–")
 
     cols = {"condo": "Condo", "area": "Area", "sale_min": "Sale from (RM)", "sale_max": "Sale to (RM)",
             "sale_listings": "For sale", "rent_min": "Rent from (RM)", "rent_max": "Rent to (RM)",
@@ -890,6 +933,202 @@ def chat_bot_page():
                 st.markdown(f"**{'🤖 Bot' if role == 'assistant' else '👤 ' + who}:** {text}")
 
 
+# ---------- WhatsApp blast (one message to many numbers, sent slowly from this PC) ----------
+def whatsapp_blast_page():
+    from collections import Counter
+
+    st.title("WhatsApp blast")
+    st.caption("Send one message - with photos / videos / PDF and a link button if you like - to a list of numbers, "
+               "one person at a time with a random pause in between, now or at a time you choose. It sends from "
+               "this PC, so keep the PC on until it finishes (it won't go to sleep while a blast is waiting).")
+    try:
+        import neonize  # noqa: F401
+        import bot_client
+        import wa_blast
+        import wa_client
+    except ImportError:
+        st.info("WhatsApp blast only works on the PC where your WhatsApp is linked (open the dashboard there).")
+        return
+
+    senders, me_of = {}, {}
+    for key, mod in (("main", wa_client), ("bot", bot_client)):
+        s = mod.status()
+        if not s and key == "main":
+            try:
+                s = wa_client.ensure_running()
+            except Exception:
+                s = None
+        if s and s.get("status") == "ready":
+            me_of[key] = (s.get("me") or {}).get("number") or ""
+            senders[key] = f"{wa_blast.SENDERS[key]} (+{me_of[key]})"
+
+    new, mine = st.tabs(["New blast", "My blasts"])
+    with new:
+        if not senders:
+            st.warning("No WhatsApp connected yet - link your number on the **WhatsApp** page first "
+                       "(or the bot number on the **Chat bot** page), then come back.")
+        else:
+            new_blast_form(wa_blast, wa_client, senders)
+    with mine:
+        @st.fragment(run_every="10s")
+        def blast_list():
+            all_jobs = wa_blast.jobs()
+            if not all_jobs:
+                st.info("No blasts yet.")
+                return
+            for i, j in enumerate(all_jobs):
+                res = (j.get("progress") or {}).get("results") or {}
+                count = Counter(r.get("status") for r in res.values())
+                total, state = len(j["numbers"]), wa_blast.state_of(j)
+                live = state not in ("Finished", "Cancelled")
+                head = (f"{'🧪 Test' if j.get('test') else '📣'} {datetime.fromtimestamp(j['created']):%d %b %I:%M %p}"
+                        f" · {total} {'person' if total == 1 else 'people'} · {state}")
+                with st.expander(head, expanded=live and i < 3):
+                    st.progress(len(res) / max(total, 1),
+                                text=f"✅ {count['sent']} sent · 🚫 {count['not on WhatsApp']} not on WhatsApp · "
+                                     f"⚠️ {count['failed']} failed · ⏳ {total - len(res)} still to send")
+                    st.caption("From: " + wa_blast.SENDERS.get(j["sender"], j["sender"])
+                               + (f" · attachments: {', '.join(j['files'])}" if j.get("files") else ""))
+                    st.text(wa_blast.full_text(j, "{name}")[:600])
+                    if live:
+                        b = st.columns(4)
+                        if j["control"] == "pause":
+                            if b[0].button("▶️ Resume", key=f"res-{j['id']}"):
+                                wa_blast.set_control(j["id"], "run")
+                                st.rerun()
+                        elif b[0].button("⏸️ Pause", key=f"pau-{j['id']}"):
+                            wa_blast.set_control(j["id"], "pause")
+                            st.rerun()
+                        if b[1].button("✖️ Cancel", key=f"can-{j['id']}"):
+                            wa_blast.set_control(j["id"], "cancel")
+                            st.rerun()
+                    rows = [{"Number": n["phone"], "Name": n.get("name") or "",
+                             "Result": (res.get(n["phone"]) or {}).get("status", "waiting"),
+                             "Time": (datetime.fromtimestamp(res[n["phone"]]["at"]).strftime("%d %b %I:%M %p")
+                                      if n["phone"] in res else ""),
+                             "Problem": (res.get(n["phone"]) or {}).get("error", "")} for n in j["numbers"]]
+                    table = pd.DataFrame(rows)
+                    st.dataframe(table, hide_index=True, width="stretch", height=min(400, 38 + 35 * len(rows)))
+                    st.download_button("Download results (CSV)", table.to_csv(index=False).encode("utf-8-sig"),
+                                       f"blast {j['id']}.csv", "text/csv", key=f"dl-{j['id']}", on_click="ignore")
+        blast_list()
+
+
+def new_blast_form(wa_blast, wa_client, senders):
+    import time
+
+    from phone_filter import extract_from_text
+
+    v = st.session_state.setdefault("blast_v", 0)  # bumped after a blast starts -> widgets come back empty
+    sender = st.radio("Send from", list(senders), format_func=senders.get, horizontal=True)
+
+    st.subheader("1. Who")
+    c1, c2 = st.columns(2)
+    pasted = c1.text_area("Paste numbers - one per line. Add a name after the number if you like "
+                          "(e.g. `0123456789 Ali`)", height=170, key=f"blast-numbers-{v}")
+    ups = c2.file_uploader("…or upload .txt / Excel / CSV files", type=["txt", "csv", "xlsx", "xls"],
+                           accept_multiple_files=True, key=f"blast-files-{v}")
+    lines = pasted.splitlines()
+    for u in ups or []:
+        try:
+            lines += wa_blast.lines_from_file(u.name, u.getvalue())
+        except Exception as e:
+            st.warning(f"Couldn't read {u.name}: {e}")
+    numbers, rejected, dupes = wa_blast.parse_numbers(lines)
+    skip_days = c2.number_input("Skip people I already blasted in the last … days (0 = don't skip)", 0, 365, 7)
+    recent = wa_blast.recently_sent(skip_days) if skip_days else set()
+    skipped = [n for n in numbers if n["phone"] in recent]
+    numbers = [n for n in numbers if n["phone"] not in recent]
+    if lines:
+        bits = [f"**{len(numbers)}** to send"]
+        bits += [f"{dupes} duplicate{'s' * (dupes != 1)} removed"] if dupes else []
+        bits += [f"{len(skipped)} already blasted in the last {skip_days} days"] if skipped else []
+        bits += [f"{len(rejected)} not a Malaysian mobile"] if rejected else []
+        st.markdown(" · ".join(bits))
+        with st.expander("See the list"):
+            st.dataframe(pd.DataFrame(numbers or [{"phone": "", "name": ""}]).rename(
+                columns={"phone": "Number", "name": "Name"}), hide_index=True, width="stretch")
+            if rejected:
+                st.caption("Left out: " + ", ".join(f"{raw} ({why})" for raw, why in rejected[:30]))
+
+    st.subheader("2. What")
+    msg = st.text_area("Message", height=170, key=f"blast-msg-{v}",
+                       placeholder="{Hi|Hello} {name}, this is Mr Low from Homex Property 😊\n"
+                                   "Got a few new units at KLCC for rent, interested to view?")
+    st.caption("`{name}` = the person's name (left out when you didn't give one). `{Hi|Hello|Hey}` = picks one "
+               "at random for each person, so the messages aren't all identical - WhatsApp is less likely to "
+               "flag you.")
+    atts = st.file_uploader("Photos / videos / PDF (optional - the message goes with the first one)",
+                            accept_multiple_files=True, key=f"blast-atts-{v}",
+                            type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "pdf", "doc", "docx", "xls", "xlsx"])
+    b1, b2 = st.columns([1, 2])
+    label = b1.text_input("Button text (optional)", placeholder="WhatsApp me", key=f"blast-btn-{v}")
+    link = b2.text_input("Button link - a website, or just a phone number for a WhatsApp chat link",
+                         placeholder="0123456789  or  https://…", key=f"blast-link-{v}").strip()
+    if link and not link.lower().startswith("http"):
+        num = next((n for n, _, _ in extract_from_text(link) if n), None)
+        link = f"https://wa.me/6{num}" if num else "https://" + link
+    st.caption("Normal WhatsApp accounts can't send real buttons (only the paid WhatsApp Business API can), so it is "
+               "added as a tappable link at the end of the message.")
+    button = {"label": label, "url": link} if link else None
+    if msg.strip() or link:
+        sample = numbers[0] if numbers else {"name": "Ali"}
+        st.markdown("**Preview**" + (f" (for {sample.get('name') or 'someone without a name'})"))
+        st.info(wa_blast.full_text({"message": msg, "button": button}, sample.get("name")) or "(no text)")
+
+    st.subheader("3. When")
+    t1, t2, t3 = st.columns(3)
+    delay = t1.slider("Pause between people (seconds, random)", 15, 600, (45, 120), step=5)
+    limit = t2.number_input("Max people per day", 1, 300, 40,
+                            help="The rest carry on the next day. Keeping it low protects your number.")
+    hours = t3.slider("Only send between (hour of day)", 0, 24, (9, 21))
+    when = st.radio("Start", ["Now", "At a set time"], horizontal=True)
+    start_at = time.time()
+    if when == "At a set time":
+        d1, d2 = st.columns(2)
+        day = d1.date_input("Date", datetime.now().date(), min_value=datetime.now().date())
+        at = d2.time_input("Time", (datetime.now() + timedelta(hours=1)).replace(minute=0).time(), step=900)
+        start_at = datetime.combine(day, at).timestamp()
+        if start_at < time.time():
+            st.warning("That time has already passed - it would start right away.")
+    if numbers:
+        mins = len(numbers) * (sum(delay) / 2 + 8) / 60
+        days = -(-len(numbers) // limit)
+        st.caption(f"About {mins:.0f} minutes of sending" + (f", spread over {days} days (max {limit} a day)"
+                                                             if days > 1 else "") + ".")
+
+    files = [(a.name, a.getvalue()) for a in atts or []]
+    if not (msg.strip() or files or link):
+        return
+    st.divider()
+    t_col, go_col = st.columns(2)
+    default_test = (wa_client.load_settings().get("my_numbers") or [""])[0] if sender == "main" else ""
+    test_to = t_col.text_input("Test number", default_test, placeholder="your own other number",
+                               help="Sends the message once right now, so you can see how it looks.")
+    if t_col.button("🧪 Send a test"):
+        tn = next((n for n, _, _ in extract_from_text(test_to) if n), None)
+        if not tn:
+            st.error("Put a Malaysian mobile number in Test number.")
+        else:
+            wa_blast.create(sender, [{"phone": tn, "name": (numbers[0].get("name") if numbers else None)}],
+                            msg, files, button, test=True)
+            st.success(f"Test sending to {tn} now - check that phone in a few seconds.")
+    if not numbers:
+        go_col.info("Add some numbers in step 1.")
+        return
+    ok = go_col.checkbox(f"Yes, send this to {len(numbers)} {'person' if len(numbers) == 1 else 'people'}")
+    if go_col.button("📣 Start blast", type="primary", disabled=not ok):
+        wa_blast.create(sender, numbers, msg, files, button, start_at=start_at, delay=delay,
+                        daily_limit=limit, hours=hours)
+        st.session_state.blast_v = v + 1  # fresh, empty form next time - no accidental second send
+        st.success("Blast saved" + (f" - starts {datetime.fromtimestamp(start_at):%d %b %I:%M %p}"
+                                    if when == "At a set time" else " - sending has started")
+                   + ". Follow it on the **My blasts** tab.")
+
+
+if tool == "WhatsApp blast":
+    whatsapp_blast_page()
+    st.stop()
 if tool == "Chat bot":
     chat_bot_page()
     st.stop()

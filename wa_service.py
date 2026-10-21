@@ -4,7 +4,8 @@ Runs in the background on this PC:
   * links as a WhatsApp "linked device" by QR code (shows up as "KL Tracker" on your phone)
   * stores message history your phone sends at link time + new messages, in wa_data/messages.sqlite
   * downloads photos on request (only for chats you scan)
-Read-only: it never sends anything. Control API on 127.0.0.1:3078, protected by wa_data/.token.
+  * sends only the blasts you set up on the dashboard's "WhatsApp blast" page (wa_blast.py) - nothing else
+Control API on 127.0.0.1:3078, protected by wa_data/.token.
 
 Start it from the dashboard's WhatsApp page (or: python wa_service.py).
 """
@@ -322,6 +323,8 @@ if __name__ == "__main__":
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Api)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     threading.Thread(target=qr_watchdog, daemon=True).start()
+    import wa_blast
+    threading.Thread(target=wa_blast.worker, args=(client, "main", state), daemon=True).start()
     print(f"wa_service listening on 127.0.0.1:{PORT}", flush=True)
     try:
         client.connect()

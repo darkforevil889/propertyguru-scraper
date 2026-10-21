@@ -264,6 +264,8 @@ if __name__ == "__main__":
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Api)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     threading.Thread(target=qr_watchdog, daemon=True).start()
+    import wa_blast
+    threading.Thread(target=wa_blast.worker, args=(client, "bot", state), daemon=True).start()
     print(f"wa_bot listening on 127.0.0.1:{PORT}", flush=True)
     try:
         client.connect()
