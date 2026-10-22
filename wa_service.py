@@ -66,7 +66,7 @@ def phone_of(jid):
     return user.split(":")[0] if server == "s.whatsapp.net" and user.isdigit() else None
 
 
-PHOTO, PDF, VIDEO = 1, 2, 3  # stored in messages.has_image
+PHOTO, PDF, VIDEO, ZIP = 1, 2, 3, 4  # stored in messages.has_image
 
 
 def unwrap(m):
@@ -83,6 +83,8 @@ def unwrap(m):
         d = m.documentMessage
         if d.mimetype == "application/pdf" or (d.fileName or "").lower().endswith(".pdf"):
             return d.caption or d.fileName or "", PDF
+        if "zip" in (d.mimetype or "") or (d.fileName or "").lower().endswith(".zip"):
+            return d.caption or d.fileName or "", ZIP  # owners' photos / PDFs in one file - opened when scanning
         return None, 0
     if m.conversation:
         return m.conversation, 0
@@ -321,7 +323,7 @@ def download(ids, out_dir):
             continue
         try:
             data = client.download_any(WAMessage.FromString(row[0]))
-            ext = {PDF: 'pdf', VIDEO: 'mp4'}.get(row[1], 'jpg')
+            ext = {PDF: 'pdf', VIDEO: 'mp4', ZIP: 'zip'}.get(row[1], 'jpg')
             name = f"{''.join(ch for ch in mid if ch.isalnum())[:40]}.{ext}"
             (out / name).write_bytes(data)
             saved[mid] = name

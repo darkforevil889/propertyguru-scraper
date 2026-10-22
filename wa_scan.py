@@ -39,6 +39,57 @@ def status():
         return {}
 
 
+ZIP_KINDS = {".jpg": "photo", ".jpeg": "photo", ".png": "photo", ".webp": "photo", ".pdf": "pdf", ".mp4": "video",
+             ".mov": "video", ".txt": "text"}
+ZIP_MAX_FILES, ZIP_MAX_BYTES = 300, 300 * 1024 * 1024
+
+
+def _unzip(path, media, mid):
+    """A ZIP from a chat -> [(kind, file name in media/ or None, text)] for its photos / PDFs / videos / .txt.
+    Files are written flat into media/ under new names (never outside it); other file types are skipped."""
+    import re
+    import zipfile
+    prefix, out, total = re.sub(r"\W", "", mid)[:30], [], 0
+    try:
+        with zipfile.ZipFile(path) as z:
+            for info in sorted(z.infolist(), key=lambda i: i.filename):
+                name = Path(info.filename).name
+                kind = ZIP_KINDS.get(Path(name).suffix.lower())
+                if info.is_dir() or not kind or "__MACOSX" in info.filename or name.startswith("."):
+                    continue
+                total += info.file_size
+                if total > ZIP_MAX_BYTES or len(out) >= ZIP_MAX_FILES:
+                    break
+                if kind == "text":
+                    out.append(("text", None, z.read(info).decode("utf-8", "replace")[:20000]))
+                    continue
+                clean = re.sub(r"[^\w.-]", "_", name)[-60:]
+                fname = f"{prefix}_{len(out)}_{clean}"
+                (media / fname).write_bytes(z.read(info))
+                out.append((kind, fname, ""))
+    except (zipfile.BadZipFile, OSError):
+        return []
+    return out
+
+
+def expand_zips(msgs, got, media):
+    """Replace each ZIP message by one message per file inside it (same sender and time, so a ZIP posted
+    between two '.' separators belongs to that owner). A ZIP that can't be opened stays as its caption."""
+    out = []
+    for m in msgs:
+        if not m.get("is_zip"):
+            out.append(m)
+            continue
+        inner = _unzip(media / got[m["id"]], media, m["id"]) if m["id"] in got else []
+        caption = (m.get("body") or "").strip()
+        if caption and not caption.lower().endswith(".zip") or not inner:
+            out.append({**m, "is_zip": False})  # its caption (or just the file name if it couldn't be opened)
+        for i, (kind, fname, text) in enumerate(inner):
+            out.append({**m, "id": f"{m['id']}-z{i}", "is_zip": False, "body": text or "", "photo": fname,
+                        "has_image": kind == "photo", "is_pdf": kind == "pdf", "is_video": kind == "video"})
+    return out
+
+
 def scan(db, picked, days, read_pictures, scanned_by, progress=None):
     """Scan the picked chats (keys from wa_client.chats()) -> {'listings', 'media', 'messages', 'saved'}.
     progress(text, fraction or None) is called along the way. saved = True, or a short note / error."""
@@ -55,11 +106,17 @@ def scan(db, picked, days, read_pictures, scanned_by, progress=None):
 
     progress("Reading messages…", 0.02)
     msgs = wa_client.messages([j for k in picked for j in by_key.get(k, [k])], time.time() - days * 86400)
+    zips = [m for m in msgs if m.get("is_zip")]
+    if zips:  # owners' photos / PDFs sent as one ZIP: open it, its files count as posted where the ZIP was
+        progress(f"Opening {len(zips)} ZIP file(s)…", 0.03)
+        got = wa_client.download([(m["chatId"], m["id"]) for m in zips], run_dir / "media")
+        msgs = expand_zips(msgs, got, run_dir / "media")
     files_msgs = [m for m in msgs if m["has_image"] or m["is_pdf"] or m["is_video"]]
     if read_pictures and files_msgs:
         from wa_ocr import is_chat_screenshot, read_pdf, read_text
         progress(f"Downloading {len(files_msgs)} pictures / PDFs / videos…", 0.05)
-        files = wa_client.download([(m["chatId"], m["id"]) for m in files_msgs], run_dir / "media")
+        files = wa_client.download([(m["chatId"], m["id"]) for m in files_msgs if not m.get("photo")],
+                                   run_dir / "media")
         for m in files_msgs:
             if m["id"] in files:
                 m["photo"] = files[m["id"]]

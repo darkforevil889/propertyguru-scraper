@@ -162,6 +162,7 @@ def messages(chat_jids, since_ts):
         phone, name = _resolve(sender or chat, lid_phone, names, sphone, sname)
         out.append({"chatId": chat, "id": mid, "author": phone or sender or chat, "authorName": name,
                     "authorNumber": phone, "timestamp": ts, "fromMe": bool(from_me), "body": body or "",
-                    "has_image": has_image == 1, "is_pdf": has_image == 2, "is_video": has_image == 3, "photo": None, "reply_to": reply,
+                    "has_image": has_image == 1, "is_pdf": has_image == 2, "is_video": has_image == 3,
+                    "is_zip": has_image == 4, "photo": None, "reply_to": reply,
                     "chatName": cname or (f"+{cphone}" if cphone else chat.split("@")[0])})
     return out
