@@ -84,6 +84,11 @@ def heartbeat(db):
         data["wa_scan"] = wa_scan.status()
     except Exception:
         pass
+    try:  # PropertyGuru comparison progress, shown on the online Saved listings tab
+        import market_check
+        data["market_check"] = market_check.status()
+    except Exception:
+        pass
     db.table("pc_status").upsert({"name": "pc", "data": data}).execute()
 
 

@@ -82,6 +82,9 @@ def blast_sync_loop():
         try:  # WhatsApp page: chat list up every minute, scans / settings asked for online every 15 s
             importlib.reload(wa_scan)
             wa_scan.run_requests(db, log)
+            import market_check  # Saved listings: "Compare with PropertyGuru" pressed online
+            importlib.reload(market_check)
+            market_check.run_requests(db, log)
             if n % 4 == 1:
                 wa_scan.sync_chats(db)
             last_wa_error = None

@@ -321,11 +321,27 @@ def load_owner_listings(_db):
     rows, start = [], 0
     while True:
         batch = (_db.table("owner_listings").select("*").order("posted_at", desc=True)
-                 .range(start, start + 999).execute().data)
+                 .order("message_id").range(start, start + 999).execute().data)
         rows += batch
         if len(batch) < 1000:
             return rows
         start += 1000
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_market_check(_db):
+    """PropertyGuru comparisons of saved listings (market_check.py) - {message_id: result}."""
+    import market_check
+    return market_check.load_results(_db)
+
+
+def blast_remote_status(_db):
+    """The PC's last heartbeat (pc_status 'pc') - progress of things it runs for the online dashboard."""
+    try:
+        rows = _db.table("pc_status").select("data").eq("name", "pc").execute().data
+        return rows[0]["data"] if rows else {}
+    except Exception:
+        return {}
 
 
 def signed_urls(paths, ttl=3600):
@@ -387,30 +403,78 @@ def saved_listings_tab():
                                                        ("place", "phones", "sender_phone", "message_text")).lower())]
     st.caption(f"{len(shown):,} of {len(rows):,} listings")
 
-    # Signed (temporary, private) links to each listing's first picture for the thumbnails. Reused for 50 minutes:
-    # new links on every refresh would make the table look "different" and clear the row you clicked.
-    first_pic = {r["message_id"]: next((p for p in r.get("photo_paths") or [] if p.endswith(".jpg")), None)
-                 for r in shown[:300]}
-    thumbs = signed_urls([p for p in first_pic.values() if p])
+    # ----- compare with PropertyGuru (runs on the PC: market_check.py) -----
+    import market_check
+    market = load_market_check(db)
+    on_pc = (ROOT_DIR / "market_check.py").exists() and bool(os.environ.get("SUPABASE_SECRET_KEY"))
+    mstat = market_check.status() if on_pc else (blast_remote_status(db).get("market_check") or {})
+    m1, m2 = st.columns([1, 3])
+    if mstat.get("state") == "running" and datetime.now().timestamp() - mstat.get("at", 0) < 600:
+        @st.fragment(run_every="5s")
+        def market_progress():
+            s = market_check.status() if on_pc else (blast_remote_status(db).get("market_check") or {})
+            if s.get("state") != "running":
+                load_market_check.clear()
+                st.rerun(scope="app")
+            st.info(f"🔍 Comparing with PropertyGuru & iProperty on your PC… {s.get('done', 0)} of {s.get('total', '?')}: "
+                    f"{s.get('text', '')}")
+        with m2:
+            market_progress()
+    elif m1.button(f"🔍 Compare with PropertyGuru & iProperty ({len(shown)})", disabled=not shown,
+                   help="For each listing shown: finds it on PropertyGuru and iProperty, reads the current rent / sale prices and "
+                        "sizes there, and says whether the owner's price is OK to post. Runs on your PC (a Chrome "
+                        "window opens) - about 20 seconds per property."):
+        ids = [r["message_id"] for r in shown]
+        if on_pc:
+            market_check.start(ids)
+        else:
+            market_check.request(db, ids)
+            st.session_state.market_asked = True
+        st.rerun()
+    if st.session_state.get("market_asked") and not on_pc:
+        m2.caption("⏳ Sent to your PC - results appear here within a few minutes (if the PC is on).")
+
+    # Left: the owner's listing | right: PropertyGuru & iProperty
     table = pd.DataFrame([{
-        "Picture": thumbs.get(first_pic.get(r["message_id"])),
         "Owner": r.get("owner_name"),
         "Number": (r.get("phones") or "").replace("; ", ", ") or r.get("sender_phone"),
-        "Price (RM)": r.get("price_rm"),
+        "Place": r.get("place"),
+        "Unit number": r.get("unit_no"),
+        "Type": r["_category"],
+        # a sale that comes with a tenant also shows its rental
+        "Rent Price (RM)": r.get("price_rm") if r.get("listing_type") == "Rent" else r.get("rental_rm"),
+        "Sale Price (RM)": r.get("price_rm") if r.get("listing_type") != "Rent" else None,
+        "sf": r.get("sqft"),
         "Rent / Sale": r.get("listing_type"),
-        "Property type": r["_category"],
-        "Location": r.get("place"),
-        "Unit": r.get("unit_no"),
-        "Rental (RM/mo)": r.get("rental_rm"),
-        "Sqft": r.get("sqft"),
-        "Furnishing": r.get("furnishing"),
-        "Photos": len(r.get("photo_paths") or []),
-        "Posted": pd.to_datetime(r.get("posted_at"), utc=True).tz_convert(MYT).strftime("%Y-%m-%d"),
+        "Furnish": r.get("furnishing"),
+        "PG + iProperty": (market.get(r["message_id"]) or {}).get("label", ""),
+        "Why": (market.get(r["message_id"]) or {}).get("why") or (market.get(r["message_id"]) or {}).get("reason"),
+        "Lowest sale": market_check.lowest_real(market.get(r["message_id"]) or {}, "sale"),
+        "Lowest rent": market_check.lowest_real(market.get(r["message_id"]) or {}, "rent"),
+        "Already listed?": (market.get(r["message_id"]) or {}).get("same_unit_url"),
     } for r in shown])
     picked = st.dataframe(table, hide_index=True, width="stretch", height=480, on_select="rerun",
-                          selection_mode="single-row", row_height=60, key="saved_listings_table",
-                          column_config={"Picture": st.column_config.ImageColumn("Picture", width="small"),
-                                         "Price (RM)": st.column_config.NumberColumn(format="%,d")})
+                          selection_mode="single-row", key="saved_listings_table",
+                          column_config={"Place": st.column_config.TextColumn(width="medium"),
+                                         "Rent Price (RM)": st.column_config.NumberColumn(
+                                             format="%,d", help="Monthly rent - for a sale, the rental it comes "
+                                                                "with (sold tenanted)"),
+                                         "Sale Price (RM)": st.column_config.NumberColumn(format="%,d"),
+                                         "sf": st.column_config.NumberColumn(format="%,d"),
+                                         "PG + iProperty": st.column_config.TextColumn(
+                                             help="Owner's price compared with PropertyGuru and iProperty now"),
+                                         "Why": st.column_config.TextColumn(width="large"),
+                                         "Lowest sale": st.column_config.NumberColumn(
+                                             format="%,d", help="Cheapest real one for sale on PropertyGuru / "
+                                                                "iProperty now - same size when listed (lelong / "
+                                                                "bait left out)"),
+                                         "Lowest rent": st.column_config.NumberColumn(
+                                             format="%,d", help="Cheapest real one for rent on PropertyGuru / "
+                                                                "iProperty now - same size when listed (lelong / "
+                                                                "bait left out)"),
+                                         "Already listed?": st.column_config.LinkColumn(
+                                             display_text="👀 Open", help="Same price online - probably this unit, "
+                                                                          "already advertised")})
     sel = [i for i in picked.selection.rows if i < len(shown)]
     if not sel:
         st.caption("👆 Click a row for its description and pictures.")
@@ -422,24 +486,91 @@ def saved_listings_tab():
                  f"{'RM ' + format(r['price_rm'], ',') if r.get('price_rm') else ''}")
     if r.get("property_type"):
         st.caption(f"Type as written: {r['property_type'][:200]}")
+    mk = market.get(r["message_id"])
+    if mk:  # the verdict, full width
+        box = {"good": st.success, "ok": st.warning, "high": st.error}.get(mk.get("verdict"), st.info)
+        when = datetime.fromtimestamp(mk.get("checked_at", 0), MYT).strftime("%d %b %Y")
+        links = " · ".join(x for x in (
+            f"[See {mk.get('property')} on PropertyGuru]({mk['property_url']})" if mk.get("property_url") else "",
+            f"[on iProperty]({mk['ip_url']})" if mk.get("ip_url") else "",
+            f"[👀 Already listed? (same price)]({mk['same_unit_url']})" if mk.get("same_unit_url") else "") if x)
+        sites = "PropertyGuru & iProperty" if mk.get("sites") else "PropertyGuru (compare again to add iProperty)"
+        box(f"**📊 Compared with {sites}: {mk.get('label')}**\n\n{mk.get('reason')}\n\n{links}  \n"
+            f"_Checked {when}_")
     name = re.sub(r"[^A-Za-z0-9 ]+", "", r.get("place") or "listing").strip() or "listing"
     paths = r.get("photo_paths") or []
-    b1, b2 = st.columns(2)
-    b1.download_button("Download description (.txt)", describe(listing).encode("utf-8-sig"),
-                       f"{name}.txt", "text/plain", on_click="ignore")
-    if paths and b2.button(f"Prepare ZIP: description + {len(paths)} files", key=f"zip-{r['message_id']}"):
-        with st.spinner("Collecting pictures…"):
-            photos = []
-            for p in paths:
-                try:
-                    photos.append((p, db.storage.from_(PHOTO_BUCKET).download(p)))
-                except Exception:
-                    pass
-        st.session_state.owner_zip = (r["message_id"], listing_zip(listing, photos), f"{name}.zip")
-    oz = st.session_state.get("owner_zip")
-    if oz and oz[0] == r["message_id"]:
-        b2.download_button(f"Download {oz[2]}", oz[1], oz[2], "application/zip", type="primary", on_click="ignore")
-    st.text(describe(listing))
+    left, right = st.columns(2, gap="large")  # half owner, half PropertyGuru & iProperty
+
+    # ----- left: the owner's listing -----
+    with left:
+        st.markdown("### 🏠 Owner's listing")
+        rent = r.get("listing_type") == "Rent"
+        money = (f"RM {r['price_rm']:,}" + ("/mo" if rent else "")) if r.get("price_rm") else "-"
+        facts = [("Rent / Sale", r.get("listing_type")), ("Price", money),
+                 ("Size", f"{r['sqft']:,} sf" if r.get("sqft") else None),
+                 ("Property type", r["_category"] + (f" ({r['property_type'][:60]})" if r.get("property_type") else "")),
+                 ("Rooms", " / ".join(x for x in (f"{r['bedrooms']} bed" if r.get("bedrooms") else "",
+                                                  f"{r['bathrooms']} bath" if r.get("bathrooms") else "") if x)),
+                 ("Furnishing", r.get("furnishing")), ("Unit", r.get("unit_no")),
+                 ("Rental (if sold tenanted)", f"RM {r['rental_rm']:,}/mo" if r.get("rental_rm") and not rent else None),
+                 ("Owner", r.get("owner_name")),
+                 ("Number", (r.get("phones") or "").replace("; ", ", ") or r.get("sender_phone")),
+                 ("Posted", pd.to_datetime(r.get("posted_at"), utc=True).tz_convert(MYT).strftime("%d %b %Y"))]
+        st.markdown("\n".join(f"- **{k}:** {v}" for k, v in facts if v))
+        b1, b2 = st.columns(2)
+        b1.download_button("Download description (.txt)", describe(listing).encode("utf-8-sig"),
+                           f"{name}.txt", "text/plain", on_click="ignore")
+        if paths and b2.button(f"Prepare ZIP ({len(paths)} files)", key=f"zip-{r['message_id']}"):
+            with st.spinner("Collecting pictures…"):
+                photos = []
+                for p in paths:
+                    try:
+                        photos.append((p, db.storage.from_(PHOTO_BUCKET).download(p)))
+                    except Exception:
+                        pass
+            st.session_state.owner_zip = (r["message_id"], listing_zip(listing, photos), f"{name}.zip")
+        oz = st.session_state.get("owner_zip")
+        if oz and oz[0] == r["message_id"]:
+            b2.download_button(f"Download {oz[2]}", oz[1], oz[2], "application/zip", type="primary",
+                               on_click="ignore")
+        with st.expander("Owner's full description", expanded=True):
+            st.text(describe(listing))
+
+    # ----- right: what's on PropertyGuru & iProperty now - the 5 cheapest for sale and for rent, real or fake -----
+    with right:
+        st.markdown("### 🔎 PropertyGuru & iProperty now")
+        if not mk:
+            st.caption("Not compared yet - press **Compare with PropertyGuru & iProperty** above.")
+        else:
+            where = f"in **{mk.get('property')}** (area)" if mk.get("area") else \
+                f"at **{mk.get('property')}**" if mk.get("property") else ""
+            st.caption(f"Cheapest listings {where} on both sites (an ad on both counts once) - each one's own "
+                       "description checked: ✅ real · ⚠️ check · ❌ fake (lelong, \"starting from\", a different "
+                       "price in its description)")
+            real_word = {"real": "✅ Real", "check": "⚠️ Check", "fake": "❌ Fake"}
+            site_word = {"pg": "PropertyGuru", "ip": "iProperty", "both": "Both"}
+            for k, title in (("sale", "🏷️ 5 cheapest for sale"), ("rent", "🔑 5 cheapest for rent")):
+                units = mk.get(f"{k}_lowest")
+                size_note = (f"same size as the owner's (±20% of {mk['owner_sqft']:,} sf)" if mk.get(f"{k}_same_size")
+                             else "sizes vary")
+                st.markdown(f"**{title}** <small>· {size_note}</small>", unsafe_allow_html=True)
+                if units is None:
+                    st.caption("Compare again to see this.")
+                    continue
+                if not units:
+                    st.caption("None listed on PropertyGuru or iProperty right now.")
+                    continue
+                st.dataframe(pd.DataFrame([{
+                    "Real?": real_word.get((u.get("check") or {}).get("status"), ""),
+                    "Price (RM)": u["price"], "Sqft": u.get("sqft"), "Beds": u.get("beds"),
+                    "Site": site_word.get(u.get("site") or "pg", ""),
+                    "Why": (u.get("check") or {}).get("why", ""),
+                    "Listing": u.get("url")} for u in units]), hide_index=True, width="stretch",
+                    column_config={"Price (RM)": st.column_config.NumberColumn(format="%,d"),
+                                   "Sqft": st.column_config.NumberColumn(format="%,d"),
+                                   "Why": st.column_config.TextColumn(width="large",
+                                                                      help="Quoted from the listing's own description"),
+                                   "Listing": st.column_config.LinkColumn("Listing", display_text="Open ↗")})
     if paths:
         links = signed_urls(paths)
         if len(links) < len(paths):
