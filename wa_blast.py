@@ -21,7 +21,7 @@ MYT = timezone(timedelta(hours=8))  # Malaysia time - the online dashboard's ser
 ROOT = Path(__file__).parent.resolve()
 DIR = ROOT / "wa_blast"
 FILES = DIR / "files"
-SENDERS = {"main": "My WhatsApp (linked on the WhatsApp page)", "bot": "Chat bot number"}
+SENDERS = {"main": "My WhatsApp (linked on the WhatsApp listing page)", "bot": "Chat bot number"}
 IMAGE, VIDEO = {".jpg", ".jpeg", ".png", ".webp"}, {".mp4", ".mov", ".3gp", ".m4v"}
 
 
@@ -35,6 +35,12 @@ def _read(path, default=None):
 def _write(path, obj):
     tmp = Path(str(path) + ".tmp")
     tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
+    for attempt in range(20):  # Windows refuses while another program is reading the file - try again shortly
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.1)
     os.replace(tmp, path)
 
 

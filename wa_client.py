@@ -39,7 +39,7 @@ def ensure_running():
         import neonize  # noqa: F401
     except ImportError:
         raise RuntimeError("The WhatsApp connector isn't installed on this computer - "
-                           "the WhatsApp page only works on the PC it was set up on.")
+                           "the WhatsApp listing page only works on the PC it was set up on.")
     (ROOT / "logs").mkdir(exist_ok=True)
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
     subprocess.Popen([sys.executable, str(ROOT / "wa_service.py")], cwd=ROOT, creationflags=flags,

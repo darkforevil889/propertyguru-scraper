@@ -63,8 +63,9 @@ def audio_url(db, call_id, ttl=3600):
         return None
 
 
-def request_check(db, start_page, pages):
-    db.table("pc_tasks").insert({"kind": "ai_call", "params": {"start": int(start_page), "pages": int(pages)}}).execute()
+def request_check(db, start_page, pages, quick=False):
+    db.table("pc_tasks").insert({"kind": "ai_call", "params": {"start": int(start_page), "pages": int(pages),
+                                                               "quick": bool(quick)}}).execute()
 
 
 def pending_requests(db):
@@ -125,6 +126,6 @@ def run_requests(db, start_check):
         if s.get("state") == "running" and time.time() - s.get("at", 0) < 600:
             return  # one check at a time - the request waits until this one is done
         p = task.get("params") or {}
-        start_check(int(p.get("start") or 1), int(p.get("pages") or 1))
+        start_check(int(p.get("start") or 1), int(p.get("pages") or 1), bool(p.get("quick")))
         db.table("pc_tasks").update({"status": "started"}).eq("id", task["id"]).execute()
         return

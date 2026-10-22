@@ -301,6 +301,118 @@ Reply ONLY with JSON: {"q1": "<their answer to Q1, short>", "q2": "<their answer
 translation in brackets only if not English>"}"""
 
 
+# ---------- quick check: only the answer to "Do you want to sell or rent your property?" ----------
+QUICK_RULES = 1
+VOICEMAIL = re.compile(r"leave (a |your )?message|after the (beep|tone)|voice ?mail|voice message|press (#|hash)|"
+                       r"not available|unavailable|tidak dapat dihubungi|tinggalkan (pesanan|mesej)|留言|不在服务区|"
+                       r"无法接通|暂时无法|無法接聽", re.I)
+QUICK_JUDGE = """Phone call by a Malaysian property agent's robot. Q1 = "Do you want to sell or rent your \
+property?", Q2 = "How about I WhatsApp you details?". Below: the call from Q1 on. Each PERSON line is heard twice: \
+"re-heard" (more accurate) and "ipline guessed" (often wrong). People answer late, so an answer to Q1 may come after \
+Q2. English / Malay / Chinese / a mix.
+
+Facts (true / false), each on its own:
+- machine: voicemail / recorded / operator message, not a person.
+- refused: no / not now / not interested / no property / not owner / wrong number / hostile / annoyed / go away.
+- q1_yes: answers Q1 with yes / ok / can / sure / boleh, or has a property to sell or rent out, or wants to buy or \
+rent one.
+- q1_asks_property: asks what / where / which property, price, area, which agency (not a bare "sorry?" / "hello?").
+- q2_yes: agrees to be WhatsApped - yes / ok / can / sure / "send me the details" / "WhatsApp me".
+- confused: clearly doesn't understand the call or who is calling - "minta apa?", "apa ni?", "untuk apa?", "detail \
+untuk?", "what are you saying?", "who are you?", "I don't know you", unrelated replies. A bare "sorry?" / "hello?" is \
+NOT confused.
+
+JSON only: {"q1": "<answer to Q1>", "q2": "<answer to Q2>", "machine": bool, "refused": bool, "q1_yes": bool, \
+"q1_asks_property": bool, "q2_yes": bool, "confused": bool, "said": "<their key words, short; English in brackets \
+only if not English>"}"""
+
+
+def first_answer(turns):
+    """The call from the robot's 'sell or rent' question on (robot + person lines; the hello / who-is-this part
+    before it is left out). The robot goes straight on to 'How about I WhatsApp you details?', so the person's real
+    answer often comes after that line."""
+    start = next((i for i, t in enumerate(turns) if t["who"] == "robot" and re.search(r"sell|rent", t["text"], re.I)),
+                 None)
+    return [] if start is None else [t for t in turns[start:] if t["who"] in ("robot", "person")]
+
+
+# ---------- free word rules: settle the obvious calls without the AI (text-only backlog) ----------
+CONFUSED_WORDS = re.compile(r"minta apa|apa (ni|tu|ini|itu)\b|untuk apa|detail untuk|who (are|is) (you|this|that)|"
+                            r"siapa|what (is|are) (this|you saying)|don'?t (know|understand) what|tak faham|你是谁|"
+                            r"什么事|干什么|乜嘢", re.I)
+REFUSED_WORDS = re.compile(r"not interest|no need|tak (nak|mau|mahu|perlu|minat|payah)|tak ?payah|tidak (berminat|perlu|"
+                           r"mahu)|don'?t (want|need|call|like)|stop calling|wrong number|salah nombor|no thank|"
+                           r"不要|不需要|没兴趣|沒興趣|不用|唔使|唔要|^\W*(no|nope|nah|tak|tidak|takde|tak ada)\W*$", re.I)
+ASKS_WORDS = re.compile(r"which (property|one|area|place|unit|condo|house)|where (is |are )?(the )?(property|place|"
+                        r"unit|house|condo)|what property|property (mana|apa)|mana (punya )?property|rumah mana|"
+                        r"which area|where ah|kat mana|dekat mana|哪里|哪个", re.I)
+FILLER_TOKENS = {"hello", "helo", "hallo", "hi", "hey", "eh", "ah", "ha", "huh", "hmm", "oh", "er", "erm", "sorry",
+                 "thank", "thanks", "you", "bye", "terima", "kasih", "the", "a", "so", "and", "i", "喂", "你好", "哈囉",
+                 "谢谢", "謝謝", "拜拜"}
+AGREE_TOKENS = {"yes", "yeah", "ya", "yup", "ok", "okay", "okey", "okie", "oke", "can", "sure", "boleh", "alright",
+                "please", "send", "whatsapp", "me", "details", "detail", "baik", "好", "可以", "好的"}
+
+
+def rule_check(answer):
+    """Obvious calls decided by word rules (free, instant) -> facts, or None when unclear (the AI decides).
+    answer = robot + person lines from the 'sell or rent' question on (ipline's text)."""
+    lines = [t["text"].strip() for t in answer if t["who"] == "person" and t["text"].strip()]
+    facts = {"machine": False, "refused": False, "q1_yes": False, "q1_asks_property": False, "q2_yes": False,
+             "confused": False, "q1": " / ".join(lines)[:120], "said": " / ".join(lines)[:200], "by_rules": True}
+    text = " ".join(lines)
+    tokens = [w for w in re.findall(r"[\w']+", text.lower()) if w not in FILLER_TOKENS]
+    if not tokens:  # nothing, or only hello / sorry / thank you
+        return facts
+    refused, confused, asks = REFUSED_WORDS.search(text) or any(REFUSED_WORDS.search(l) for l in lines), \
+        CONFUSED_WORDS.search(text), ASKS_WORDS.search(text)
+    agree_only = all(w in AGREE_TOKENS for w in tokens)
+    if refused and any(w in AGREE_TOKENS for w in tokens):
+        return None  # "yes ... no ..." - mixed, let the AI read it
+    if sum(map(bool, (refused, confused, asks, agree_only))) != 1:
+        return None  # mixed or nothing recognisable - let the AI read it
+    facts.update(refused=bool(refused), confused=bool(confused), q1_asks_property=bool(asks), q1_yes=agree_only)
+    return facts
+
+
+TEXT_NOTE = ("\n\nNOTE: this call's recording is gone, so there is no \"re-heard\" text - only ipline's guesses, which "
+             "are often wrong. Read past obvious mis-hearings.")
+def quick_judge(answer, text_only=False):
+    """Facts about the call from the question on -> {facts..., verdict, reason}. Free shortcut first.
+    text_only: the recording is gone - judge from ipline's own text."""
+    person = [t for t in answer if t["who"] == "person"]
+    if not any((t.get("heard") or t.get("text") or "").strip() for t in person):
+        return {"machine": False, "refused": False, "q1_yes": False, "q1_asks_property": False, "q2_yes": False,
+                "confused": False, "q1": "", "said": "", "verdict": "not interested",
+                "reason": "Said nothing after the question"}
+    lines = conversation(answer, "ipline") if text_only else conversation(answer)
+    system = QUICK_JUDGE + (TEXT_NOTE if text_only else "")
+    text = ""
+    # the text-only backlog leaves the chat bot's main model (gpt-oss-120b) alone
+    for model in ([m for m in MODELS if "120b" not in m] if text_only else MODELS):
+        body = {"model": model, "temperature": 0, "max_tokens": 600, "response_format": {"type": "json_object"},
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": lines}]}
+        if "gpt-oss" in model:
+            body["reasoning_effort"] = "low"
+        try:
+            text = _groq("POST", "/chat/completions", json=body)["choices"][0]["message"]["content"] or ""
+            break
+        except DailyLimit:
+            continue
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code not in (400, 404):
+                raise
+    else:
+        raise DailyLimit("today's free AI allowance is used up on every model")
+    try:
+        facts = json.loads(re.search(r"\{.*\}", text, re.S).group(0))
+    except (AttributeError, ValueError):
+        return {"verdict": "not interested", "said": "", "reason": "AI answer unreadable - please check"}
+    for k in ("machine", "refused", "q1_yes", "q1_asks_property", "q2_yes", "confused"):
+        facts[k] = facts.get(k) is True or str(facts.get(k)).lower() == "true"
+    verdict, reason = decide(facts)
+    return {**facts, "verdict": verdict, "reason": reason}
+
+
 def decide(f):
     """Your rules, applied in order -> (verdict, short reason)."""
     if f.get("machine"):
@@ -375,7 +487,14 @@ STATUS = OUT / "status.json"
 def _save(path, obj):
     tmp = Path(str(path) + ".tmp")
     tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
-    os.replace(tmp, path)
+    for attempt in range(20):  # Windows refuses while another program is reading the file - try again shortly
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.1)
+    if path != STATUS:  # a missed progress update doesn't matter; anything else does
+        os.replace(tmp, path)
 
 
 def status():
@@ -404,6 +523,11 @@ def results():
         if v.get("phone"):
             if "q1_yes" in v:  # rules may have changed since - apply today's to the stored facts
                 v["verdict"], v["reason"] = decide(v)
+            if v.get("listen") == "quick":
+                v["reason"] = f"{v.get('reason', '')} · quick check"
+            elif v.get("listen") == "text":
+                v["reason"] = (f"{v.get('reason', '')} · ipline text only (no recording)"
+                               + (" · word rules" if v.get("by_rules") else ""))
             rows.append({"call_id": k, **v})
     return sorted(rows, key=lambda r: r.get("called") or "", reverse=True)
 
@@ -413,14 +537,17 @@ def audio_file(call_id):
     return p if p.exists() else None
 
 
-def check(pages=1, start_page=1, progress=print, headless=True):
-    """Check A-grade calls page by page (already-checked calls are skipped). Returns (results, csv_path, txt_path)."""
+def check(pages=1, start_page=1, progress=print, headless=True, quick=False, text_only=False):
+    """Check A-grade calls page by page (already-checked calls are skipped). Returns (results, csv_path, txt_path).
+    quick = only the answer to "Do you want to sell or rent your property?" (about 5x faster, a few leads missed);
+    calls checked quickly are checked again in full by a later full check."""
     OUT.mkdir(parents=True, exist_ok=True)
     AUDIO.mkdir(exist_ok=True)
     cache, results = _load_cache(), []
 
     def step(**kw):
-        _save(STATUS, {"state": "running", "at": time.time(), "start": start_page, "pages": pages, **kw})
+        _save(STATUS, {"state": "running", "at": time.time(), "start": start_page, "pages": pages,
+                       "mode": "text" if text_only else "quick" if quick else "full", **kw})
 
     with Ipline(headless=headless) as ip:
         for page_no in range(start_page, start_page + pages):
@@ -434,7 +561,35 @@ def check(pages=1, start_page=1, progress=print, headless=True):
                 entry = cache.get(key) or {}
                 step(page=page_no, of_pages=n_pages, call=i, calls=len(calls), phone=c["phone"])
                 try:
-                    if entry.get("listen") != LISTEN:
+                    light = quick or text_only
+                    if light and entry.get("listen") in (LISTEN, "quick", "text"):
+                        if entry.get("listen") in ("quick", "text") and entry.get("rules") != QUICK_RULES:
+                            entry.update(quick_judge(first_answer(entry["turns"]), entry["listen"] == "text"),
+                                         rules=QUICK_RULES)
+                    elif light:  # from the question on only: one short listen (none when text only) + a tiny AI question
+                        progress(f"  {i}/{len(calls)} {c['phone']}: {'text' if text_only else 'quick'} check…")
+                        turns = ip.transcript(c)
+                        answer = first_answer(turns)
+                        if any(VOICEMAIL.search(t["text"]) for t in turns if t["who"] == "person"):
+                            facts = {"machine": True, "q1_yes": False, "q1_asks_property": False, "q2_yes": False,
+                                     "refused": False, "confused": False, "q1": "", "said": "(voicemail)"}
+                            facts["verdict"], facts["reason"] = decide(facts)
+                        else:
+                            if not text_only:
+                                hear_person(ip, answer)
+                            facts = rule_check(answer) if text_only else None  # free word rules first
+                            if facts is not None:
+                                facts["verdict"], facts["reason"] = decide(facts)
+                            else:
+                                facts = quick_judge(answer, text_only)
+                        entry = {"turns": [{k: t.get(k, "") for k in ("who", "text", "heard")} for t in turns],
+                                 "full": "", "listen": "text" if text_only else "quick", "rules": QUICK_RULES, **facts}
+                        mp3 = AUDIO / f"{key}.mp3"
+                        if not text_only and not mp3.exists():  # for listening on the dashboard (no AI needed)
+                            audio = ip.recording(c)
+                            if audio:
+                                mp3.write_bytes(audio)
+                    elif entry.get("listen") != LISTEN:
                         progress(f"  {i}/{len(calls)} {c['phone']}: listening…")
                         turns = ip.transcript(c)
                         hear_person(ip, turns)
@@ -448,7 +603,7 @@ def check(pages=1, start_page=1, progress=print, headless=True):
                         entry.update(listen=LISTEN, rules=None)
                     entry["heard"] = conversation(entry["turns"], "heard")
                     entry["ipline"] = conversation(entry["turns"], "ipline")
-                    if entry.get("rules") != RULES:
+                    if entry.get("listen") == LISTEN and entry.get("rules") != RULES:
                         entry.update(judge(entry["turns"], entry.get("full", "")), rules=RULES)
                     entry.update(phone=c["phone"], called=when, seconds=c.get("conversationtime"), page=page_no)
                     cache[key] = entry
@@ -464,7 +619,8 @@ def check(pages=1, start_page=1, progress=print, headless=True):
                                                    ("phone", "called", "seconds", "verdict", "said", "reason",
                                                     "heard", "ipline")}})
     _save(STATUS, {"state": "done", "at": time.time(), "checked": len(results),
-                   "errors": sum(r["verdict"] == "error" for r in results)})
+                   "errors": sum(r["verdict"] == "error" for r in results), "start": start_page, "pages": pages,
+                   "mode": "text" if text_only else "quick" if quick else "full"})
     stamp = datetime.now().strftime("%Y%m%d_%H%M")
     csv_path, txt_path = OUT / f"ai_call_{stamp}.csv", OUT / f"interested_{stamp}.txt"
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
@@ -482,9 +638,11 @@ if __name__ == "__main__":
     ap.add_argument("--pages", type=int, default=1)
     ap.add_argument("--start", type=int, default=1)
     ap.add_argument("--show", action="store_true", help="show the Chrome window")
+    ap.add_argument("--quick", action="store_true", help="only from 'sell or rent your property?' on")
+    ap.add_argument("--text", action="store_true", help="old calls whose recordings are gone: ipline's text only")
     a = ap.parse_args()
     try:
-        res, csv_path, txt_path = check(a.pages, a.start, headless=not a.show)
+        res, csv_path, txt_path = check(a.pages, a.start, headless=not a.show, quick=a.quick, text_only=a.text)
     except DailyLimit:
         _save(STATUS, {"state": "error", "at": time.time(),
                        "error": "Today's free AI allowance is used up. Calls checked so far are saved - press "

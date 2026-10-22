@@ -68,6 +68,8 @@ def blast_sync_loop():
         try:  # AI call: checked calls up to Supabase every minute, "Check calls" pressed online every 15 s
             importlib.reload(ai_call_remote)
             ai_call_remote.run_requests(db, start_ai_check)
+            if n % 20 == 3:  # every 5 minutes
+                ai_backlog()
             if n % 4 == 0:
                 sent = ai_call_remote.sync(db)
                 if sent:
@@ -100,17 +102,46 @@ def blast_sync_loop():
         time.sleep(15)
 
 
-def start_ai_check(start, pages):
-    """Run ai_call.py in the background (asked for on the online dashboard)."""
+def ai_backlog():
+    """A long AI call run (data/ai_call/backlog.json, e.g. the old text-only pages) that the free daily AI allowance
+    can't finish in one go: start it again once the allowance has had time to reset, until it reaches the end."""
+    import json
+    import ai_call
+    path = ai_call.OUT / "backlog.json"
+    try:
+        b = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not b.get("active"):
+        return
+    s = ai_call.status()
+    if s.get("state") == "running" and time.time() - s.get("at", 0) < 600:
+        return  # a check is running (this one or yours)
+    if s.get("state") == "done" and s.get("start") == b["start"] and s.get("pages") == b["pages"] \
+            and s.get("mode") == b.get("mode") and s.get("at", 0) > b.get("started", 0):
+        b["active"], b["finished"] = False, time.time()
+        ai_call._save(path, b)
+        log(f"ai call backlog finished: pages {b['start']}-{b['start'] + b['pages'] - 1}")
+        return
+    if s.get("state") == "error" and "allowance" in (s.get("error") or "") and time.time() - s.get("at", 0) < 3 * 3600:
+        return  # today's free AI allowance is used up - try again a few hours later
+    b["started"] = time.time()
+    ai_call._save(path, b)
+    start_ai_check(b["start"], b["pages"], text_only=b.get("mode") == "text", quick=b.get("mode") == "quick")
+
+
+def start_ai_check(start, pages, quick=False, text_only=False):
+    """Run ai_call.py in the background (asked for on the online dashboard, or the backlog)."""
     import ai_call
     ai_call.OUT.mkdir(parents=True, exist_ok=True)
     ai_call._save(ai_call.STATUS, {"state": "running", "at": time.time(), "page": start, "call": 0,
                                    "calls": "?", "of_pages": "?", "phone": "logging in…"})
     python = ROOT / ".venv" / "Scripts" / "python.exe"
-    subprocess.Popen([str(python), "-u", str(ROOT / "ai_call.py"), "--pages", str(pages), "--start", str(start)],
-                     cwd=ROOT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    subprocess.Popen([str(python), "-u", str(ROOT / "ai_call.py"), "--pages", str(pages), "--start", str(start)]
+                     + (["--quick"] if quick else []) + (["--text"] if text_only else []), cwd=ROOT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                      stdout=open(LOGS / "ai_call.log", "a", encoding="utf-8"), stderr=subprocess.STDOUT)
-    log(f"ai call check started from the online page: page {start}, {pages} page(s)")
+    log(f"ai call {'text-only ' if text_only else 'quick ' if quick else ''}check started: page {start}, "
+        f"{pages} page(s)")
 
 
 def main():

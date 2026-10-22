@@ -110,8 +110,11 @@ with st.sidebar:
         st.session_state.logged_out = True
         write_cookie("", days=0)
         st.rerun()
-    tool = st.radio("Page", ["Listings", "Condo prices", "WhatsApp", "WhatsApp blast", "Chat bot", "AI call",
-                             "Phone filter", "Price filter"], key="page")
+    pages = ["Listings", "Condo prices", "WhatsApp listing", "WhatsApp blast", "Chat bot", "AI call", "Phone filter",
+             "Price filter"]
+    if st.session_state.get("page") not in pages:  # e.g. a page that was renamed since
+        st.session_state.page = {"WhatsApp": "WhatsApp listing"}.get(st.session_state.get("page"), pages[0])
+    tool = st.radio("Page", pages, key="page")
 
 
 # ---------- phone filter ----------
@@ -351,10 +354,10 @@ def saved_listings_tab():
         rows = load_owner_listings(db)
     except Exception as e:
         st.warning(f"Couldn't load owner listings ({str(e).splitlines()[0]}). If this is the first time, run "
-                   "schema_owner_listings.sql once in the Supabase SQL Editor, then scan on the WhatsApp page.")
+                   "schema_owner_listings.sql once in the Supabase SQL Editor, then scan on the WhatsApp listing page.")
         return
     if not rows:
-        st.info("Nothing saved yet - scan some chats on the WhatsApp page (on your PC).")
+        st.info("Nothing saved yet - scan some chats on the WhatsApp listing page.")
         return
 
     f1, f2, f3 = st.columns([1, 2, 2])
@@ -619,7 +622,7 @@ def scan_chats_remote():
         st.warning(f"🖥️ Your PC was last seen {age / 60:.0f} minutes ago - scans wait until it's back on.")
     if pc.get("status") not in ("ready", "syncing"):
         st.warning("WhatsApp isn't connected on your PC - open the dashboard on the PC and link it by QR code "
-                   "(WhatsApp page) once.")
+                   "(WhatsApp listing page) once.")
         return
     me = pc.get("me") or {}
     st.success(f"Connected on your PC as **{me.get('name') or '?'}** (+{me.get('number') or '?'}) · chat list "
@@ -1076,7 +1079,7 @@ def whatsapp_blast_page():
     new, mine = st.tabs(["New blast", "My blasts"])
     with new:
         if not senders:
-            st.warning("No WhatsApp connected yet - link your number on the **WhatsApp** page on your PC first "
+            st.warning("No WhatsApp connected yet - link your number on the **WhatsApp listing** page on your PC first "
                        "(or the bot number on the **Chat bot** page), then come back.")
         else:
             new_blast_form(store, senders, default_test)
@@ -1213,7 +1216,7 @@ def new_blast_form(wa_blast, senders, default_test=""):
         st.caption(f"Each person gets **one** auto reply - the first time their message fits a rule - only for "
                    f"people from this blast, for {wa_blast.REPLY_DAYS} days, and not after you've replied to them "
                    "yourself. Messages that fit no rule are left for you. Your own test numbers (\"my numbers\" on "
-                   "the WhatsApp page) get an auto reply every time, for testing.")
+                   "the WhatsApp listing page) get an auto reply every time, for testing.")
     spec = {"message": msg}
     if msg.strip():
         sample = numbers[0] if numbers else {"name": "Ali"}
@@ -1331,8 +1334,14 @@ def ai_call_page():
         c1, c2, c3 = st.columns([1, 1, 2])
         start = c1.number_input("Start from page", 1, 999, 1, help="Page 1 = the newest calls")
         pages = c2.number_input("How many pages (30 calls each)", 1, 200, 1)
-        c3.caption(f"About {pages * 3} minutes. Calls already checked are skipped, so you can run it again any "
-                   "time to pick up new calls." + ("" if on_pc else " Your PC does the checking - keep it on."))
+        quick = c1.radio("Check", ["Full", "Quick"], horizontal=True, help=(
+            "Full: listens to the whole call twice (most accurate, ~250-300 calls a day on the free AI). "
+            "Quick: only listens to what they said from 'Do you want to sell or rent your property?' on - about "
+            "2x faster and ~500 calls a day, but misses about 1 in 4 real leads (ones only the whole recording "
+            "hears clearly). Good for the old backlog; run Full on those pages later to check them properly.")) \
+            == "Quick"
+        c3.caption(f"About {pages * (2 if quick else 4)} minutes. Calls already checked are skipped, so you can run "
+                   "it again any time to pick up new calls." + ("" if on_pc else " Your PC does the checking - keep it on."))
         if running or waiting:
             @st.fragment(run_every="5s")
             def progress_box():
@@ -1355,11 +1364,12 @@ def ai_call_page():
                                                "calls": "?", "of_pages": "?", "phone": "logging in…"})
                 flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
                 subprocess.Popen([sys.executable, "-u", str(ROOT_DIR / "ai_call.py"), "--pages", str(pages),
-                                  "--start", str(start)], cwd=ROOT_DIR, creationflags=flags,
+                                  "--start", str(start)] + (["--quick"] if quick else []), cwd=ROOT_DIR,
+                                 creationflags=flags,
                                  stdout=open(ROOT_DIR / "logs" / "ai_call.log", "a", encoding="utf-8"),
                                  stderr=subprocess.STDOUT)
             else:
-                ai_call_remote.request_check(db, start, pages)
+                ai_call_remote.request_check(db, start, pages, quick)
             st.rerun()
         if stt.get("state") == "error":
             c3.error(f"Last check stopped: {stt.get('error')}")
@@ -1546,7 +1556,7 @@ if tool == "Chat bot":
 if tool == "Condo prices":
     condo_prices_page()
     st.stop()
-if tool == "WhatsApp":
+if tool == "WhatsApp listing":
     whatsapp_page()
     st.stop()
 if tool == "Phone filter":

@@ -24,7 +24,12 @@ def _save(path, obj):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = Path(str(path) + ".tmp")
     tmp.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+    for attempt in range(20):  # Windows refuses while another program is reading the file - try again shortly
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.1)
 
 
 def status():
