@@ -111,9 +111,10 @@ def blast_sync_loop():
 
 
 def ai_backlog():
-    """A long AI call run (data/ai_call/backlog.json, e.g. the old text-only pages) that the free daily AI allowance
-    can't finish in one go: start it again once the allowance has had time to reset, until it reaches the end."""
+    """A long AI call run (data/ai_call/backlog.json, e.g. the old text-only pages): a share of it each day
+    ("daily" calls, default 200, from 1 AM) so the free AI allowance is left for everything else, until it's done."""
     import json
+    from datetime import datetime
     import ai_call
     path = ai_call.OUT / "backlog.json"
     try:
@@ -125,20 +126,22 @@ def ai_backlog():
     s = ai_call.status()
     if s.get("state") == "running" and time.time() - s.get("at", 0) < 600:
         return  # a check is running (this one or yours)
-    if s.get("state") == "done" and s.get("start") == b["start"] and s.get("pages") == b["pages"] \
-            and s.get("mode") == b.get("mode") and s.get("at", 0) > b.get("started", 0):
+    if s.get("state") == "done" and not s.get("capped") and s.get("start") == b["start"] \
+            and s.get("pages") == b["pages"] and s.get("mode") == b.get("mode") and s.get("at", 0) > b.get("started", 0):
         b["active"], b["finished"] = False, time.time()
         ai_call._save(path, b)
         log(f"ai call backlog finished: pages {b['start']}-{b['start'] + b['pages'] - 1}")
         return
-    if s.get("state") == "error" and "allowance" in (s.get("error") or "") and time.time() - s.get("at", 0) < 3 * 3600:
-        return  # today's free AI allowance is used up - try again a few hours later
-    b["started"] = time.time()
+    now = datetime.now()
+    if b.get("last_day") == now.strftime("%Y-%m-%d") or now.hour < 1:
+        return  # today's share is done (or it's not 1 AM yet)
+    b.update(started=time.time(), last_day=now.strftime("%Y-%m-%d"))
     ai_call._save(path, b)
-    start_ai_check(b["start"], b["pages"], text_only=b.get("mode") == "text", quick=b.get("mode") == "quick")
+    start_ai_check(b["start"], b["pages"], text_only=b.get("mode") == "text", quick=b.get("mode") == "quick",
+                   max_new=b.get("daily", 200), before=b.get("before"))
 
 
-def start_ai_check(start, pages, quick=False, text_only=False):
+def start_ai_check(start, pages, quick=False, text_only=False, max_new=None, before=None):
     """Run ai_call.py in the background (asked for on the online dashboard, or the backlog)."""
     import ai_call
     ai_call.OUT.mkdir(parents=True, exist_ok=True)
@@ -146,10 +149,12 @@ def start_ai_check(start, pages, quick=False, text_only=False):
                                    "calls": "?", "of_pages": "?", "phone": "logging in…"})
     python = ROOT / ".venv" / "Scripts" / "python.exe"
     subprocess.Popen([str(python), "-u", str(ROOT / "ai_call.py"), "--pages", str(pages), "--start", str(start)]
-                     + (["--quick"] if quick else []) + (["--text"] if text_only else []), cwd=ROOT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                     + (["--quick"] if quick else []) + (["--text"] if text_only else [])
+                     + (["--max-new", str(max_new)] if max_new else []) + (["--before", before] if before else []),
+                     cwd=ROOT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                      stdout=open(LOGS / "ai_call.log", "a", encoding="utf-8"), stderr=subprocess.STDOUT)
     log(f"ai call {'text-only ' if text_only else 'quick ' if quick else ''}check started: page {start}, "
-        f"{pages} page(s)")
+        f"{pages} page(s)" + (f", up to {max_new} new calls" if max_new else ""))
 
 
 def main():

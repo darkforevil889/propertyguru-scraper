@@ -387,8 +387,9 @@ def quick_judge(answer, text_only=False):
     lines = conversation(answer, "ipline") if text_only else conversation(answer)
     system = QUICK_JUDGE + (TEXT_NOTE if text_only else "")
     text = ""
-    # the text-only backlog leaves the chat bot's main model (gpt-oss-120b) alone
-    for model in ([m for m in MODELS if "120b" not in m] if text_only else MODELS):
+    # the text-only backlog uses gpt-oss-20b first: Qwen (the only free model that can see photos) and the chat
+    # bot's main model (gpt-oss-120b) are left for everything else
+    for model in (["openai/gpt-oss-20b", "qwen/qwen3.8-27b"] if text_only else MODELS):
         body = {"model": model, "temperature": 0, "max_tokens": 600, "response_format": {"type": "json_object"},
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": lines}]}
         if "gpt-oss" in model:
@@ -537,7 +538,8 @@ def audio_file(call_id):
     return p if p.exists() else None
 
 
-def check(pages=1, start_page=1, progress=print, headless=True, quick=False, text_only=False):
+def check(pages=1, start_page=1, progress=print, headless=True, quick=False, text_only=False, max_new=None,
+          before=None):
     """Check A-grade calls page by page (already-checked calls are skipped). Returns (results, csv_path, txt_path).
     quick = only the answer to "Do you want to sell or rent your property?" (about 5x faster, a few leads missed);
     calls checked quickly are checked again in full by a later full check."""
@@ -549,8 +551,11 @@ def check(pages=1, start_page=1, progress=print, headless=True, quick=False, tex
         _save(STATUS, {"state": "running", "at": time.time(), "start": start_page, "pages": pages,
                        "mode": "text" if text_only else "quick" if quick else "full", **kw})
 
+    new_count, capped = 0, False
     with Ipline(headless=headless) as ip:
         for page_no in range(start_page, start_page + pages):
+            if capped:
+                break
             calls, total, n_pages = ip.calls(page_no)
             progress(f"Page {page_no} of {n_pages} ({total:,} A-grade calls in total): {len(calls)} calls")
             if not calls:
@@ -559,6 +564,14 @@ def check(pages=1, start_page=1, progress=print, headless=True, quick=False, tex
                 key = str(c["id"])
                 when = datetime.fromtimestamp(c.get("dialtime", 0) / 1000, MYT).strftime("%Y-%m-%d %H:%M")
                 entry = cache.get(key) or {}
+                if before and c.get("dialtime", 0) / 1000 >= before:
+                    continue  # newer than the cut-off (e.g. still has its recording) - left for normal checks
+                needs_work = (entry.get("listen") not in (LISTEN, "quick", "text")) if (quick or text_only) \
+                    else entry.get("listen") != LISTEN
+                if needs_work and max_new is not None and new_count >= max_new:
+                    capped = True  # today's share is done - the rest another day
+                    break
+                new_count += needs_work
                 step(page=page_no, of_pages=n_pages, call=i, calls=len(calls), phone=c["phone"])
                 try:
                     light = quick or text_only
@@ -620,7 +633,8 @@ def check(pages=1, start_page=1, progress=print, headless=True, quick=False, tex
                                                     "heard", "ipline")}})
     _save(STATUS, {"state": "done", "at": time.time(), "checked": len(results),
                    "errors": sum(r["verdict"] == "error" for r in results), "start": start_page, "pages": pages,
-                   "mode": "text" if text_only else "quick" if quick else "full"})
+                   "mode": "text" if text_only else "quick" if quick else "full", "capped": capped,
+                   "new": new_count})
     stamp = datetime.now().strftime("%Y%m%d_%H%M")
     csv_path, txt_path = OUT / f"ai_call_{stamp}.csv", OUT / f"interested_{stamp}.txt"
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
@@ -640,9 +654,13 @@ if __name__ == "__main__":
     ap.add_argument("--show", action="store_true", help="show the Chrome window")
     ap.add_argument("--quick", action="store_true", help="only from 'sell or rent your property?' on")
     ap.add_argument("--text", action="store_true", help="old calls whose recordings are gone: ipline's text only")
+    ap.add_argument("--max-new", type=int, help="stop after checking this many calls not checked before")
+    ap.add_argument("--before", help="only calls made before this date (YYYY-MM-DD, Malaysia time)")
     a = ap.parse_args()
+    cutoff = datetime.strptime(a.before, "%Y-%m-%d").replace(tzinfo=MYT).timestamp() if a.before else None
     try:
-        res, csv_path, txt_path = check(a.pages, a.start, headless=not a.show, quick=a.quick, text_only=a.text)
+        res, csv_path, txt_path = check(a.pages, a.start, headless=not a.show, quick=a.quick, text_only=a.text,
+                                        max_new=a.max_new, before=cutoff)
     except DailyLimit:
         _save(STATUS, {"state": "error", "at": time.time(),
                        "error": "Today's free AI allowance is used up. Calls checked so far are saved - press "
