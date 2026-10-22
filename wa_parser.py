@@ -15,9 +15,19 @@ MONEY = re.compile(r"(?:\b(rm|myr)\s*)?(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+
 ROOMS = re.compile(r"\b(\d{1,2})\s*(?:\+\s*\d\s*)?(?:r|rooms?|bed(?:room)?s?|br|bilik(?!\s*air))\b", re.I)
 BATHS = re.compile(r"\b(\d{1,2})\s*(?:b|baths?|bathrooms?|bilik\s*air)\b", re.I)
 COMBO = re.compile(r"\b(\d{1,2})\s*(?:\+\s*\d\s*)?(?:r|b)\s*(\d{1,2})\s*(?:b|br|ba|bath)\b", re.I)  # 3R2B / 3+1R2B / 3B2BR
-FURNISH = [("Fully Furnished", re.compile(r"\b(fully?\s*furnish\w*|ff|full\s*furnish\w*|lengkap\s*perabot)\b", re.I)),
-           ("Partially Furnished", re.compile(r"\b(partial\w*\s*furnish\w*|partly\s*furnish\w*|semi\s*-?\s*furnish\w*|pf)\b", re.I)),
-           ("Unfurnished", re.compile(r"\b(un\s*-?furnish\w*|bare\s*unit|uf|kosong)\b", re.I))]
+# Unfurnished / partly are checked before "fully" so "not fully furnished" is not read as fully furnished.
+# Up to two words may sit between "fully" and "furnished" ("fully ID furnished", "fully reno & furnished").
+FURNISH = [("Unfurnished", re.compile(r"\b(un\s*-?furnish\w*|non\s*-?furnish\w*|not\s+furnish\w*|bare\s*unit|uf|"
+                                      r"kosong|tanpa\s*perabot|没家私|无家私)\b", re.I)),
+           ("Partially Furnished", re.compile(r"\b(not\s+full(?:y)?\s+furnish\w*|partial\w*\s+(?:\S+\s+){0,2}?furnish\w*|partly\s+(?:\S+\s+){0,2}?"
+                                              r"furnish\w*|semi\s*-?\s*furnish\w*|pf|separa\s*perabot|半家私)\b", re.I)),
+           ("Fully Furnished", re.compile(r"\b(full(y)?\s+(?:\S+\s+){0,2}?furnish\w*|ff|lengkap\s*perabot|"
+                                          r"fully\s+(?:id|i\.d\.?)(?:\s|$)|全家私|家私齐全)", re.I))]
+
+
+def furnishing_in(text):
+    """Furnishing stated in a text ("Fully ID furnished" -> Fully Furnished), or None."""
+    return next((label for label, rx in FURNISH if rx.search(text or "")), None)
 # Where a property name stops and the details begin ("The Conlay 2R2B 1,066sf ..." -> "The Conlay")
 PLACE_END = re.compile(r"(\s|^)(for\s*(rent|sale)|rent(al)?\b|sale\b|dijual|disewakan|sewa\b|jual\b|rm\b|myr\b|"
                        r"\d+(?:\.\d+)?\s*(?:\+\s*\d\s*)?(?:r\b|r\d|b\b|bed|bath|room|bilik|sf|sq|kps|k\b|mil|m\b|juta|%)|"
@@ -133,7 +143,7 @@ def parse(text):
             beds = int(m.group(1))
         if m := BATHS.search(numeric):
             baths = int(m.group(1))
-    furnishing = next((label for label, rx in FURNISH if rx.search(text)), None)
+    furnishing = furnishing_in(text)
     is_rent, is_sale = bool(RENT.search(text)), bool(SALE.search(text))
     if is_rent and is_sale and price:
         kind = "Sale" if price >= 100_000 else "Rent"
@@ -286,7 +296,7 @@ def split_pdf_properties(text):
             "unit_no": unit_no(f.get("address"), f.get("location")), "property_type": f.get("type") or None,
             "tenure": tenure.group(1).title() if tenure else None,
             "sqft": sqft, "bedrooms": None, "bathrooms": None,
-            "furnishing": None, "phones": [], "text": f"Property {key}\n{body.strip()}"})
+            "furnishing": furnishing_in(body), "phones": [], "text": f"Property {key}\n{body.strip()}"})
     return props
 
 
@@ -331,7 +341,7 @@ def split_catalogue(text):
             "address": None, "unit_no": unit_no(title, desc), "property_type": None, "tenure":
                 (re.search(r"\b(freehold|leasehold)\b", desc, re.I) or [None, None])[1],
             "sqft": int(float(size.group(1).replace(",", ""))) if size else None, "bedrooms": None,
-            "bathrooms": None, "furnishing": None, "phones": [], "text": f"{title}\n{desc}".strip()})
+            "bathrooms": None, "furnishing": furnishing_in(desc), "phones": [], "text": f"{title}\n{desc}".strip()})
     return props
 
 
@@ -431,9 +441,57 @@ def _same_property(a, b):
         return {w for w in re.findall(r"[a-z0-9]+", s.lower()) if len(w) >= 2}
     ta, tb = tokens(a), tokens(b)
     nums_a, nums_b = {w for w in ta if w.isdigit()}, {w for w in tb if w.isdigit()}
-    if nums_a and nums_b and not nums_a & nums_b:
+    # A shared 5-digit number is the postcode (a whole town shares 85000 Segamat) - it proves nothing. Other
+    # numbers (house / lot / unit, or two different postcodes) must have something in common.
+    postcode = {n for n in nums_a & nums_b if len(n) == 5}
+    house_a, house_b = nums_a - postcode, nums_b - postcode
+    if house_a and house_b and not house_a & house_b:
         return False
-    return len((ta - nums_a) & (tb - nums_b)) >= 1
+    words = (ta - nums_a - GENERIC_WORDS) & (tb - nums_b - GENERIC_WORDS)
+    return len(words) >= 1
+
+
+# Words that appear in many addresses - sharing only these doesn't make two listings the same property
+GENERIC_WORDS = {"jalan", "jln", "taman", "tmn", "lorong", "persiaran", "lebuh", "lebuhraya", "kampung", "kg", "bandar",
+                 "lot", "no", "unit", "the", "of", "and", "for", "at", "sale", "rent", "land", "acre", "acres", "gross",
+                 "nett", "net", "kuala", "lumpur", "kl", "selangor", "johor", "darul", "ehsan", "takzim", "wilayah",
+                 "persekutuan", "malaysia", "mukim", "daerah", "sungai", "segamat", "petaling", "subang", "jaya", "shah",
+                 "alam", "seksyen", "section", "utama", "baru", "indah", "jaya", "city", "tower", "block", "blok",
+                 "level", "floor", "ground"}
+
+
+# ---------- simple property type for the dashboard (Condo, Shop, Land, ...) ----------
+PROPERTY_TYPES = [  # first match wins - order matters ("Bungalow Land" is land, "ShopOffice" is a shop)
+    ("Factory / Warehouse", r"factor(y|ies)|warehouse|industrial|kilang|gudang|工厂|厂房|仓库"),
+    ("Land", r"\bland\b|\bacres?\b|\btanah\b|vacant lot|agricultur|土地|地皮"),
+    ("Shop / Shop office", r"shop ?office|shop ?lot|shop ?house|storey shop|retail|\bshops?\b|kedai|店屋|店铺|"
+                           r"\b\d(\.5)? ?(shc?|sso|ssh)\b"),  # agents' shorthand: 2Shc = 2-storey shop (corner)
+    ("Office / Commercial", r"office|commercial|\bsofo\b|\bsoho\b|\bsovo\b|pejabat|办公"),
+    ("Bungalow", r"bungalow|banglo|独立式"),
+    ("Semi-D", r"semi[- ]?d\b|semi[- ]?detached|半独立"),
+    ("Townhouse", r"town ?house"),
+    ("Terrace", r"terrace|link ?house|\bteres\b|排屋"),
+    ("Condo / Apartment", r"condo|condominium|apartment|serviced? (residence|apartment|suite)|residen|\bsuites?\b|"
+                          r"penthouse|duplex|\bflat\b|pangsapuri|公寓"),
+]
+
+
+def property_category(stated_type, place, message="", condo_names=()):
+    """'Condo / Apartment', 'Shop / Shop office', 'Land', ... or 'Unknown'. Looks at the stated type, then the
+    place, then known condo names (e.g. from Condo prices), then the message text."""
+    def by_words(text):
+        t = (text or "").lower()
+        return next((label for label, pattern in PROPERTY_TYPES if t and re.search(pattern, t)), None)
+
+    found = by_words(stated_type) or by_words(place)
+    if found:
+        return found
+    p = re.sub(r"\W+", " ", (place or "").lower()).strip()
+    for name in condo_names:
+        n = re.sub(r"\W+", " ", (name or "").lower()).strip()
+        if len(n) >= 4 and len(p) >= 4 and (n in p or p in n):
+            return "Condo / Apartment"
+    return by_words(message) or "Unknown"
 
 
 # ---------- chats where you separate owners with a "." message ----------
@@ -571,7 +629,7 @@ def _owner_part(part, n, mine):
             return []
         first = next((m for m, _ in texts), part[0])
         fields = parse(everything) or {"type": None, "price_rm": price, "sqft": None, "bedrooms": None,
-                                       "bathrooms": None, "furnishing": None, "place": _place(everything),
+                                       "bathrooms": None, "furnishing": furnishing_in(everything), "place": _place(everything),
                                        "phones": owner_phones}
         props.append(_listing(fields, first, everything, []))
     sources = {p["posted_at"] for p in props}

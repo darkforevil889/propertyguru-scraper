@@ -16,6 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent.resolve()
 STATUS = ROOT / "data" / "wa_scan_status.json"
+SAVED_IDS = ROOT / "wa_data" / "saved_listing_ids.json"  # every listing a scan saved - to tell what you deleted
 BUCKET = "owner-photos"
 NEW_COLS = ("owner_name", "unit_no", "address", "rental_rm", "tenure", "property_type", "price_psf", "owner_no")
 
@@ -32,6 +33,17 @@ def _save(path, obj):
             time.sleep(0.1)
 
 
+def _load(path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
+def _store(path, obj):
+    _save(path, obj)
+
+
 def status():
     try:
         return json.loads(STATUS.read_text(encoding="utf-8"))
@@ -44,18 +56,85 @@ ZIP_KINDS = {".jpg": "photo", ".jpeg": "photo", ".png": "photo", ".webp": "photo
 ZIP_MAX_FILES, ZIP_MAX_BYTES = 300, 300 * 1024 * 1024
 
 
+import re  # noqa: E402
+
+# WhatsApp "Export chat" line: Android "19/10/2026, 6:01 pm - Name: text", iPhone "[19/10/2026, 18:01:05] Name: text"
+CHAT_LINE = re.compile(r"^‎?\[?(\d{1,2}/\d{1,2}/\d{2,4}),? (\d{1,2}[:.]\d{2}(?:[:.]\d{2})?\s*(?:[ap]\.?\s?m\.?)?)"
+                       r"\]?\s*(?:[-–]\s*)?([^:]{1,60}?): (.*)$", re.I)
+ATTACHED = re.compile(r"^‎?(?:(.+?\.\w{2,4}) \(file attached\)|<attached: (.+?)>)", re.I)
+EXPORT_NAME = re.compile(r"WhatsApp Chat (?:with|-) (.+?)(?:\.txt|\.zip)?$", re.I)
+
+
+def _digits(s):
+    return re.sub(r"\D", "", s or "")
+
+
+def _chat_export(z, infos, media, prefix):
+    """A WhatsApp 'Export chat' ZIP (one conversation with an owner) -> (party, items): party = {'name', 'phone'} of
+    the person the chat is with; items = their messages and the files THEY sent, in chat order. Your own messages
+    (questions, name card) are left out - they say nothing about the owner's property."""
+    txt = next(i for i in infos if i.filename.lower().endswith(".txt"))
+    who = EXPORT_NAME.search(Path(txt.filename).name) or EXPORT_NAME.search(Path(z.filename or "").name)
+    party_label = (who.group(1).strip() if who else "")
+    party = {"phone": _digits(party_label) if len(_digits(party_label)) >= 9 else None,
+             "name": None if len(_digits(party_label)) >= 9 else (party_label or None)}
+    files = {Path(i.filename).name: i for i in infos}
+    lines, cur = [], None
+    for raw in z.read(txt).decode("utf-8", "replace").splitlines():
+        m = CHAT_LINE.match(raw)
+        if m:
+            cur = {"author": m.group(3).strip(), "text": m.group(4)}
+            lines.append(cur)
+        elif cur is not None:  # a message over several lines
+            cur["text"] += "\n" + raw
+    authors = {l["author"] for l in lines}
+    if not party_label and len(authors) == 2:  # file renamed - the other person is the one who isn't you
+        party_label = sorted(authors, key=lambda a: -sum(1 for l in lines if l["author"] == a))[0]
+
+    def is_party(a):
+        return (party["phone"] and _digits(a).endswith(party["phone"][-9:])) or a.strip() == party_label
+
+    items, total = [], 0
+    for l in lines:
+        if not is_party(l["author"]):
+            continue
+        att = ATTACHED.match(l["text"].strip())
+        if att:
+            fname = (att.group(1) or att.group(2)).strip()
+            info = files.get(fname)
+            kind = ZIP_KINDS.get(Path(fname).suffix.lower()) if info else None
+            if kind and kind != "text":
+                total += info.file_size
+                if total > ZIP_MAX_BYTES or len(items) >= ZIP_MAX_FILES:
+                    break
+                clean = re.sub(r"[^\w.-]", "_", fname)[-60:]
+                out_name = f"{prefix}_{len(items)}_{clean}"
+                (media / out_name).write_bytes(z.read(info))
+                items.append((kind, out_name, ""))
+            continue
+        if "end-to-end encrypted" not in l["text"] and l["text"].strip() not in ("<Media omitted>", "null"):
+            items.append(("text", None, l["text"]))
+    return party, items
+
+
 def _unzip(path, media, mid):
-    """A ZIP from a chat -> [(kind, file name in media/ or None, text)] for its photos / PDFs / videos / .txt.
-    Files are written flat into media/ under new names (never outside it); other file types are skipped."""
-    import re
+    """A ZIP from a chat -> (party, [(kind, file name in media/ or None, text)]) for its photos / PDFs / videos /
+    .txt. party is set when it's a WhatsApp chat export (see _chat_export). Files are written flat into media/
+    under new names (never outside it); other file types are skipped."""
     import zipfile
     prefix, out, total = re.sub(r"\W", "", mid)[:30], [], 0
     try:
         with zipfile.ZipFile(path) as z:
-            for info in sorted(z.infolist(), key=lambda i: i.filename):
+            infos = [i for i in z.infolist() if not i.is_dir() and "__MACOSX" not in i.filename]
+            txts = [i for i in infos if i.filename.lower().endswith(".txt")]
+            if len(txts) == 1:
+                head = z.read(txts[0])[:3000].decode("utf-8", "replace")
+                if sum(1 for line in head.splitlines() if CHAT_LINE.match(line)) >= 2:
+                    return _chat_export(z, infos, media, prefix)
+            for info in sorted(infos, key=lambda i: i.filename):
                 name = Path(info.filename).name
                 kind = ZIP_KINDS.get(Path(name).suffix.lower())
-                if info.is_dir() or not kind or "__MACOSX" in info.filename or name.startswith("."):
+                if not kind or name.startswith("."):
                     continue
                 total += info.file_size
                 if total > ZIP_MAX_BYTES or len(out) >= ZIP_MAX_FILES:
@@ -68,25 +147,38 @@ def _unzip(path, media, mid):
                 (media / fname).write_bytes(z.read(info))
                 out.append((kind, fname, ""))
     except (zipfile.BadZipFile, OSError):
-        return []
-    return out
+        return None, []
+    return None, out
 
 
 def expand_zips(msgs, got, media):
     """Replace each ZIP message by one message per file inside it (same sender and time, so a ZIP posted
-    between two '.' separators belongs to that owner). A ZIP that can't be opened stays as its caption."""
+    between two '.' separators belongs to that owner). A WhatsApp chat export is one owner of its own: it is
+    wrapped in '.' separators and starts with the owner's number / name from the file name.
+    A ZIP that can't be opened stays as its caption."""
     out = []
     for m in msgs:
         if not m.get("is_zip"):
             out.append(m)
             continue
-        inner = _unzip(media / got[m["id"]], media, m["id"]) if m["id"] in got else []
+        party, inner = _unzip(media / got[m["id"]], media, m["id"]) if m["id"] in got else (None, [])
         caption = (m.get("body") or "").strip()
-        if caption and not caption.lower().endswith(".zip") or not inner:
+        if (caption and not caption.lower().endswith(".zip") and not party) or not inner:
             out.append({**m, "is_zip": False})  # its caption (or just the file name if it couldn't be opened)
+            if not inner:
+                continue
+        plain = {**m, "is_zip": False, "has_image": False, "is_pdf": False, "is_video": False, "photo": None}
+        if party:
+            out.append({**plain, "id": f"{m['id']}-s0", "body": "."})
+            intro = " ".join(x for x in (f"This is {party['name']}" if party["name"] else "",
+                                         f"+{party['phone']}" if party["phone"] else "") if x)
+            if intro:
+                out.append({**plain, "id": f"{m['id']}-who", "body": intro})
         for i, (kind, fname, text) in enumerate(inner):
-            out.append({**m, "id": f"{m['id']}-z{i}", "is_zip": False, "body": text or "", "photo": fname,
+            out.append({**plain, "id": f"{m['id']}-z{i}", "body": text or "", "photo": fname,
                         "has_image": kind == "photo", "is_pdf": kind == "pdf", "is_video": kind == "video"})
+        if party:
+            out.append({**plain, "id": f"{m['id']}-s1", "body": "."})
     return out
 
 
@@ -189,6 +281,18 @@ def scan(db, picked, days, read_pictures, scanned_by, progress=None):
              "rental_rm": l.get("rental_rm"), "tenure": l.get("tenure"), "property_type": l.get("property_type"),
              "price_psf": l.get("price_psf"), "owner_no": l.get("owner_no")} for l in listings]
     notes = [f"{too_big} video(s) over 50 MB kept in the ZIP only"] if too_big else []
+    chats_scanned = list({l["chat"] for l in listings})
+    # Listings you deleted in Saved listings stay deleted: anything a scan saved before that is gone now was
+    # deleted by you, so it is not saved again
+    known = set(_load(SAVED_IDS, []))
+    existing = set()
+    for i in range(0, len(chats_scanned), 50):
+        existing |= {r["message_id"] for r in db.table("owner_listings").select("message_id")
+                     .in_("chat", chats_scanned[i:i + 50]).execute().data}
+    you_deleted = known - existing
+    skipped = [r for r in rows if r["message_id"] in you_deleted]
+    rows = [r for r in rows if r["message_id"] not in you_deleted]
+    result["listings"] = [l for l in listings if l["id"] not in you_deleted]
     try:
         try:
             for i in range(0, len(rows), 500):
@@ -201,14 +305,30 @@ def scan(db, picked, days, read_pictures, scanned_by, progress=None):
                 db.table("owner_listings").upsert([{k: v for k, v in r.items() if k not in NEW_COLS}
                                                    for r in rows[i:i + 500]], on_conflict="message_id").execute()
             notes.append("owner name / unit / rental not saved online yet - run schema_owner_listings_v2.sql")
-        # This scan replaces what earlier scans saved for the same chats (old, less accurate results)
+        # This scan replaces what earlier scans saved for the same chats and the same days (old, less accurate
+        # results) - listings from before the scanned days are left alone
+        new_ids = [r["message_id"] for r in rows]
+        replaced = set()
         try:
-            chats_scanned = list({l["chat"] for l in listings})
             if chats_scanned:
-                db.table("owner_listings").delete().in_("chat", chats_scanned) \
-                    .not_.in_("message_id", [r["message_id"] for r in rows]).execute()
+                since = datetime.fromtimestamp(time.time() - days * 86400, timezone.utc).isoformat()
+                old = db.table("owner_listings").select("message_id").in_("chat", chats_scanned) \
+                    .gte("posted_at", since).not_.in_("message_id", new_ids).execute().data
+                replaced = {r["message_id"] for r in old}
+                for i in range(0, len(old), 200):
+                    db.table("owner_listings").delete().in_("message_id", [r["message_id"] for r in old[i:i + 200]]) \
+                        .execute()
         except Exception:
             pass  # needs the delete permission from schema_owner_listings_v2.sql
+        _store(SAVED_IDS, sorted((known - replaced) | set(new_ids)))
+        if skipped:
+            notes.append(f"{len(skipped)} listing(s) you deleted before were left out")
+        try:  # furnishing from the text, else from photos (free AI) - keeper.py catches up on any left over
+            import furnish_check
+            progress("Checking furnishing…", 0.99)
+            furnish_check.run(db, only_ids=new_ids, log=lambda m: None)
+        except Exception:
+            pass
         if upload_error:
             notes.append(f"some files not uploaded ({upload_error})")
         result["saved"] = True if not notes else "; ".join(notes)

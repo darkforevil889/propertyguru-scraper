@@ -360,14 +360,28 @@ def saved_listings_tab():
         st.info("Nothing saved yet - scan some chats on the WhatsApp listing page.")
         return
 
-    f1, f2, f3 = st.columns([1, 2, 2])
-    kind = f1.radio("Type", ["All", "Rent", "Sale"], horizontal=True)
-    text = f2.text_input("Search location / phone / message")
+    # Simple property type (Condo, Shop, Land, ...) from the stated type / place / message + your Condo prices list
+    from wa_parser import property_category
+    try:
+        condos = [c.get("condo") for c in load_condo_summary(db).get("rows") or []]
+    except Exception:
+        condos = []
+    for r in rows:
+        r["_category"] = property_category(r.get("property_type"), r.get("place"), r.get("message_text"), condos)
+
+    f1, f2, f3, f4 = st.columns([1, 1.5, 2, 2])
+    kind = f1.radio("Rent / Sale", ["All", "Rent", "Sale"], horizontal=True)
+    cats = sorted({r["_category"] for r in rows}, key=lambda c: (c == "Unknown", c))
+    pick_cats = f2.multiselect("Property type", cats, placeholder="All types",
+                               help="Condo, shop, office, factory, land… worked out from the listing's own type, its "
+                                    "name and message, and the condo names in Condo prices.")
+    text = f3.text_input("Search location / phone / message")
     prices = [r["price_rm"] for r in rows if r.get("price_rm")]
     lo, hi = (min(prices), max(prices)) if prices else (0, 1)
-    pr = f3.slider("Price (RM)", lo, max(hi, lo + 1), (lo, max(hi, lo + 1)))
+    pr = f4.slider("Price (RM)", lo, max(hi, lo + 1), (lo, max(hi, lo + 1)))
     shown = [r for r in rows
              if (kind == "All" or r.get("listing_type") == kind)
+             and (not pick_cats or r["_category"] in pick_cats)
              and (not r.get("price_rm") or pr[0] <= r["price_rm"] <= pr[1])
              and (not text or text.lower() in " ".join(str(r.get(k) or "") for k in
                                                        ("place", "phones", "sender_phone", "message_text")).lower())]
@@ -384,6 +398,7 @@ def saved_listings_tab():
         "Number": (r.get("phones") or "").replace("; ", ", ") or r.get("sender_phone"),
         "Price (RM)": r.get("price_rm"),
         "Rent / Sale": r.get("listing_type"),
+        "Property type": r["_category"],
         "Location": r.get("place"),
         "Unit": r.get("unit_no"),
         "Rental (RM/mo)": r.get("rental_rm"),
@@ -403,8 +418,10 @@ def saved_listings_tab():
 
     r = shown[sel[0]]
     listing = from_row(r)
-    st.subheader(f"{r.get('listing_type') or ''} · {r.get('place') or 'Listing'} · "
+    st.subheader(f"{r.get('listing_type') or ''} · {r['_category']} · {r.get('place') or 'Listing'} · "
                  f"{'RM ' + format(r['price_rm'], ',') if r.get('price_rm') else ''}")
+    if r.get("property_type"):
+        st.caption(f"Type as written: {r['property_type'][:200]}")
     name = re.sub(r"[^A-Za-z0-9 ]+", "", r.get("place") or "listing").strip() or "listing"
     paths = r.get("photo_paths") or []
     b1, b2 = st.columns(2)

@@ -89,6 +89,14 @@ def blast_sync_loop():
             if str(e) != last_wa_error:
                 log(f"whatsapp page sync problem: {str(e)[:300]}")
                 last_wa_error = str(e)
+        if n % 240 == 7:  # hourly: furnishing for saved listings that still don't have it (see furnish_check.py)
+            try:
+                import furnish_check
+                importlib.reload(furnish_check)
+                furnish_check.run(db, log=log)
+            except Exception as e:
+                if "allowance" not in str(e):
+                    log(f"furnishing check problem: {str(e)[:200]}")
         try:  # Chat bot page: changes / test questions from online every 15 s, status + conversations every 30 s
             importlib.reload(bot_remote)
             if not bot_remote.run_requests(db, log) and n % 2 == 0:
