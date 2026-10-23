@@ -401,6 +401,11 @@ def scan(db, picked, days, read_pictures, scanned_by, progress=None):
              "owner_name": l.get("owner_name"), "unit_no": l.get("unit_no"), "address": l.get("address"),
              "rental_rm": l.get("rental_rm"), "tenure": l.get("tenure"), "property_type": l.get("property_type"),
              "price_psf": l.get("price_psf"), "owner_no": l.get("owner_no")} for l in listings]
+    try:  # your own corrections (Saved listings -> Edit) win over what the scan read
+        import listing_edits
+        rows = listing_edits.apply(db, rows)
+    except Exception:
+        pass
     notes = [f"{too_big} video(s) over 50 MB kept in the ZIP only"] if too_big else []
     chats_scanned = list({l["chat"] for l in listings})
     # Listings you deleted in Saved listings stay deleted: anything a scan saved before that is gone now was
@@ -532,7 +537,7 @@ if __name__ == "__main__":  # started by keeper.py for a scan asked for on the o
         _save(STATUS, {"state": "running", "at": time.time(), "text": text, "frac": frac or 0})
 
     try:
-        res = scan(db, p.get("chats") or [], int(p.get("days") or 60), bool(p.get("read_pictures", True)),
+        res = scan(db, p.get("chats") or [], float(p.get("days") or 60), bool(p.get("read_pictures", True)),
                    p.get("by") or "online dashboard", report)
         _save(STATUS, {"state": "done", "at": time.time(), "messages": res["messages"],
                        "listings": len(res["listings"]),

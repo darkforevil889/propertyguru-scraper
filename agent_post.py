@@ -58,6 +58,27 @@ def say(text, **extra):
     _save(STATUS, {"state": "running", "at": time.time(), "text": text, **_batch, **extra})
 
 
+PREFS = "data/agent_post_prefs.json"  # message id -> {"skip_photos": [...], "headline", "description"}
+
+
+def load_prefs(db):
+    try:
+        return json.loads(db.storage.from_(BUCKET).download(PREFS))
+    except Exception:
+        return {}
+
+
+def save_prefs(db, message_id, **changes):
+    """Your choices for a listing's ad (dashboard): photos left out, your own headline / description ("" = back to
+    the usual one)."""
+    prefs = load_prefs(db)
+    mine = {**prefs.get(message_id, {}), **changes}
+    prefs[message_id] = {k: v for k, v in mine.items() if v not in (None, "", [])}
+    db.storage.from_(BUCKET).upload(PREFS, json.dumps(prefs, ensure_ascii=False).encode(),
+                                    {"content-type": "application/json", "upsert": "true"})
+    return prefs[message_id]
+
+
 def load_results(db):
     try:
         return json.loads(db.storage.from_(BUCKET).download(RESULTS))
@@ -89,17 +110,24 @@ def plan(r, mk=None):
         sub = "Apartment"
     else:
         sub = "Condominium"  # condos far more often than apartments
+    # whole words only, and not something the unit looks at: "Facing Dua penthouses" is a view, not a penthouse
+    seen = re.sub(r"\b(facing|view of|views? to|overlooking|next to|near|beside|opposite)\b[^.\n]{0,40}", " ", low)
     unit_type = next((name for word, name in (
-        (r"\bstudio\b", "Studio"), (r"penthouse", "Penthouse"), (r"duplex", "Duplex"), (r"triplex", "Triplex"),
-        (r"dual\s*key", "Dual Key"), (r"\bsoho\b", "Soho"), (r"\bloft\b", "Loft"), (r"corner", "Corner Lot"),
-        (r"end\s*lot", "End Lot"), (r"ground\s*floor", "Ground Floor Unit")) if re.search(word, low)), "Intermediate")
+        (r"\bstudio\b", "Studio"), (r"\bpenthouse\b", "Penthouse"), (r"\bduplex\b", "Duplex"),
+        (r"\btriplex\b", "Triplex"), (r"\bdual\s*key\b", "Dual Key"), (r"\bsoho\b", "Soho"), (r"\bloft\b", "Loft"),
+        (r"\bcorner\s*(lot|unit)\b", "Corner Lot"), (r"\bend\s*lot\b", "End Lot"),
+        (r"\bground\s*floor\s*unit\b", "Ground Floor Unit")) if re.search(word, seen)), "Intermediate")
     beds = r.get("bedrooms") or (1 if studio else None) or mk.get("est_beds")
     beds = 1 if beds is not None and beds <= 0 else beds  # a studio counts as 1 bed 1 bath
     baths = r.get("bathrooms") or (1 if studio else beds)
     sqft = r.get("sqft") or mk.get("est_sqft")
     furn = r.get("furnishing") or ""
-    furnishing = ("UNFUR" if re.search(r"unfurnish|bare", furn, re.I) or category == "Factory / Warehouse" else
-                  "PART" if re.search(r"partial", furn, re.I) else "FULL")
+    # Homes: fully furnished unless the owner says otherwise. Shops / offices / factories / land: bare unless the
+    # owner says it's furnished (a guess from photos doesn't count for them)
+    stated = furn if "(from photos)" not in furn else ""
+    furnishing = ("UNFUR" if re.search(r"unfurnish|bare", furn, re.I) else
+                  "PART" if re.search(r"partial", furn, re.I) and (residential or stated) else
+                  "FULL" if residential or re.search(r"furnish", stated, re.I) else "UNFUR")
     words = {"FULL": "Fully Furnished", "PART": "Partially Furnished", "UNFUR": "Unfurnished"}[furnishing]
     rent = r.get("listing_type") == "Rent"
     return {
@@ -110,7 +138,8 @@ def plan(r, mk=None):
         "sqft": sqft, "sqft_estimated": not r.get("sqft") and bool(sqft),
         "furnishing": furnishing, "furnishing_words": words,
         "furnishing_items": {"FULL": ["AIRCO", "BED", "FRI", "HEATE"], "PART": ["AIRCO", "HEATE"]}.get(furnishing, []),
-        "price": r.get("price_rm"), "photos": [p for p in r.get("photo_paths") or [] if p.lower().endswith(".jpg")],
+        "price": r.get("price_rm"), "rental": r.get("rental_rm") if r.get("listing_type") != "Rent" else None,
+        "photos": [p for p in r.get("photo_paths") or [] if p.lower().endswith(".jpg")],
     }
 
 
@@ -131,7 +160,7 @@ def description(p, name, area, city):
     rooms = (f"{p['beds']} Bedroom{'s' * (p['beds'] > 1)} {p['baths']} Bathroom{'s' * ((p['baths'] or 0) > 1)}"
              if p.get("beds") else "")
     lines = [name, ", ".join(x for x in (area, city) if x), p["furnishing_words"], rooms,
-             f"{p['sqft']:,} sqft" if p.get("sqft") else "", "Looks New", FILLER]
+             f"{p['sqft']:,} sqft" if p.get("sqft") else "", "Looks New", FILLER]  # no tenant: some buyers mind
     return "\n".join(x for x in lines if x)
 
 
@@ -180,8 +209,55 @@ def _chip(page, text):
 
 
 def _next(page):
+    """Next - and make sure AgentNet moved on; if it stayed, say why (its own red messages)."""
+    before = page.url
     page.click("[da-id=footer-next-button]")
     page.wait_for_timeout(4000)
+    if page.url == before:
+        msgs = page.eval_on_selector_all(
+            "[class*=error], [class*=invalid], [class*=helper], [class*=hint], [class*=feedback]",
+            "els => [...new Set(els.filter(e => e.offsetParent).map(e => e.innerText.trim()).filter(Boolean))]")
+        # AgentNet's real complaints ("Description must be at least 20 words.") - not its hints ("A minimum of 10
+        # characters 43 / 70") that sit next to every box
+        real = [m.splitlines()[0] for m in msgs if re.search(r"must|required|cannot|can't|invalid|please (select|"
+                                                             r"enter|add|choose)|at least", m, re.I)]
+        raise RuntimeError("AgentNet didn't go on to the next step" + (f": {'; '.join(dict.fromkeys(real))[:200]}"
+                                                                      if real else " (no message shown)"))
+
+
+# ---------- step by step: each listing's steps, shown on the dashboard (✅ done / ❌ where it stopped and why) ----------
+_steps = []
+
+
+class _Step:
+    def __init__(self, name):
+        self.name = name
+
+    def __enter__(self):
+        _steps.append({"step": self.name, "state": "doing"})
+        say(f"{self.name}…", steps=list(_steps))
+        return self
+
+    def detail(self, text):
+        _steps[-1]["detail"] = text
+
+    def __exit__(self, kind, exc, tb):
+        _steps[-1]["state"] = "failed" if exc else "done"
+        if exc:
+            _steps[-1]["error"] = explain(exc)
+        say(f"{self.name} {'✗' if exc else '✓'}", steps=list(_steps))
+        return False  # the error carries on up: this listing stops, the next one starts
+
+
+def explain(e):
+    """An error -> plain words."""
+    text = str(e).splitlines()[0] if str(e) else e.__class__.__name__
+    if "Timeout" in text or "timeout" in text:
+        return ("AgentNet didn't react in time - a button or box the robot waits for didn't appear (AgentNet slow, "
+                "or its page changed)")
+    if "Target page, context or browser has been closed" in text:
+        return "The Chrome window was closed while it was working"
+    return text[:220]
 
 
 def _dropdown(page, index, option):
@@ -232,84 +308,121 @@ def pick_property(page, name):
                 addr = [x.strip() for x in text.splitlines()[-1].split(",")]
                 area = addr[1] if len(addr) >= 3 else (addr[0] if addr else "")
                 city = addr[-1] if len(addr) >= 2 else ""
+                street = re.sub(r"\s*\b\d{5}\b\s*", " ", addr[0]).strip() if len(addr) >= 3 else ""
+                if re.match(r"(kampung|kg\.?)\s", area, re.I) and street:
+                    area = street  # "Kampung Berembang" looks cheap in an ad - the street ("Jalan Nipah") instead
                 return text.splitlines()[0].strip(), area, city, text.replace("\n", " ")
     raise RuntimeError(f"\"{name}\" isn't in AgentNet's property search - pick it by hand")
 
 
 def fill(page, p, photos):
-    """Fill every step of Create Listing up to Preview. -> what was filled in (for the review)."""
+    """Fill every step of Create Listing up to Preview, step by step (see _Step). -> what was filled in."""
     done = {}
-    new_listing(page)
-    say("Listing type…")
-    _chip(page, "Residential" if p["residential"] else "Commercial")
-    _chip(page, "Rent" if p["rent"] else "Sale")
-    if p["rent"]:
-        _chip(page, "Entire Unit")
-    if page.get_by_text("Immediately", exact=True).count():
-        _chip(page, "Immediately")
-    _next(page)
+    with _Step("Listing type") as s:
+        new_listing(page)
+        chips = ["Residential" if p["residential"] else "Commercial", "Rent" if p["rent"] else "Sale"]
+        chips += ["Entire Unit"] if p["rent"] else []
+        for c in chips:
+            _chip(page, c)
+        if page.get_by_text("Immediately", exact=True).count():
+            _chip(page, "Immediately")
+            chips.append("Immediately")
+        s.detail(" · ".join(chips))
+        _next(page)
 
-    say("Location…")
-    official, area, city, picked = pick_property(page, p["name"])
-    done["property"] = picked
-    p = {**p, "name": official or p["name"]}  # PropertyGuru's own name in the headline / description
-    if p["sub_type"]:
-        _dropdown(page, 1, p["sub_type"])
-    if p["unit_type"]:
-        _dropdown(page, 2, p["unit_type"])
-    if page.locator(f"text={p['title']}").count():
-        page.get_by_text(p["title"], exact=True).first.click()
-        page.wait_for_timeout(500)
-    done["types"] = " / ".join(page.locator("input[name=select-input]").nth(i).input_value() for i in range(3))
-    _next(page)
+    with _Step("Location") as s:
+        official, area, city, picked = pick_property(page, p["name"])
+        done["property"] = picked
+        p = {**p, "name": official or p["name"]}  # PropertyGuru's own name in the headline / description
+        if p["sub_type"]:
+            _dropdown(page, 1, p["sub_type"])
+        if p["unit_type"]:
+            _dropdown(page, 2, p["unit_type"])
+        if page.locator(f"text={p['title']}").count():
+            page.get_by_text(p["title"], exact=True).first.click()
+            page.wait_for_timeout(500)
+        done["types"] = " / ".join(page.locator("input[name=select-input]").nth(i).input_value() for i in range(3))
+        s.detail(f"{official} ({', '.join(x for x in (area, city) if x)}) · {done['types']} · {p['title']}")
+        _next(page)
 
-    say("Unit details…")
-    if p["beds"]:
-        _step(page, "bedrooms", p["beds"])
-        _step(page, "bathrooms", p["baths"] or 1)
-    if p["sqft"]:
-        page.locator("[da-id=built-up-input] input").first.fill(str(p["sqft"]))
-    page.click(f"[da-id=furnishing-{p['furnishing']}]")
-    page.wait_for_timeout(1500)
-    for k in p["furnishing_items"]:
-        if page.locator(f"[da-id=furnishingDetails-{k}]").count():
-            page.click(f"[da-id=furnishingDetails-{k}]")
-            page.wait_for_timeout(300)
-    _next(page)
+    with _Step("Unit details") as s:
+        if p["beds"]:
+            _step(page, "bedrooms", p["beds"])
+            _step(page, "bathrooms", p["baths"] or 1)
+        if p["sqft"]:
+            page.locator("[da-id=built-up-input] input").first.fill(str(p["sqft"]))
+        page.click(f"[da-id=furnishing-{p['furnishing']}]")
+        page.wait_for_timeout(1500)
+        items = []
+        for k in p["furnishing_items"]:
+            if page.locator(f"[da-id=furnishingDetails-{k}]").count():
+                page.click(f"[da-id=furnishingDetails-{k}]")
+                page.wait_for_timeout(300)
+                items.append({"AIRCO": "air-con", "BED": "bed", "FRI": "fridge", "HEATE": "water heater"}.get(k, k))
+        s.detail(" · ".join(x for x in (
+            f"{p['beds']} bed {p['baths'] or 1} bath" if p["beds"] else "",
+            f"{p['sqft']:,} sf{' (estimated)' if p.get('sqft_estimated') else ''}" if p["sqft"] else "no size",
+            p["furnishing_words"] + (f" ({', '.join(items)})" if items else "")) if x))
+        _next(page)
 
-    say("Price…")
-    page.locator("[da-id=selling-price-input] input").first.fill(str(p["price"]))
-    _next(page)
+    with _Step("Price") as s:
+        page.locator("[da-id=selling-price-input] input").first.fill(str(p["price"]))
+        s.detail(f"RM {p['price']:,}" + ("/month" if p["rent"] else ""))
+        _next(page)
 
-    say("Description…")
-    done["headline"] = headline(p, area)
-    done["description"] = description(p, p["name"], area, city)
-    page.locator('textarea[placeholder^="A short sentence"]').first.fill(done["headline"])
-    page.locator('textarea[placeholder^="Describe the property"]').first.fill(done["description"])
-    page.wait_for_timeout(1000)
-    _next(page)  # AgentNet saves a draft from here on
-    m = re.search(r"create-listing/(\d+)", page.url)
-    done["draft_id"] = m.group(1) if m else None
+    with _Step("Description") as s:
+        # your own wording (typed on the draft card) over the usual one
+        done["headline"] = (p.get("my_headline") or headline(p, area))[:70]
+        done["description"] = p.get("my_description") or description(p, p["name"], area, city)
+        page.locator('textarea[placeholder^="A short sentence"]').first.fill(done["headline"])
+        page.locator('textarea[placeholder^="Describe the property"]').first.fill(done["description"])
+        page.wait_for_timeout(1000)
+        s.detail(done["headline"])
+        _next(page)  # AgentNet saves a draft from here on
+        m = re.search(r"create-listing/(\d+)", page.url)
+        done["draft_id"] = m.group(1) if m else None
+        _batch["draft_id"] = done["draft_id"]
 
-    say("Uploading photos…", draft_id=done["draft_id"])
-    row = page.locator("[da-id=listing-images-section-header]")
-    with page.expect_file_chooser() as fc:
-        row.locator("button").last.click()
-    fc.value.set_files([str(f) for f in photos])
-    for _ in range(60):  # wait for the uploads
-        page.wait_for_timeout(2000)
-        if f"Photos ({len(photos)})" in row.inner_text():
-            break
-    done["photos"] = len(photos)
-    _next(page)  # platform posting
-    credits = re.search(r"(\d+)\s+Universal Credits", page.inner_text("body"))
-    done["credits"] = int(credits.group(1)) if credits else None
-    _next(page)  # preview
+    with _Step("Photos") as s:
+        row = page.locator("[da-id=listing-images-section-header]")
+        with page.expect_file_chooser() as fc:
+            row.locator("button").last.click()
+        fc.value.set_files([str(f) for f in photos])
+        for _ in range(60):  # wait for the uploads
+            page.wait_for_timeout(2000)
+            if f"Photos ({len(photos)})" in row.inner_text():
+                break
+        else:
+            raise RuntimeError(f"the photos didn't all upload ({row.inner_text().splitlines()[0]} of {len(photos)})")
+        done["photos"] = len(photos)
+        done["photo_paths"] = [getattr(f, "stored", None) for f in photos]
+        s.detail(f"{len(photos)} photos uploaded")
+        _next(page)
+
+    with _Step("Platform posting") as s:
+        credits = re.search(r"(\d+)\s+Universal Credits", page.inner_text("body"))
+        done["credits"] = int(credits.group(1)) if credits else None
+        s.detail(f"{done['credits'] or '?'} Universal Credits when posted · PropertyGuru + iProperty")
+        _next(page)  # preview
+
+    with _Step("Preview") as s:
+        if not page.locator("[da-id=footer-post-now-button]").count():
+            raise RuntimeError("the Preview page has no Post now button")
+        s.detail("checked - ready")
     return done
 
 
-def photo_files(db, paths, folder):
-    """Up to 5 of the owner's photos, downloaded - WhatsApp screenshots (prices, chats) left out."""
+class _Stored(type(Path())):
+    """A downloaded photo that remembers where it's stored online."""
+    def __new__(cls, local, stored):
+        obj = super().__new__(cls, local)
+        obj.stored = stored
+        return obj
+
+
+def photo_files(db, paths, folder, limit=5):
+    """Up to 5 of the owner's photos, downloaded - WhatsApp screenshots (prices, chats) left out. Each file keeps
+    the photo's storage path in .stored (shown on the dashboard's draft card)."""
     from wa_ocr import is_chat_screenshot
     out = []
     for p in paths:
@@ -319,8 +432,8 @@ def photo_files(db, paths, folder):
         except Exception:
             continue
         if not is_chat_screenshot(f):
-            out.append(f)
-        if len(out) == 5:
+            out.append(_Stored(f, p))
+        if len(out) == limit:
             break
     return out
 
@@ -342,8 +455,10 @@ def _click_post(page):
 
 
 def _one(db, page, r, mk, action, folder):
-    """One listing: "draft" = fill + save as draft, "post" = fill + post, "post_draft" = post its saved draft."""
+    """One listing: "draft" / "redo" = fill + save as draft, "post" = fill + post (or post its draft),
+    "post_draft" = post its saved draft, "redo_post" = fill again with your changes + post."""
     mid = r["message_id"]
+    _steps.clear()
     prev = load_results(db).get(mid) or {}
     if prev.get("state") in ("posted", "check"):  # "check" = Post now pressed, unconfirmed: never pay twice
         raise RuntimeError("already posted (or posting to check in AgentNet) - not posted again")
@@ -352,29 +467,42 @@ def _one(db, page, r, mk, action, folder):
     if action == "post_draft":
         if not prev.get("draft_id"):
             raise RuntimeError("no draft yet - make a draft first")
-        goto(page, f"/v3/create-listing/{prev['draft_id']}")
-        # a saved draft reopens at Gallery, with Preview greyed out until you go through the steps: Next, Next
-        for _ in range(8):
-            if "#/preview" in page.url:
-                break
-            _next(page)
-        if not page.locator("[da-id=footer-post-now-button]").count():
-            raise RuntimeError(f"the draft didn't reach Preview (stuck at {page.url.split('#')[-1]}) - open it in "
-                               "AgentNet to see what's missing")
+        with _Step("Open draft") as s:
+            goto(page, f"/v3/create-listing/{prev['draft_id']}")
+            s.detail(f"AgentNet ID {prev['draft_id']}")
+        with _Step("Preview") as s:
+            # a saved draft reopens at Gallery, with Preview greyed out until you go through the steps: Next, Next
+            for _ in range(8):
+                if "#/preview" in page.url:
+                    break
+                _next(page)
+            if not page.locator("[da-id=footer-post-now-button]").count():
+                raise RuntimeError(f"the draft didn't reach Preview (stuck at {page.url.split('#')[-1]}) - open it "
+                                   "in AgentNet to see what's missing")
+            s.detail("checked - ready")
         result = {**prev}
     else:
-        p = plan(r, mk)
-        problems = [x for x, ok in (("no price", p["price"]), ("no building name", p["name"])) if not ok]
-        photos = photo_files(db, p["photos"], folder)
-        if len(photos) < 5:
-            problems.append(f"only {len(photos)} photo(s) - PropertyGuru needs at least 5")
-        if problems:
-            raise RuntimeError("; ".join(problems))
+        with _Step("Check listing") as s:  # before opening AgentNet: price, building, 5 photos
+            p = plan(r, mk)
+            mine = load_prefs(db).get(mid) or {}  # your choices on the dashboard: photos left out, own wording
+            if mine.get("photos"):  # the photos you ticked, in the listing's order
+                p["photos"] = [x for x in p["photos"] if x in set(mine["photos"])]
+            else:
+                p["photos"] = [x for x in p["photos"] if x not in set(mine.get("skip_photos") or [])]
+            p["my_headline"], p["my_description"] = mine.get("headline"), mine.get("description")
+            problems = [x for x, ok in (("no price", p["price"]), ("no building name", p["name"])) if not ok]
+            photos = photo_files(db, p["photos"], folder, max(5, len(mine.get("photos") or [])))
+            if len(photos) < 5:
+                problems.append(f"only {len(photos)} photo(s) - PropertyGuru needs at least 5")
+            if problems:
+                raise RuntimeError("; ".join(problems))
+            s.detail(f"{p['name']} · RM {p['price']:,} · {len(photos)} photos")
         done = fill(page, p, photos)
         result = {**done, "plan": {k: v for k, v in p.items() if k != "photos"},
                   "edit_url": f"{BASE}/v3/create-listing/{done['draft_id']}#/preview" if done.get("draft_id") else None}
     result.update(place=r.get("place"), owner=r.get("owner_name"), at=time.time())
     result.pop("error", None)
+    result.pop("error_shot", None)
     try:  # the preview, to look at on the dashboard (also online)
         shot = folder / f"{re.sub(r'[^A-Za-z0-9]', '', mid)[:40]}.png"
         page.screenshot(path=str(shot))
@@ -383,16 +511,20 @@ def _one(db, page, r, mk, action, folder):
         result["shot"] = key
     except Exception:
         pass
-    if action in ("post", "post_draft"):
-        say("Posting…")
-        ok = _click_post(page)
-        result.update(state="posted" if ok else "check", posted_at=time.time(),
-                      note=None if ok else "Pressed Post now but AgentNet didn't clearly confirm - check Active "
-                                           "Listings in AgentNet")
-    else:
-        page.click("[da-id=listing-creation-header-save-exit-button]")  # keep it as a draft
-        page.wait_for_timeout(5000)
-        result["state"] = "draft"
+    with _Step("Save / post") as s:
+        if action in ("post", "post_draft", "redo_post"):  # redo_post: made fresh with your changes, then posted
+            ok = _click_post(page)
+            result.update(state="posted" if ok else "check", posted_at=time.time(),
+                          note=None if ok else "Pressed Post now but AgentNet didn't clearly confirm - check Active "
+                                               "Listings in AgentNet")
+            s.detail("Posted - live on PropertyGuru + iProperty" if ok else "Post now pressed - not confirmed, check "
+                                                                          "AgentNet")
+        else:
+            page.click("[da-id=listing-creation-header-save-exit-button]")  # keep it as a draft
+            page.wait_for_timeout(5000)
+            result["state"] = "draft"
+            s.detail(f"Saved as draft (AgentNet ID {result.get('draft_id')}) - nothing posted")
+    result["steps"] = list(_steps)
     save_result(db, mid, result)
     return result
 
@@ -409,7 +541,8 @@ def run_batch(db, ids, action="draft"):
     rows = {r["message_id"]: r for r in db.table("owner_listings").select("*").in_("message_id", ids).execute().data}
     markets = market_check.load_results(db)
     counts = {"ok": 0, "failed": 0}
-    word = {"draft": "Saving drafts", "post": "Posting", "post_draft": "Posting drafts"}[action]
+    word = {"draft": "Saving drafts", "redo": "Redoing drafts", "post": "Posting", "post_draft": "Posting drafts",
+            "redo_post": "Redoing and posting"}[action]
     _batch.update(action=action, total=len(ids), ids=ids)
     credits = None
     with sync_playwright() as pw, tempfile.TemporaryDirectory() as tmp:
@@ -429,9 +562,19 @@ def run_batch(db, ids, action="draft"):
                 except Exception as e:
                     counts["failed"] += 1
                     prev = load_results(db).get(mid) or {}
-                    save_result(db, mid, {**prev, "state": prev.get("state") or "error", "at": time.time(),
-                                          "place": (r or {}).get("place"), "owner": (r or {}).get("owner_name"),
-                                          "error": str(e).splitlines()[0][:200]})
+                    where = next((x["step"] for x in _steps if x["state"] == "failed"), None)
+                    fail = {**prev, "state": prev.get("state") or "error", "at": time.time(),
+                            "place": (r or {}).get("place"), "owner": (r or {}).get("owner_name"),
+                            "steps": list(_steps), "error": (f"{where}: " if where else "") + explain(e)}
+                    try:  # what AgentNet showed when it stopped
+                        shot = Path(tmp) / f"{re.sub(r'[^A-Za-z0-9]', '', mid)[:40]}-error.png"
+                        page.screenshot(path=str(shot))
+                        fail["error_shot"] = f"agent_post/{shot.name}"
+                        db.storage.from_(BUCKET).upload(fail["error_shot"], shot.read_bytes(),
+                                                        {"content-type": "image/png", "upsert": "true"})
+                    except Exception:
+                        fail.pop("error_shot", None)
+                    save_result(db, mid, fail)
             try:  # credits left, shown on the posting page
                 credits = int(re.sub(r"\D", "", page.locator("[da-id=credit-type-dropdown-trigger]").first
                                      .inner_text()) or 0) or None
@@ -497,7 +640,7 @@ def run_requests(db, log=print):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--ids", nargs="+", required=True, help="saved listings (message ids)")
-    ap.add_argument("--action", default="draft", choices=["draft", "post", "post_draft"])
+    ap.add_argument("--action", default="draft", choices=["draft", "redo", "post", "post_draft", "redo_post"])
     a = ap.parse_args()
     from dotenv import load_dotenv
     from supabase import create_client

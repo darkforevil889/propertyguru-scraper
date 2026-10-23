@@ -26,8 +26,13 @@ FURNISH = [("Unfurnished", re.compile(r"\b(un\s*-?furnish\w*|non\s*-?furnish\w*|
 
 
 def furnishing_in(text):
-    """Furnishing stated in a text ("Fully ID furnished" -> Fully Furnished), or None."""
-    return next((label for label, rx in FURNISH if rx.search(text or "")), None)
+    """Furnishing stated in a text ("Fully ID furnished" -> Fully Furnished), or None. A plain "Furnished" (no
+    fully / partly / un- with it) counts as fully furnished - what owners mean by it, and your default."""
+    found = next((label for label, rx in FURNISH if rx.search(text or "")), None)
+    if not found and re.search(r"(?<![\w-])furnished\b", text or "", re.I) \
+            and not re.search(r"\b(not|non|un|semi|part\w*)[\s-]*furnished", text or "", re.I):
+        return "Fully Furnished"
+    return found
 # Where a property name stops and the details begin ("The Conlay 2R2B 1,066sf ..." -> "The Conlay")
 PLACE_END = re.compile(r"(\s|^)(for\s*(rent|sale)|rent(al)?\b|sale\b|dijual|disewakan|sewa\b|jual\b|rm\b|myr\b|"
                        r"\d+(?:\.\d+)?\s*(?:\+\s*\d\s*)?(?:r\b|r\d|b\b|bed|bath|room|bilik|sf|sq|kps|k\b|mil|m\b|juta|%)|"
@@ -163,8 +168,11 @@ def parse(text, need_price=True):
         kind = "Sale / Rent" if rent_v and ASKING_RENT.search(text) else "Sale"
     elif rent_v and (not price or price < 50_000):
         price, kind = rent_v, "Rent"
-    # Needs a price plus at least one other property clue to count as a listing
-    if need_price and (not price or not (kind or sqft or beds or furnishing)):
+    # "Tenanted - RM1600/month": the tenant's rent - the unit itself is for sale (its price may come later)
+    if TENANTED.search(text) and not ASKING_RENT.search(text) and kind == "Rent" and price and price < 50_000:
+        rental, price, kind = price, None, "Sale"
+    # Needs a price (or a tenanted unit's rental) plus at least one other property clue to count as a listing
+    if need_price and (not (price or rental) or not (kind or sqft or beds or furnishing)):
         return None
     return {"type": kind, "price_rm": price, "sqft": sqft, "bedrooms": beds, "bathrooms": baths,
             "furnishing": furnishing, "place": _place(text), "phones": phones, "rental_rm": rental}
@@ -176,6 +184,8 @@ SALE_AMT = re.compile(r"\b(?:for\s*sale|sale|selling(?:\s*price)?|sell(?:ing)?\s
 RENT_AMT = re.compile(r"\b(?:rented\s*(?:out\s*)?(?:for|at)|tenanted\s*(?:for|at)|asking\s*rental|monthly\s*rental|"
                       r"rental|rent|sewa)\b(?:\s*(?:is|at|:|-|=|of|for))*\s*" + AMT, re.I)
 ASKING_RENT = re.compile(r"\basking\s*rental|\bfor\s*rent\b|\bto\s*let\b|\bdisewakan\b", re.I)
+TENANTED = re.compile(r"\btenanted\b|\bwith\s+(a\s+)?tenant\b|\bcurrently\s+rent(ed)?\s+out\b|\bsold\s+with\s+tenant",
+                      re.I)
 
 
 def _keyword_amount(rx, text, lo, hi):
@@ -187,21 +197,61 @@ def _keyword_amount(rx, text, lo, hi):
     return None
 
 
+def _follow_up(text, fields):
+    """A short message with a price but nothing that names or describes a property ("Can sell 450k", "ok 4.3k
+    nett") - an update to the chat's listing, not a new one."""
+    return (len(text) <= 80 and not PLACE_HINT.search(text) and not unit_no(text)
+            and not (fields.get("sqft") or fields.get("bedrooms")))
+
+
+def _update(listing, fields, text):
+    """Put an owner's later price into their listing: a sale price (or a rent for a rental), else the rent a sale
+    unit brings in. The message is added to the listing's text so you can see where it came from."""
+    price, kind = fields.get("price_rm"), fields.get("type")
+    selling = (listing.get("type") or "").startswith("Sale")
+    if price:
+        if selling and kind == "Rent" and price < 50_000:
+            listing["rental_rm"] = price  # "tenant pays 1.8k" on a unit for sale
+        else:
+            listing["price_rm"] = price
+            if kind:
+                listing["type"] = kind if not (selling and kind == "Sale" and listing["type"] == "Sale / Rent") \
+                    else listing["type"]
+    for k in ("furnishing", "rental_rm"):
+        if fields.get(k) and not listing.get(k):
+            listing[k] = fields[k]
+    listing["text"] = f"{listing['text']}\n(later) {text}"
+
+
 def group_listings(messages, window_s=600):
     """messages: bridge records. Returns listings with their photos attached.
 
     A photo belongs to the closest listing text from the same sender in the same chat within `window_s`
     (owners usually send photos just before or after the description). Photo captions can be listings too.
     """
-    listings, photos = [], []
+    listings, photos, intent = [], [], {}
     for m in sorted(messages, key=lambda r: (r["chatId"], r["timestamp"])):
+        private = not m["chatId"].endswith("@g.us")
+        if private and m.get("fromMe"):
+            continue  # your own words to an owner ("450k market price") aren't their listing
         text = full_text(m)
         fields = parse(text)
         ref = _ref(m)
+        # A private chat is one conversation: a short later message with no property of its own ("Can sell 450k")
+        # updates the listing already in the chat instead of becoming a new one
+        prev = next((l for l in reversed(listings) if l["chat"] == m["chatName"]), None) if private else None
+        if fields and prev and _follow_up(text, fields):
+            _update(prev, fields, text)
+            continue
         if fields:
+            said = intent.pop(m["chatId"], None)  # "I have Neu suites unit for sale" said before the details
+            if said and not fields.get("type"):
+                fields["type"] = said
             listings.append(_listing(fields, m, text, [ref] if ref else []))
         elif ref:
             photos.append((m, ref))
+        elif private and text and (RENT.search(text) or SALE.search(text)):
+            intent[m["chatId"]] = "Sale" if SALE.search(text) and not ASKING_RENT.search(text) else "Rent"
     for p, ref in photos:
         # Match on the sender's WhatsApp id (works even when their phone number is hidden)
         near = [l for l in listings if l["chat"] == p["chatName"] and l["sender"] == p.get("author")

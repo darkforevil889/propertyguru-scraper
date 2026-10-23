@@ -75,7 +75,7 @@ def pending_requests(db):
 
 # ---------- PC side (keeper.py) ----------
 def _fingerprint(row):
-    keep = {k: row.get(k) for k in ("verdict", "reason", "said", "phone", "called", "listen", "rules")}
+    keep = {k: row.get(k) for k in ("verdict", "reason", "said", "phone", "called", "listen", "rules", "chinese")}
     return hashlib.md5(json.dumps(keep, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -93,7 +93,7 @@ def sync(db):
         cid, fp = r["call_id"], _fingerprint(r)
         if calls.get(cid) != fp:
             data = {k: r.get(k) for k in ("phone", "called", "seconds", "verdict", "said", "reason", "turns", "heard",
-                                          "full", "ipline", "page")}
+                                          "full", "ipline", "page", "chinese")}
             batch.append(({"call_id": cid, "data": data}, cid, fp))
         if cid not in audio and (f := ai_call.audio_file(cid)):
             db.storage.from_(BUCKET).upload(_audio_path(cid), f.read_bytes(),

@@ -192,15 +192,31 @@ def hear_person(ip, turns):
         out.setsampwidth(fmt[1])
         out.setframerate(fmt[2])
         out.writeframes(b"".join(frames))
-    segs = _whisper("person.wav", buf.getvalue(), "audio/wav", PERSON_HINT)
-    got = {id(t): [] for *_, t in spans}
-    for s in segs:
-        text = s["text"].strip()
-        mid = (s["start"] + s["end"]) / 2
-        hit = min(spans, key=lambda sp: 0 if sp[0] <= mid <= sp[1] else min(abs(mid - sp[0]), abs(mid - sp[1])))
-        got[id(hit[2])].append(text)
-    for *_, t in spans:
-        t["heard"] = " ".join(got[id(t)])
+    def put_back(segs, field):  # each piece of text back on the line (clip) it came from
+        got = {id(t): [] for *_, t in spans}
+        for s in segs:
+            mid = (s["start"] + s["end"]) / 2
+            hit = min(spans, key=lambda sp: 0 if sp[0] <= mid <= sp[1] else min(abs(mid - sp[0]), abs(mid - sp[1])))
+            got[id(hit[2])].append(s["text"].strip())
+        for *_, t in spans:
+            t[field] = " ".join(got[id(t)])
+
+    audio = buf.getvalue()
+    put_back(_whisper("person.wav", audio, "audio/wav", PERSON_HINT), "heard")
+    # The same clips heard as Chinese: with the English hint a Chinese answer comes out as English-sounding nonsense
+    # ("Boleh boleh" / "有,在哪里的?" heard as "Hampshire resident?"). The hint has no answer words - forced to
+    # Chinese, Whisper sometimes just repeats its hint back, and those lines are dropped.
+    try:
+        zh = [s for s in _whisper("person.wav", audio, "audio/wav", ZH_HINT, "zh") if not ZH_ECHO.search(s["text"])]
+        put_back(zh, "heard_zh")
+    except DailyLimit:
+        raise
+    except Exception:
+        pass  # the English hearing is enough to go on
+
+
+ZH_HINT = "马来西亚的一通房产电话，这是接电话的人说的话。"
+ZH_ECHO = re.compile(r"问：|回答：|房产电话|接电话的人")
 
 
 # Greetings / goodbyes say nothing about interest - left out of what the dashboard shows
@@ -252,7 +268,9 @@ def conversation(turns, which="both"):
             elif which == "heard":
                 out.append(f"PERSON: {heard or '(nothing clear)'}")
             else:
-                out.append(f"PERSON: re-heard \"{heard or '(nothing clear)'}\"  |  ipline guessed \"{guess}\"")
+                zh = (t.get("heard_zh") or "").strip()
+                out.append(f"PERSON: re-heard \"{heard or '(nothing clear)'}\""
+                           + (f"  |  re-heard as Chinese \"{zh}\"" if zh else "") + f"  |  ipline guessed \"{guess}\"")
     return "\n".join(out)
 
 
@@ -268,6 +286,11 @@ and "ipline guessed" = ipline's own recognition.
 B) The whole recording heard again - both voices mixed. The robot's lines are known (e.g. "I'm Lily, property \
 agent here...", "Do you want to sell or rent your property?", "How about I WhatsApp you detail shortly?", "Thank \
 you, bye bye"); everything else is the person. A quiet person may be missing here.
+The person's own voice clips ("re-heard" in A) are the most accurate for THEIR words - each clip is only them; the \
+whole recording (B) mixes both voices and often mishears them. When the clips and B disagree, trust the clips.
+Some PERSON lines also have "re-heard as Chinese" = the same clip heard as Chinese. If the person spoke Chinese, that \
+one is right (the plain "re-heard" then turns Chinese into English-sounding nonsense, e.g. "Hampshire resident?"); \
+if they spoke English or Malay, ignore it.
 Work out what the person really said: prefer what two hearings agree on (also when they only sound alike, e.g. \
 "Detail and so" ~ "Detail untuk?"); otherwise prefer the version that makes sense as a reply to the robot. \
 Phone lines blur similar words: a short reply to Q1 like "we property" / "where property" / "what property" is \
@@ -308,7 +331,8 @@ VOICEMAIL = re.compile(r"leave (a |your )?message|after the (beep|tone)|voice ?m
                        r"无法接通|暂时无法|無法接聽", re.I)
 QUICK_JUDGE = """Phone call by a Malaysian property agent's robot. Q1 = "Do you want to sell or rent your \
 property?", Q2 = "How about I WhatsApp you details?". Below: the call from Q1 on. Each PERSON line is heard twice: \
-"re-heard" (more accurate) and "ipline guessed" (often wrong). People answer late, so an answer to Q1 may come after \
+"re-heard" (more accurate) and "ipline guessed" (often wrong); some also "re-heard as Chinese" (right if they spoke \
+Chinese, ignore it otherwise). People answer late, so an answer to Q1 may come after \
 Q2. English / Malay / Chinese / a mix.
 
 Facts (true / false), each on its own:
@@ -414,10 +438,54 @@ def quick_judge(answer, text_only=False):
     return {**facts, "verdict": verdict, "reason": reason}
 
 
+# A clear "no" in ANY version of what the person said - ipline's text, the re-heard clips, the whole recording.
+# One wrong hearing ("I think wrong number then" heard as "I think we're going to sell it") mustn't make a Want.
+CLEAR_NO = re.compile(r"wrong (number|no\b|person)|salah (nombor|number|no\b|orang)|not interest|tak (minat|berminat)|"
+                      r"tidak berminat|no (property|house|rumah)|don'?t have (any |a )?(property|house)|"
+                      r"tak (ada|de) (rumah|property|hartanah)|stop calling|don'?t call|打错|打錯|没兴趣|沒興趣|不需要", re.I)
+
+
+def clear_no(f):
+    """The clear "no" words the person said anywhere in the call, or None. Only what was heard - not the AI's
+    "said" summary, which can hold its own guesses ("likely misheard 'I'm not interested'")."""
+    parts = [f.get("full") or ""]
+    parts += [f"{t.get('text', '')} {t.get('heard', '')} {t.get('heard_zh', '')}" for t in f.get("turns") or []
+              if t.get("who") == "person"]
+    m = CLEAR_NO.search("\n".join(parts))
+    return m.group(0) if m else None
+
+
+# A clear yes in the person's OWN voice clips (each clip = only them, heard again) after "sell or rent?" - more
+# reliable than the whole recording, which mixes both voices ("Boleh, boleh" heard there as "Have you done that?")
+CLIP_YES = re.compile(r"\b(boleh|can|sure|i have (one|a|property)|i got (one|a)|got one|nak (jual|sewa))\b|可以", re.I)
+# ... but not when those clips also sound lost ("Yes? Come again? You are?", "I don't know you")
+CLIP_LOST = re.compile(r"come again|you are\?|who are you|don'?t know (you|who)|pardon|heard my name|what\?", re.I)
+
+
+def clips_yes(f):
+    """The yes words in the person's own re-heard clips from the 'sell or rent' question on - None if there are
+    none, or if those clips also sound confused."""
+    turns = f.get("turns") or []
+    start = next((i for i, t in enumerate(turns) if t.get("who") == "robot"
+                  and re.search(r"sell|rent", t.get("text") or "", re.I)), None)
+    if start is None:
+        return None
+    clips = "\n".join(f"{t.get('heard') or ''} {t.get('heard_zh') or ''}" for t in turns[start:]
+                      if t.get("who") == "person")
+    m = CLIP_YES.search(clips)
+    return m.group(0) if m and not CONFUSED_WORDS.search(clips) and not CLIP_LOST.search(clips) else None
+
+
 def decide(f):
     """Your rules, applied in order -> (verdict, short reason)."""
     if f.get("machine"):
         return "not interested", "Machine / voicemail answered"
+    no = clear_no(f)
+    if no:
+        return "not interested", f"Said \"{no}\""
+    yes = clips_yes(f) if not f.get("refused") else None
+    if yes and (f.get("confused") or not (f.get("q1_yes") or f.get("q1_asks_property") or f.get("q2_yes"))):
+        return "interested", f"Said \"{yes}\" (in their own voice clips)"
     if f.get("refused"):
         return "not interested", "Refused or annoyed"
     if f.get("q1_asks_property"):
@@ -519,7 +587,7 @@ def save_ticks(ticks):
 
 def results():
     """Every call checked so far (newest call first)."""
-    rows = []
+    rows, reviewed = [], load_reviewed()
     for k, v in _load_cache().items():
         if v.get("phone"):
             if "q1_yes" in v:  # rules may have changed since - apply today's to the stored facts
@@ -529,8 +597,20 @@ def results():
             elif v.get("listen") == "text":
                 v["reason"] = (f"{v.get('reason', '')} · ipline text only (no recording)"
                                + (" · word rules" if v.get("by_rules") else ""))
+            if k in reviewed:  # read again call by call - over the AI and the word rules
+                v["verdict"], v["reason"] = reviewed[k]["verdict"], f"{reviewed[k]['reason']} · rechecked"
             rows.append({"call_id": k, **v})
     return sorted(rows, key=lambda r: r.get("called") or "", reverse=True)
+
+
+REVIEWED = OUT / "reviewed.json"  # call id -> {"verdict", "reason"}: calls read again one by one (2026-10-23)
+
+
+def load_reviewed():
+    try:
+        return json.loads(REVIEWED.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
 
 
 def audio_file(call_id):
@@ -595,7 +675,7 @@ def check(pages=1, start_page=1, progress=print, headless=True, quick=False, tex
                                 facts["verdict"], facts["reason"] = decide(facts)
                             else:
                                 facts = quick_judge(answer, text_only)
-                        entry = {"turns": [{k: t.get(k, "") for k in ("who", "text", "heard")} for t in turns],
+                        entry = {"turns": [{k: t.get(k, "") for k in ("who", "text", "heard", "heard_zh")} for t in turns],
                                  "full": "", "listen": "text" if text_only else "quick", "rules": QUICK_RULES, **facts}
                         mp3 = AUDIO / f"{key}.mp3"
                         if not text_only and not mp3.exists():  # for listening on the dashboard (no AI needed)
@@ -606,7 +686,7 @@ def check(pages=1, start_page=1, progress=print, headless=True, quick=False, tex
                         progress(f"  {i}/{len(calls)} {c['phone']}: listening…")
                         turns = ip.transcript(c)
                         hear_person(ip, turns)
-                        entry["turns"] = [{k: t.get(k, "") for k in ("who", "text", "heard")} for t in turns]
+                        entry["turns"] = [{k: t.get(k, "") for k in ("who", "text", "heard", "heard_zh")} for t in turns]
                         mp3 = AUDIO / f"{key}.mp3"
                         if not mp3.exists():
                             audio = ip.recording(c)  # whole call - also for listening on the dashboard

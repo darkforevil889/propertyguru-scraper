@@ -382,21 +382,33 @@ def agent_post_progress(agent_post, on_pc):
             st.rerun(scope="app")
         total = s.get("total") or 1
         st.progress(min(1.0, (s.get("done") or 0) / total),
-                    text=f"⏳ On your PC ({s.get('done', 0)} of {total} done): {s.get('text', '')} - a Chrome window "
-                         "is filling AgentNet")
+                    text=f"⏳ On your PC ({s.get('done', 0)} of {total} done): {s.get('place') or ''} - a Chrome "
+                         "window is filling AgentNet")
+        if s.get("steps"):  # this listing, step by step
+            st.markdown(agent_post_steps(s["steps"]))
         if st.button("⏹ Stop after this listing", key="ap-stop"):
             agent_post.stop() if on_pc else agent_post.request_stop(db)
             st.toast("Stopping after the listing it's on…")
     progress()
 
 
-def agent_post_actions(ids, key, results):
+def agent_post_credits(mid, results, rows):
+    """Universal Credits to post this listing: what AgentNet showed for its draft, else what it usually charges -
+    2 for a rental, 6 for a sale."""
+    known = (results.get(mid) or {}).get("credits")
+    if known:
+        return known
+    return 2 if (rows.get(mid) or {}).get("listing_type") == "Rent" else 6
+
+
+def agent_post_actions(ids, key, results, rows=None):
     """The action bar for ticked listings: save as drafts (preview, no credits) / post now - and post the ones that
-    already have a draft. Posting needs a tick: 2 Universal Credits each."""
+    already have a draft. Posting needs a tick that says what it costs."""
     agent_post, on_pc, s, _ = agent_post_state()
     if agent_post_busy(s):
         agent_post_progress(agent_post, on_pc)
         return
+    rows = rows or {}
     # posted, or Post now pressed but unconfirmed ("check") - never posted (paid) twice
     posted = [i for i in ids if (results.get(i) or {}).get("state") in ("posted", "check")]
     todo = [i for i in ids if i not in posted]
@@ -412,16 +424,16 @@ def agent_post_actions(ids, key, results):
         st.rerun()
 
     plural = lambda n: "s" * (n > 1)  # noqa: E731
+    credits = sum(agent_post_credits(i, results, rows) for i in todo)
     c1, c2, c3 = st.columns([1.2, 1.5, 1.3])
     if c1.button(f"📝 Save {len(no_draft)} as draft{plural(len(no_draft))} (preview)" if no_draft else
-                 "📝 Already saved as draft", key=f"{key}-draft",
-                 disabled=not no_draft,
+                 "📝 Already saved as draft", key=f"{key}-draft", disabled=not no_draft,
                  help="Fills AgentNet's Create Listing for each with your usual choices and saves it as a draft - "
                       "nothing is posted, no credits used. Check them, then post. Listings that already have a "
                       "draft are left out."):
         go(no_draft, "draft")
-    sure = c2.checkbox(f"I checked - post {len(todo)} listing{plural(len(todo))} ({2 * len(todo)} Universal "
-                       "Credits)", key=f"{key}-sure")
+    sure = c2.checkbox(f"I checked - post {len(todo)} listing{plural(len(todo))} ({credits} Universal Credits)",
+                       key=f"{key}-sure", help="2 credits for a rental, 6 for a sale (what AgentNet charges)")
     if c3.button(f"🚀 Post {len(todo)} now", key=f"{key}-post", type="primary", disabled=not sure,
                  help="A listing with a draft posts that draft (what you checked); the others are filled in and "
                       "posted straight away"):
@@ -437,6 +449,48 @@ def agent_post_box(r, results):
         agent_post_detail(done)
 
 
+def agent_post_steps(steps):
+    """The robot's steps for one listing -> a checklist: ✅ done (what it filled in) / ⏳ working / ❌ stopped (why)."""
+    icon = {"done": "✅", "doing": "⏳", "failed": "❌"}
+    return "\n".join(f"{i}. {icon.get(x.get('state'), '•')} **{x['step']}**"
+                     + (f" — {x['detail']}" if x.get("detail") and x.get("state") != "failed" else "")
+                     + (f" — :red[{x['error']}]" if x.get("error") else "")
+                     for i, x in enumerate(steps, 1))
+
+
+def agent_post_fields(pl, done=None, credits=None):
+    """What goes (or went) into AgentNet's form, as a two-column table you can check at a glance."""
+    done = done or {}
+    furnish = pl.get("furnishing_words") or ""
+    items = {"AIRCO": "air-con", "BED": "bed", "FRI": "fridge", "HEATE": "water heater"}
+    if pl.get("furnishing_items"):
+        furnish += " (" + ", ".join(items.get(k, k) for k in pl["furnishing_items"]) + ")"
+    rooms = f"{pl.get('beds')} bed, {pl.get('baths')} bath" if pl.get("beds") else "-"
+    size = (f"{pl['sqft']:,} sf" + (" (estimated from PropertyGuru)" if pl.get("sqft_estimated") else "")
+            if pl.get("sqft") else "-")
+    price = f"RM {pl['price']:,}" + ("/month" if pl.get("rent") else "") if pl.get("price") else "-"
+    facts = [
+        ("For", f"{'Rent - entire unit' if pl.get('rent') else 'Sale'} · available immediately"),
+        ("Building", (done.get("property") or pl.get("name") or "-").replace("  ", " · ")),
+        ("Property type", done.get("types") or " / ".join(x for x in (pl.get("sub_type"), pl.get("unit_type")) if x)),
+        ("Title", pl.get("title")),
+        ("Rooms", rooms), ("Size", size), ("Furnishing", furnish or "-"), ("Price", price),
+        ("Tenant pays", f"RM {pl['rental']:,}/month" if pl.get("rental") else None),
+        ("Photos", f"{done['photos']} of the owner's photos (no videos, no screenshots)" if done.get("photos")
+         else None),
+        ("Cost to post", f"{credits} Universal Credits · PropertyGuru + iProperty · 60 days" if credits else None)]
+    st.markdown("\n".join(f"- **{k}:** {v}" for k, v in facts if v))
+
+
+def agent_post_photos(paths):
+    """The owner's photos the robot put in, small."""
+    urls = signed_urls([p for p in paths or [] if p])
+    if urls:
+        cols = st.columns(len(urls))
+        for col, p in zip(cols, urls):
+            col.image(urls[p], width="stretch")
+
+
 def agent_post_detail(done):
     word = {"posted": "✅ Posted", "draft": "📝 Draft saved (not posted yet)", "check": "⚠️ Check in AgentNet",
             "error": "❌ Couldn't make it"}.get(done.get("state"), done.get("state"))
@@ -445,30 +499,149 @@ def agent_post_detail(done):
     link = f" · [Open it in AgentNet ↗]({done['edit_url']})" if done.get("edit_url") else ""
     st.markdown(f"**{word}**{ident}{link} · {when}")
     if done.get("error"):
-        st.error(done["error"])
+        st.error(f"❌ {done['error']}")
     if done.get("note"):
         st.warning(done["note"])
+    if done.get("steps"):
+        with st.expander("Step by step", expanded=bool(done.get("error"))):
+            st.markdown(agent_post_steps(done["steps"]))
+            if done.get("error_shot"):
+                url = signed_urls([done["error_shot"]]).get(done["error_shot"])
+                if url:
+                    st.image(url, caption="What AgentNet showed when it stopped", width=520)
     if done.get("headline"):
         st.markdown(f"**Headline:** {done['headline']}")
         st.text(done.get("description", ""))
-        pl = done.get("plan") or {}
-        st.caption(f"{done.get('property', '')} · {done.get('types', '')} · {pl.get('beds')} bed {pl.get('baths')} "
-                   f"bath · {pl.get('sqft')} sf{' (estimated)' if pl.get('sqft_estimated') else ''} · "
-                   f"{pl.get('furnishing_words')} · RM {pl.get('price') or 0:,} · {done.get('photos', 0)} photos")
     if done.get("shot"):
         url = signed_urls([done["shot"]]).get(done["shot"])
         if url:
             st.image(url, caption="AgentNet preview", width=520)
 
 
+def agent_post_photo_picker(mid, row, prefs, key):
+    """All the owner's photos: tick the ones for the ad (at first the robot's usual 5 are ticked). -> the photos
+    that go in, in the listing's order."""
+    import agent_post
+    every = [p for p in row.get("photo_paths") or [] if p.lower().endswith(".jpg")]
+    mine = prefs.get(mid) or {}
+    if mine.get("photos"):
+        chosen = [p for p in every if p in set(mine["photos"])]
+    else:  # nothing ticked yet: the usual first 5 (minus any left out before)
+        chosen = [p for p in every if p not in set(mine.get("skip_photos") or [])][:5]
+    head, clear = st.columns([4, 1])
+    head.markdown(f"**Photos** - {len(every)} from the owner · tick ✔ the ones for the ad ({len(chosen)} ticked)")
+    if clear.button("Clear ticks", key=f"{key}-clear", disabled=not chosen):
+        agent_post.save_prefs(db, mid, photos=["-"], skip_photos=[])  # "-" = you cleared them all
+        for p in every:
+            st.session_state.pop(f"{key}-use-{p}", None)
+        st.rerun()
+    urls = signed_urls(every)
+    ticked = []
+    for start in range(0, len(every), 6):
+        cols = st.columns(6)
+        for col, p in zip(cols, every[start:start + 6]):
+            with col:
+                if urls.get(p):
+                    st.image(urls[p], width="stretch")
+                if st.checkbox("✔ use", value=p in chosen, key=f"{key}-use-{p}"):
+                    ticked.append(p)
+    if ticked != chosen:
+        agent_post.save_prefs(db, mid, photos=ticked or ["-"], skip_photos=[])
+        st.rerun()
+    if len(chosen) < 5:
+        st.error(f"{len(chosen)} photo(s) ticked - PropertyGuru needs at least 5.")
+    return chosen
+
+
+def agent_post_card(mid, done, row, results, rows, prefs):
+    """One draft to approve: everything the robot filled in, your choice of photos, the headline / description (you
+    can reword them), AgentNet's preview - then Approve & post (after a tick) or Redo with your changes."""
+    import agent_post
+    _, on_pc, s, _ = agent_post_state()
+    credits = agent_post_credits(mid, results, rows)
+    mine = prefs.get(mid) or {}
+    changed = (row.get("scanned_at") and pd.to_datetime(row["scanned_at"], utc=True).timestamp()
+               > (done.get("at") or 0) + 60)
+    with st.container(border=True):
+        st.markdown(f"### {row.get('place')} · {row.get('listing_type')} · "
+                    f"RM {(row.get('price_rm') or 0):,}" + (f"  \n<small>Owner: {row.get('owner_name')}</small>"
+                                                           if row.get("owner_name") else ""),
+                    unsafe_allow_html=True)
+        made = datetime.fromtimestamp(done.get("at") or 0, MYT).strftime("%d %b %H:%M")
+        st.caption(f"Draft saved {made} · AgentNet ID {done.get('draft_id')}"
+                   + (f" · [open it in AgentNet ↗]({done['edit_url']})" if done.get("edit_url") else ""))
+        left, right = st.columns([1.1, 1])
+        with left:
+            agent_post_fields(done.get("plan") or {}, done, credits)
+            head = st.text_input("Headline", mine.get("headline") or done.get("headline", ""), max_chars=70,
+                                 key=f"ap-head-{mid}")
+            desc = st.text_area("Description", mine.get("description") or done.get("description", ""), height=190,
+                                key=f"ap-desc-{mid}", help="AgentNet wants at least 20 words")
+            if (head, desc) != (mine.get("headline") or done.get("headline", ""),
+                                mine.get("description") or done.get("description", "")):
+                if st.button("💾 Keep this wording", key=f"ap-word-{mid}"):
+                    agent_post.save_prefs(db, mid, headline=head.strip(), description=desc.strip())
+                    st.rerun()
+        with right:
+            if done.get("shot"):
+                url = signed_urls([done["shot"]]).get(done["shot"])
+                if url:
+                    st.image(url, caption="How AgentNet shows it now (preview)", width="stretch")
+        used = agent_post_photo_picker(mid, row, prefs, f"card-{mid}")
+        # what you changed here that the draft in AgentNet doesn't have yet
+        in_draft = done.get("photo_paths") or []
+        pending = [x for x, yes in (
+            ("photos", bool(in_draft) and used != in_draft),
+            ("headline", bool(mine.get("headline")) and mine["headline"] != done.get("headline")),
+            ("description", bool(mine.get("description")) and mine["description"] != done.get("description")),
+            ("listing details", changed)) if yes]
+        if pending:
+            st.info(f"✏️ Your new {', '.join(pending)} aren't in AgentNet's draft yet - tick below and **✅ Redo & "
+                    "post** makes the ad again with them and posts it in one go (or **🔄 Redo draft** to see the "
+                    "new draft first).")
+        if done.get("steps"):
+            with st.expander("Step by step (what the robot did)"):
+                st.markdown(agent_post_steps(done["steps"]))
+        if agent_post_busy(s):
+            return
+        c1, c2, c3 = st.columns([1.6, 1, 1])
+        # changed something? one go: the ad made again with your changes (photos, wording, details) and posted
+        sure = c1.checkbox(f"I checked it - {'redo with my changes and ' if pending else ''}post for {credits} "
+                           "Universal Credits", key=f"ap-ok-{mid}")
+        if c2.button("✅ Redo & post" if pending else "✅ Approve & post", key=f"ap-go-{mid}", type="primary",
+                     disabled=not sure):
+            action = "redo_post" if pending else "post"
+            agent_post.start([mid], action) if on_pc else agent_post.request(db, [mid], action)
+            st.rerun()
+        if c3.button("🔄 Redo draft", key=f"ap-redo-{mid}", type="primary" if pending else "secondary",
+                     help="Makes the draft again with the photos and wording above (the old draft stays in "
+                          "AgentNet's Draft Listings - delete it there if you like)"):
+            agent_post.start([mid], "redo") if on_pc else agent_post.request(db, [mid], "redo")
+            st.rerun()
+
+
+def agent_post_preview(row, market, prefs):
+    """Before any draft: what the robot will fill in for this saved listing - and pick its photos."""
+    import agent_post
+    mid = row["message_id"]
+    pl = agent_post.plan(row, market.get(mid))
+    with st.container(border=True):
+        st.markdown(f"**{row.get('place')}** · {row.get('owner_name') or ''}")
+        agent_post_fields(pl, credits=2 if pl.get("rent") else 6)
+        st.caption(f"Headline (roughly - the area comes from PropertyGuru's search): "
+                   f"{(prefs.get(mid) or {}).get('headline') or agent_post.headline(pl, '')}")
+        agent_post_photo_picker(mid, row, prefs, f"pre-{mid}")
+
+
 # ---------- PropertyGuru posting ----------
 def propertyguru_posting_page():
-    """Everything on PropertyGuru through AgentNet: drafts / posts the robot made, and saved listings not posted."""
+    """Everything on PropertyGuru through AgentNet: drafts to approve, posted, problems, and saved listings not on
+    PropertyGuru yet (with what will be filled in)."""
     st.title("PropertyGuru posting")
-    st.caption("Your saved listings on PropertyGuru through AgentNet (your agent account). Tick listings to save them "
-               "as drafts first (preview - no credits) or post them. Runs on your PC: a Chrome window fills AgentNet "
-               "one listing after another (about 2 minutes each). Posting = 2 Universal Credits each, on "
-               "PropertyGuru + iProperty for 60 days.")
+    st.caption("Your saved listings on PropertyGuru through AgentNet (your agent account). Save listings as drafts "
+               "first (no credits), check each draft below, then approve. Runs on your PC: a Chrome window fills "
+               "AgentNet one listing after another (about 2 minutes each). Posting costs 2 Universal Credits for a "
+               "rental, 6 for a sale - on PropertyGuru + iProperty for 60 days.")
     agent_post, on_pc, s, results = agent_post_state()
     if agent_post_busy(s):
         agent_post_progress(agent_post, on_pc)
@@ -483,42 +656,52 @@ def propertyguru_posting_page():
     except Exception as e:
         st.warning(f"Couldn't load saved listings ({str(e).splitlines()[0]}).")
         return
+    import market_check
+    market = load_market_check(db)
+    prefs = agent_post.load_prefs(db)  # your photo / wording choices
+    mine = {mid: d for mid, d in results.items() if mid in rows}
+    drafts = sorted(((m, d) for m, d in mine.items() if d.get("state") == "draft"), key=lambda x: -(x[1].get("at") or 0))
+    posted = sorted(((m, d) for m, d in mine.items() if d.get("state") in ("posted", "check")),
+                    key=lambda x: -(x[1].get("posted_at") or x[1].get("at") or 0))
+    problems = [(m, d) for m, d in mine.items() if d.get("state") == "error"]
 
-    # ----- on AgentNet: what the robot made -----
-    st.subheader("📤 On AgentNet")
-    made = sorted(((mid, d) for mid, d in results.items() if mid in rows),
-                  key=lambda x: -(x[1].get("posted_at") or x[1].get("at") or 0))
-    counts = {k: sum(1 for _, d in made if d.get("state") == k) for k in ("draft", "posted", "check", "error")}
-    st.caption(f"{counts['draft']} draft(s) · {counts['posted']} posted · {counts['check']} to check · "
-               f"{counts['error']} couldn't")
-    if made:
-        word = {"posted": "✅ Posted", "draft": "📝 Draft", "check": "⚠️ Check", "error": "❌ Problem"}
-        table = pd.DataFrame([{
-            "Status": word.get(d.get("state"), d.get("state")),
-            "Place": rows[mid].get("place"), "Owner": rows[mid].get("owner_name"),
-            "Rent / Sale": rows[mid].get("listing_type"), "Price (RM)": rows[mid].get("price_rm"),
-            "Headline": d.get("headline"), "Problem": d.get("error") or d.get("note"),
-            "AgentNet": d.get("edit_url"),
-            "When": datetime.fromtimestamp(d.get("posted_at") or d.get("at") or 0, MYT).strftime("%d %b %H:%M"),
-        } for mid, d in made])
-        picked = st.dataframe(table, hide_index=True, width="stretch", on_select="rerun", selection_mode="multi-row",
-                              key="ap-made", height=min(420, 38 + 35 * len(table)),
-                              column_config={"Price (RM)": st.column_config.NumberColumn(format="%,d"),
-                                             "Headline": st.column_config.TextColumn(width="medium"),
-                                             "AgentNet": st.column_config.LinkColumn(display_text="Open ↗")})
-        sel = [made[i][0] for i in picked.selection.rows if i < len(made)]
-        if sel:
-            agent_post_actions(sel, "ap-made-act", results)
-            if len(sel) == 1:
-                agent_post_detail(results[sel[0]])
-        else:
-            st.caption("☝️ Tick listings to post their drafts (or redo them). Tick one to see its preview.")
+    # ----- drafts to approve -----
+    st.subheader(f"📝 Drafts waiting for your OK ({len(drafts)})")
+    if not drafts:
+        st.caption("No drafts - tick listings at the bottom and press **Save as drafts**.")
+    for mid, d in drafts:
+        agent_post_card(mid, d, rows[mid], results, rows, prefs)
+    if len(drafts) > 1:
+        with st.container(border=True):
+            st.markdown("**All drafts at once**")
+            agent_post_actions([m for m, _ in drafts], "ap-all-drafts", results, rows)
+
+    # ----- posted -----
+    st.subheader(f"✅ Posted ({len(posted)})")
+    if posted:
+        st.dataframe(pd.DataFrame([{
+            "Status": "✅ Posted" if d.get("state") == "posted" else "⚠️ Check in AgentNet",
+            "Place": rows[m].get("place"), "Rent / Sale": rows[m].get("listing_type"),
+            "Price (RM)": rows[m].get("price_rm"), "Headline": d.get("headline"),
+            "Posted": datetime.fromtimestamp(d.get("posted_at") or d.get("at") or 0, MYT).strftime("%d %b %H:%M"),
+            "AgentNet": d.get("live_url") or d.get("edit_url")} for m, d in posted]),
+            hide_index=True, width="stretch",
+            column_config={"Price (RM)": st.column_config.NumberColumn(format="%,d"),
+                           "AgentNet": st.column_config.LinkColumn(display_text="Open ↗")})
     else:
-        st.info("Nothing on AgentNet yet - tick listings below.")
+        st.caption("Nothing posted through the robot yet.")
 
-    # ----- saved listings not on AgentNet yet -----
+    # ----- problems -----
+    if problems:
+        st.subheader(f"❌ Couldn't make ({len(problems)})")
+        for mid, d in problems:
+            with st.expander(f"{rows[mid].get('place')} - {d.get('error', '')[:90]}"):
+                agent_post_detail(d)
+
+    # ----- saved listings not on PropertyGuru yet -----
     st.subheader("🏠 Saved listings not on PropertyGuru yet")
-    waiting = [r for mid, r in rows.items() if mid not in results or results[mid].get("state") == "error"]
+    waiting = sorted((r for mid, r in rows.items() if mid not in mine or mine[mid].get("state") == "error"),
+                     key=lambda r: r.get("posted_at") or "", reverse=True)
     if not waiting:
         st.caption("All saved listings have a draft or are posted.")
         return
@@ -534,14 +717,53 @@ def propertyguru_posting_page():
                                          "Photos": st.column_config.NumberColumn(
                                              help="PropertyGuru needs at least 5 photos")})
     sel = [waiting[i]["message_id"] for i in picked.selection.rows if i < len(waiting)]
-    if sel:
-        few = [rows[i].get("place") for i in sel
-               if sum(1 for p in rows[i].get("photo_paths") or [] if p.lower().endswith(".jpg")) < 5]
-        if few:
-            st.warning(f"Fewer than 5 photos (PropertyGuru needs 5) - these will be skipped: {', '.join(few)}")
-        agent_post_actions(sel, "ap-wait-act", results)
-    else:
-        st.caption("☝️ Tick listings to save them as drafts (preview) or post them.")
+    if not sel:
+        st.caption("☝️ Tick listings to see what will be filled in, then save them as drafts.")
+        return
+    st.markdown("**What the robot will fill in**")
+    for mid in sel[:6]:
+        agent_post_preview(rows[mid], market, prefs)
+    if len(sel) > 6:
+        st.caption(f"…and {len(sel) - 6} more.")
+    agent_post_actions(sel, "ap-wait-act", results, rows)
+
+
+def edit_listings_table(shown):
+    """Saved listings, editable: Unit number, Type, Rent price, Sale price, Furnish (Fully furnished / Partial /
+    Bare). Save writes the changed listings (listing_edits.py)."""
+    import listing_edits
+    base = pd.DataFrame([{
+        "Date": r["_date"].strftime("%d %b"), "Owner": r.get("owner_name"), "Place": r.get("place"),
+        "Unit number": r.get("unit_no") or "",
+        "Type": r["_category"] if r["_category"] in listing_edits.TYPES else None,
+        "Rent Price (RM)": r.get("price_rm") if r.get("listing_type") == "Rent" else r.get("rental_rm"),
+        "Sale Price (RM)": r.get("price_rm") if r.get("listing_type") != "Rent" else None,
+        "Furnish": listing_edits.furnish_choice(r.get("furnishing")),
+    } for r in shown])
+    st.caption("Change the white columns, then press **Save changes**. Sale price filled = for sale (the rent then "
+               "means what the tenant pays); only a rent = for rent. A changed listing is compared with PropertyGuru "
+               "again by itself.")
+    edited = st.data_editor(
+        base, hide_index=True, width="stretch", height=480, key="sl-editor",
+        disabled=["Date", "Owner", "Place"],
+        column_config={
+            "Type": st.column_config.SelectboxColumn(options=listing_edits.TYPES),
+            "Rent Price (RM)": st.column_config.NumberColumn(min_value=0, step=100, format="%,d"),
+            "Sale Price (RM)": st.column_config.NumberColumn(min_value=0, step=1000, format="%,d"),
+            "Furnish": st.column_config.SelectboxColumn(options=list(listing_edits.FURNISH))})
+    changed = [i for i in range(len(base)) if not base.iloc[i].equals(edited.iloc[i])]
+    if st.button(f"💾 Save changes ({len(changed)})", type="primary", disabled=not changed, key="sl-save"):
+        saved = 0
+        for i in changed:
+            e = edited.iloc[i]
+            num = lambda v: None if pd.isna(v) or not v else v  # noqa: E731
+            saved += bool(listing_edits.save(db, shown[i], listing_edits.row_changes(
+                shown[i], unit=(e["Unit number"] or "").strip(), ptype=e["Type"], rent=num(e["Rent Price (RM)"]),
+                sale=num(e["Sale Price (RM)"]), furnish=e["Furnish"])))
+        load_owner_listings.clear()
+        st.session_state.pop("sl-editor", None)
+        st.toast(f"Saved {saved} listing{'s' * (saved != 1)}")
+        st.rerun()
 
 
 def saved_listings_tab():
@@ -568,8 +790,15 @@ def saved_listings_tab():
     for r in rows:
         r["_category"] = property_category(r.get("property_type"), r.get("place"), r.get("message_text"), condos)
 
-    f1, f2, f3, f4 = st.columns([1, 1.5, 2, 2])
+    for r in rows:  # the day it was posted in the chat (Malaysia time)
+        r["_date"] = pd.to_datetime(r.get("posted_at"), utc=True).tz_convert(MYT).date()
+    f1, f2, f3, f4, f5 = st.columns([1, 1.5, 1.8, 1.7, 1.5])
     kind = f1.radio("Rent / Sale", ["All", "Rent", "Sale"], horizontal=True)
+    days = sorted(r["_date"] for r in rows)
+    picked_days = f5.date_input("Date", (days[0], days[-1]), min_value=days[0], max_value=days[-1],
+                                format="DD/MM/YYYY", key="sl-dates",
+                                help="Posted in the chat between these days - pick one day twice for just that day")
+    d_from, d_to = (tuple(picked_days) * 2)[:2] if picked_days else (days[0], days[-1])
     cats = sorted({r["_category"] for r in rows}, key=lambda c: (c == "Unknown", c))
     pick_cats = f2.multiselect("Property type", cats, placeholder="All types",
                                help="Condo, shop, office, factory, land… worked out from the listing's own type, its "
@@ -582,16 +811,29 @@ def saved_listings_tab():
              if (kind == "All" or r.get("listing_type") == kind)
              and (not pick_cats or r["_category"] in pick_cats)
              and (not r.get("price_rm") or pr[0] <= r["price_rm"] <= pr[1])
+             and d_from <= r["_date"] <= d_to
              and (not text or text.lower() in " ".join(str(r.get(k) or "") for k in
                                                        ("place", "phones", "sender_phone", "message_text")).lower())]
-    st.caption(f"{len(shown):,} of {len(rows):,} listings")
+    shown.sort(key=lambda r: (r.get("posted_at") or "", r["message_id"]), reverse=True)  # newest on top
+    st.caption(f"{len(shown):,} of {len(rows):,} listings · newest first")
 
     # ----- compare with PropertyGuru (runs on the PC: market_check.py) -----
     import market_check
     market = load_market_check(db)
     on_pc = (ROOT_DIR / "market_check.py").exists() and bool(os.environ.get("SUPABASE_SECRET_KEY"))
     mstat = market_check.status() if on_pc else (blast_remote_status(db).get("market_check") or {})
-    m1, m2 = st.columns([1, 3])
+    m0, m1, m2 = st.columns([1, 1, 2])
+    not_yet = [r for r in shown if r["message_id"] not in market]  # never compared
+
+    def compare(which):
+        ids = [r["message_id"] for r in which]
+        if on_pc:
+            market_check.start(ids)
+        else:
+            market_check.request(db, ids)
+            st.session_state.market_asked = True
+        st.rerun()
+
     if mstat.get("state") == "running" and datetime.now().timestamp() - mstat.get("at", 0) < 600:
         @st.fragment(run_every="5s")
         def market_progress():
@@ -603,19 +845,18 @@ def saved_listings_tab():
                     f"{s.get('text', '')}")
         with m2:
             market_progress()
-    elif m1.button(f"🔍 Compare with PropertyGuru & iProperty ({len(shown)})", disabled=not shown,
-                   help="New and changed listings are compared by themselves every few minutes (when the PC is "
-                        "on) - press this to compare the listings shown again now. "
-                        "For each listing shown: finds it on PropertyGuru and iProperty, reads the current rent / sale prices and "
-                        "sizes there, and says whether the owner's price is OK to post. Runs on your PC (a Chrome "
-                        "window opens) - about 20 seconds per property."):
-        ids = [r["message_id"] for r in shown]
-        if on_pc:
-            market_check.start(ids)
-        else:
-            market_check.request(db, ids)
-            st.session_state.market_asked = True
-        st.rerun()
+    else:
+        how = ("For each listing: finds it on PropertyGuru and iProperty, reads the current rent / sale prices and "
+               "sizes there, and says whether the owner's price is OK to post. Runs on your PC (a Chrome window "
+               "opens) - about 20 seconds per property. New and changed listings are also compared by themselves "
+               "every few minutes when the PC is on.")
+        if m0.button(f"🔍 Compare new ones ({len(not_yet)})", disabled=not not_yet, type="primary",
+                     help="Only the listings shown that were never compared. " + how):
+            compare(not_yet)
+        if m1.button(f"🔄 Compare all ({len(shown)})", disabled=not shown,
+                     help="Every listing shown again, also ones compared before (prices on PropertyGuru change). "
+                          + how):
+            compare(shown)
     if st.session_state.get("market_asked") and not on_pc:
         m2.caption("⏳ Sent to your PC - results appear here within a few minutes (if the PC is on).")
 
@@ -625,6 +866,7 @@ def saved_listings_tab():
     ap_word = {"posted": "✅ Posted", "draft": "📝 Draft", "check": "⚠️ Check", "error": "❌ Problem"}
     # Left: the owner's listing | right: PropertyGuru & iProperty
     table = pd.DataFrame([{
+        "Date": r["_date"],
         "Owner": r.get("owner_name"),
         "Number": (r.get("phones") or "").replace("; ", ", ") or r.get("sender_phone"),
         "Place": r.get("place"),
@@ -645,9 +887,16 @@ def saved_listings_tab():
         "Already listed?": (market.get(r["message_id"]) or {}).get("same_unit_url"),
         "On PropertyGuru": ap_word.get((ap_results.get(r["message_id"]) or {}).get("state"), ""),
     } for r in shown])
+    # ----- edit mode: correct unit number, type, prices, furnishing right in the table -----
+    if st.toggle("✏️ Edit", key="sl-edit", help="Correct unit number, type, rent / sale price and furnishing. "
+                                                "Your corrections stay even when the chat is scanned again."):
+        edit_listings_table(shown)
+        return
     picked = st.dataframe(table, hide_index=True, width="stretch", height=480, on_select="rerun",
                           selection_mode="multi-row", key="saved_listings_table",
-                          column_config={"Place": st.column_config.TextColumn(width="medium"),
+                          column_config={"Date": st.column_config.DateColumn(
+                                             format="DD MMM YYYY", help="Posted in the chat"),
+                                         "Place": st.column_config.TextColumn(width="medium"),
                                          "Rent Price (RM)": st.column_config.NumberColumn(
                                              format="%,d", help="Monthly rent - for a sale, the rental it comes "
                                                                 "with (sold tenanted)"),
@@ -676,7 +925,8 @@ def saved_listings_tab():
         return
     # ticked listings -> PropertyGuru: save as drafts (preview) / post (see also the PropertyGuru posting page)
     st.markdown(f"**{len(sel)} ticked** → PropertyGuru (AgentNet)")
-    agent_post_actions([shown[i]["message_id"] for i in sel], "sl-ap", ap_results)
+    agent_post_actions([shown[i]["message_id"] for i in sel], "sl-ap", ap_results,
+                       {r["message_id"]: r for r in shown})
     if len(sel) > 1:
         st.caption("Tick just one row to see its description and pictures.")
         return
@@ -911,14 +1161,16 @@ def scan_chats_tab():
         default = []
     picked = c1.multiselect("Chats to scan (newest first)", options, default, format_func=label.get,
                             key=f"pick-{kind}")
-    days = st.slider("Messages from the last N days", 1, 365, 60)
+    days = scan_days("pc")
     read_pictures = st.checkbox("Read WhatsApp screenshots and PDFs", value=True,
                                 help="Screenshots of WhatsApp chats and PDF files are read on this PC (about 1-3 "
                                      "seconds each); ordinary photos are skipped but still attached. In chats where "
                                      "you put a '.' between owners, everything between two dots counts as one "
                                      "owner (one number, possibly several properties).")
 
-    if picked and st.button("Scan messages", type="primary"):
+    if not picked:
+        st.caption("☝️ Pick at least one chat to scan.")
+    if st.button("Scan messages", type="primary", disabled=not picked):
         import wa_scan
         bar = st.progress(0.0, text="Starting…")
         st.session_state.wa_result = wa_scan.scan(
@@ -955,6 +1207,21 @@ def scan_chats_tab():
         "Posted": datetime.fromtimestamp(l["posted_at"], MYT).strftime("%Y-%m-%d %H:%M"),
         "From picture": "📷" if l.get("from_picture") else "",
         "Chat": l["chat"], "Message": l["text"][:200]} for l in listings]), hide_index=True, width="stretch")
+
+
+def scan_days(key):
+    """Which messages to scan: Today (since midnight, Malaysia time) / the last few days / any number of days.
+    -> days back (a fraction for Today)."""
+    choice = st.radio("Messages from", ["Today", "Last 3 days", "Last 7 days", "Last 30 days", "Last 60 days",
+                                        "Custom"], index=0, horizontal=True, key=f"scan-days-{key}",
+                      help="A scan replaces what earlier scans saved for the same chats and days, so scanning "
+                           "Today again is safe")
+    if choice == "Today":
+        now = datetime.now(MYT)
+        return max((now - now.replace(hour=0, minute=0, second=0, microsecond=0)).total_seconds(), 60) / 86400
+    if choice == "Custom":
+        return st.number_input("Days back", 1, 365, 14, key=f"scan-days-n-{key}")
+    return int(choice.split()[1])
 
 
 def scan_chats_remote():
@@ -1043,10 +1310,12 @@ def scan_chats_remote():
         default = []
     picked = c1.multiselect("Chats to scan (newest first)", options, default, format_func=label.get,
                             key=f"rpick-{kind}")
-    days = st.slider("Messages from the last N days", 1, 365, 60)
+    days = scan_days("online")
     read_pictures = st.checkbox("Read WhatsApp screenshots and PDFs", value=True,
                                 help="Done on your PC (about 1-3 seconds each); ordinary photos are attached only.")
-    if picked and st.button("Scan messages", type="primary"):
+    if not picked:
+        st.caption("☝️ Pick at least one chat to scan.")
+    if st.button("Scan messages", type="primary", disabled=not picked):
         wa_scan.request(db, "wa_scan", {"chats": picked, "days": days, "read_pictures": read_pictures,
                                         "by": st.session_state.get("email") or "online dashboard"})
         st.rerun()
@@ -1740,7 +2009,7 @@ def ai_call_page():
         st.info("No calls checked yet - press **Check calls**." if on_pc else
                 "No calls here yet - press **Check calls**, or wait a minute for your PC to copy its results up.")
         return
-    remote_ticks = ai_call_remote.load_ticks(db)
+    remote_ticks = load_ai_ticks(db)  # kept for 30 s: a click that only opens a call doesn't fetch them again
     ticks = {**ai_call.load_ticks(), **remote_ticks} if on_pc else remote_ticks
 
     def save_ticks(changed):
@@ -1748,12 +2017,20 @@ def ai_call_page():
         ai_call_remote.save_ticks(db, changed)
         if on_pc:
             ai_call.save_ticks({**ai_call.load_ticks(), **changed})
+        load_ai_ticks.clear()
     df = pd.DataFrame(rows)
     for c in ("said", "reason", "heard", "ipline", "full", "called", "verdict"):
         df[c] = df[c].fillna("") if c in df else ""
     # Only what the person said after "Do you want to sell or rent your property?" - no hello / bye
     df["ipline_said"] = [ai_call.after_q1(turns) if isinstance(turns, list) else ""
                          for turns in (df["turns"] if "turns" in df else [None] * len(df))]
+    # The same answer as each hearing got it (after the question, no hello / bye): their own voice clips, the clips
+    # heard as Chinese (Chinese answers come out as English-sounding nonsense in the first), and ipline's text
+    turns_col = df["turns"] if "turns" in df else [None] * len(df)
+    df["english"] = [ai_call.after_q1(t, "heard") if isinstance(t, list) else "" for t in turns_col]
+    zh_turns = [ai_call.after_q1(t, "heard_zh") if isinstance(t, list) else "" for t in turns_col]
+    df["chinese"] = [c if isinstance(c, str) and c else z
+                     for c, z in zip(df["chinese"] if "chinese" in df else [""] * len(df), zh_turns)]
     df["said"] = df.said.map(ai_call.clean_said)
     df["ai_want"] = df.verdict == "interested"
     df["keep"] = [ticks.get(i, w) for i, w in zip(df.call_id, df.ai_want)]
@@ -1795,7 +2072,8 @@ def ai_call_page():
     table = pd.DataFrame({
         "✔ Keep": view.keep.map({True: "✅", False: "⬜"}).values, "Phone": view.phone.values,
         "AI says": view.ai_want.map({True: "✅ Want", False: "❌ Fake"}).values,
-        "We heard": view.said.values, "ipline heard": view.ipline_said.values, "Why": view.reason.values,
+        "English": view.english.values, "Chinese": view.chinese.values, "ipline": view.ipline_said.values,
+        "Why": view.reason.values,
         "Called": view.called.values, "Sec": view.seconds.values,
         "Checked by me": view.reviewed.map({True: "✔", False: ""}).values})
     st.caption("👆 Click a **number** (or anywhere on its row) to listen to that call · click the **✔ Keep** box "
@@ -1828,10 +2106,11 @@ def ai_call_page():
         table, hide_index=True, width="stretch", height=min(650, 38 + 35 * len(table)),
         on_select=on_click, selection_mode="single-cell",
         column_config={"✔ Keep": st.column_config.TextColumn(width="small"),
-                       "We heard": st.column_config.TextColumn(width="large",
-                                                               help="What the person said, as we heard it"),
-                       "ipline heard": st.column_config.TextColumn(width="large",
-                                                                   help="ipline's own text of the person's words"),
+                       "English": st.column_config.TextColumn(
+                           width="large", help="Their own voice clips heard again (English / Malay)"),
+                       "Chinese": st.column_config.TextColumn(
+                           width="large", help="The same clips heard as Chinese - right when they spoke Chinese"),
+                       "ipline": st.column_config.TextColumn(width="large", help="ipline's own text of their words"),
                        "Why": st.column_config.TextColumn(width="medium")},
         key=tbl_key)
 
@@ -1848,9 +2127,9 @@ def ai_call_page():
                        disabled=not keep, on_click="ignore")
     d2.button(f"📣 Send to WhatsApp blast ({len(keep)})", disabled=not keep, on_click=to_blast, args=(keep,),
               help="Opens WhatsApp blast with these numbers filled in - just write the message and start")
-    d3.download_button("Download the table (Excel / CSV)",
-                       view.drop(columns=["ai_want", "reviewed", "day", "turns"], errors="ignore")
-                       .to_csv(index=False).encode("utf-8-sig"),
+    shown_table = view.drop(columns=["ai_want", "reviewed", "day", "turns"], errors="ignore")
+    d3.download_button("Download the table (Excel / CSV)",  # made only when pressed (1 MB+ on every click otherwise)
+                       lambda: shown_table.to_csv(index=False).encode("utf-8-sig"),
                        f"AI call {datetime.now():%Y-%m-%d}.csv", "text/csv", on_click="ignore")
     st.caption("The download uses the calls shown with the filters above.")
 
@@ -1860,9 +2139,10 @@ def ai_call_page():
     ids = list(view.call_id)
     if st.session_state.get("aicall_box") not in ids:
         st.session_state.aicall_box = ids[0] if ids else None
-    pick = st.selectbox("Call", ids, key="aicall_box", format_func=lambda i: (
-        lambda r: f"{r.phone} · {r.called} · {'✅ Want' if r.ai_want else '❌ Fake'} · {r.said[:60]}")(
-        view[view.call_id == i].iloc[0]))
+    labels = {i: f"{p} · {c} · {'✅ Want' if w else '❌ Fake'} · {s[:60]}"  # all at once (one lookup per call was slow)
+              for i, p, c, w, s in zip(view.call_id, view.phone, view.called, view.ai_want,
+                                       [e or z or ip for e, z, ip in zip(view.english, view.chinese, view.ipline_said)])}
+    pick = st.selectbox("Call", ids, key="aicall_box", format_func=labels.get)
     jump = st.session_state.pop("aicall_scroll", False)
     if pick:
         r = view[view.call_id == pick].iloc[0]
@@ -1873,19 +2153,21 @@ def ai_call_page():
             st.audio(str(f), format="audio/mpeg", autoplay=jump)
         else:
             st.caption("Recording not here yet." + ("" if on_pc else " Your PC copies it up within a minute."))
-        keep_now = bool(ticks.get(pick, r.ai_want))
-        if st.toggle("✔ Keep this number", value=keep_now, key=f"aicall-keep-{pick}") != keep_now:
-            save_ticks({pick: not keep_now})
+        keep_this = bool(ticks.get(pick, r.ai_want))  # own name: keep_now is the table's list (used by on_click)
+        if st.toggle("✔ Keep this number", value=keep_this, key=f"aicall-keep-{pick}") != keep_this:
+            save_ticks({pick: not keep_this})
             st.rerun()
         st.caption("Three hearings of the same call - phone lines blur similar words, so they can differ. "
                    "The AI goes by what they agree on; the recording above is the real thing.")
-        l1, l2, l3 = st.columns(3)
+        l1, l2, l3, l4 = st.columns(4)
         l1.markdown("**Person's voice clips, re-heard**")
         l1.text(r.heard or "(nothing)")
-        l2.markdown("**Whole recording, re-heard**")
-        l2.text(r.full or "(nothing)")
-        l3.markdown("**ipline's own text**")
-        l3.text(r.ipline or "(nothing)")
+        l2.markdown("**Heard as Chinese**")
+        l2.text(r.chinese.replace(" / ", "\n") if r.chinese else "(not heard as Chinese)")
+        l3.markdown("**Whole recording, re-heard**")
+        l3.text(r.full or "(nothing)")
+        l4.markdown("**ipline's own text**")
+        l4.text(r.ipline or "(nothing)")
     if jump:  # scroll the page down to this section
         st.iframe("<script>setTimeout(() => {const el = window.parent.document.getElementById('aicall-listen');"
                   "if (el) el.scrollIntoView({behavior: 'smooth', block: 'start'});}, 300);</script>", height=1)
@@ -1894,6 +2176,13 @@ def ai_call_page():
 def time_now():
     import time
     return time.time()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_ai_ticks(_db):
+    """Your ticks from Supabase (shared by the PC and the online page) - cleared whenever you tick."""
+    import ai_call_remote
+    return ai_call_remote.load_ticks(_db)
 
 
 @st.cache_data(ttl=60, show_spinner="Loading checked calls…")
