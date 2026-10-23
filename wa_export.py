@@ -19,8 +19,18 @@ def folder_name(i, listing):
     return f"{i:03d}_{re.sub(r'[^A-Za-z0-9 ]+', '', listing.get('place') or 'listing').strip()[:40] or 'listing'}"
 
 
-def describe(l):
-    """Plain-text description of one listing (scan result or Supabase row, see from_row)."""
+def hide_numbers(text):
+    """Every phone number in the text -> "[number hidden]" (prices, sizes, unit numbers stay)."""
+    from phone_filter import CANDIDATE, extract_from_text
+    return CANDIDATE.sub(lambda m: "[number hidden]" if any(n for n, _, _ in extract_from_text(m.group(0)))
+                         else m.group(0), text or "")
+
+
+def describe(l, hide_phones=False):
+    """Plain-text description of one listing (scan result or Supabase row, see from_row).
+    hide_phones: a copy to share - no owner / sender numbers, and numbers in the message hidden."""
+    if hide_phones:
+        l = {**l, "text": hide_numbers(l.get("text")), "address": hide_numbers(l.get("address")) or None}
     money = f"RM {l['price_rm']:,.0f}" if l.get("price_rm") else "-"
     rooms = " ".join(x for x in (f"{l['bedrooms']} bedrooms" if l.get("bedrooms") else "",
                                  f"{l['bathrooms']} bathrooms" if l.get("bathrooms") else "") if x)
@@ -34,7 +44,7 @@ def describe(l):
     rental = f"RM {l['rental_rm']:,.0f} / month" if l.get("rental_rm") else None
     return "\r\n".join([
         f"Owner:       {l.get('owner_name') or '-'}",
-        f"Phone:       {phones}",
+        *([] if hide_phones else [f"Phone:       {phones}"]),
         f"Type:        {l.get('type') or '-'}",
         f"Price:       {money}{' / month' if l.get('type') == 'Rent' and l.get('price_rm') else ''}",
         *([f"Rental:      {rental} (current tenant)"] if rental else []),
@@ -43,7 +53,8 @@ def describe(l):
         f"Size:        {size}",
         f"Rooms:       {rooms or '-'}",
         f"Furnishing:  {l.get('furnishing') or '-'}",
-        f"Sent by:     {(l.get('sender_name') or '-')} {('(' + l['sender_phone'] + ')') if l.get('sender_phone') else ''}",
+        *([] if hide_phones else [f"Sent by:     {(l.get('sender_name') or '-')} "
+                                  f"{('(' + l['sender_phone'] + ')') if l.get('sender_phone') else ''}"]),
         f"Chat:        {l.get('chat') or '-'}",
         f"Posted:      {when}",
         "",
@@ -67,15 +78,20 @@ def from_row(r):
 
 
 def file_name(n, name):
-    """photo_01.jpg / document_02.pdf - keeps PDFs as PDFs."""
-    return f"document_{n:02d}.pdf" if str(name).lower().endswith(".pdf") else f"photo_{n:02d}.jpg"
+    """photo_01.jpg / document_02.pdf / video_03.mp4 - keeps PDFs as PDFs and videos as videos."""
+    ext = str(name).lower().rsplit(".", 1)[-1]
+    if ext == "pdf":
+        return f"document_{n:02d}.pdf"
+    if ext in ("mp4", "mov"):
+        return f"video_{n:02d}.{ext}"
+    return f"photo_{n:02d}.jpg"
 
 
-def listing_zip(listing, files):
-    """One listing: description.txt + its pictures / PDFs (files = list of (original name, bytes))."""
+def listing_zip(listing, files, hide_phones=False):
+    """One listing: description.txt + its pictures / PDFs / videos (files = list of (original name, bytes))."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("description.txt", describe(listing).encode("utf-8-sig"))
+        z.writestr("description.txt", describe(listing, hide_phones).encode("utf-8-sig"))
         for n, (name, data) in enumerate(files, 1):
             z.writestr(file_name(n, name), data)
     return buf.getvalue()

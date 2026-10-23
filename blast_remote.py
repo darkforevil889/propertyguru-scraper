@@ -89,6 +89,16 @@ def heartbeat(db):
         data["market_check"] = market_check.status()
     except Exception:
         pass
+    try:  # PropertyGuru posting (AgentNet) progress, shown on the online Saved listings tab
+        import agent_post
+        data["agent_post"] = agent_post.status()
+    except Exception:
+        pass
+    try:  # Google Map Extractor progress, shown on the online page
+        import gmaps
+        data["gmaps"] = gmaps.status()
+    except Exception:
+        pass
     db.table("pc_status").upsert({"name": "pc", "data": data}).execute()
 
 

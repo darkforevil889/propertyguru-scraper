@@ -79,7 +79,18 @@ def find(place):
     far = FAR.search(place or "")
     matches = []
     compact = re.sub(r"\W", "", q.lower())
-    for prop in price_lookup.find_property(q, limit=10):
+    # "Axon Bukit Bintang" finds nothing, "Axon" does: drop words from the end (the area people add after the
+    # name) - but then the dropped words must be in the property's address (Axon in Bukit Bintang, not elsewhere)
+    parts, found = q.split(), []
+    for cut in range(len(parts), 0, -1):
+        head, tail = " ".join(parts[:cut]), " ".join(parts[cut:]).lower()
+        if len(head) < 3:
+            break
+        found = [p for p in price_lookup.find_property(head, limit=10)
+                 if not tail or tail in f"{p['name']} {p['address']}".lower()]
+        if found:
+            break
+    for prop in found:
         name_words = set(re.findall(r"[a-z0-9]+", prop["name"].lower()))
         where = f"{prop['name']} {prop['address']}".lower()
         joined = re.sub(r"\W", "", prop["name"].lower())  # "PV 128" = "Platinum Mondrian PV128"
@@ -393,14 +404,69 @@ def same_kind(listing_category, units):
     return out
 
 
+STUDIO = re.compile(r"\bstudio\b", re.I)
+
+
+def rooms_wanted(listing):
+    """The owner's rooms as PropertyGuru writes them (a studio is -1). Owners say "one room studio" for both, so a
+    studio matches studio and 1-bedroom units. -> ({-1, 0, 1} / {2}, "studio" / "2-bedroom") or (None, None)."""
+    if STUDIO.search(f"{listing.get('message_text') or ''} {listing.get('property_type') or ''}"):
+        return {-1, 0, 1}, "studio / 1-bedroom"
+    if listing.get("bedrooms"):
+        return {int(listing["bedrooms"])}, f"{listing['bedrooms']}-bedroom"
+    return None, None
+
+
+def _beds(u):
+    try:
+        return int(u.get("beds"))
+    except (TypeError, ValueError):
+        return None
+
+
+def similar_units(listing, units, sized):
+    """Units like the owner's: the same size (within 20%) when the owner gave one, else - owner said only "studio"
+    or "2 bedroom" - the same rooms. -> (units, words for them)."""
+    if not sized:
+        return [], ""
+    sqft = listing.get("sqft")
+    if sqft:
+        return [u for u in units if u["sqft"] and abs(u["sqft"] - sqft) <= 0.2 * sqft], "similar-size units"
+    want, word = rooms_wanted(listing)
+    if want:
+        return [u for u in units if _beds(u) in want], f"{word} units"
+    return [], ""
+
+
+def estimate(listing, units):
+    """The owner left out the size or the rooms: what's usual for the other one there on PropertyGuru / iProperty.
+    -> {'est_sqft' or 'est_beds', 'est_note'} or {}."""
+    import collections
+    want, word = rooms_wanted(listing)
+    sqft = listing.get("sqft")
+    if not sqft and want:
+        sizes = [u["sqft"] for u in units if u["sqft"] and _beds(u) in want]
+        if sizes:
+            s = int(statistics.median(sizes))
+            return {"est_sqft": s, "est_note": f"about {s:,} sf - the usual size of {word} units there online "
+                                               f"({min(sizes):,}-{max(sizes):,} sf, {len(sizes)} listed)"}
+    if sqft and not want:
+        near = [_beds(u) for u in units if u["sqft"] and abs(u["sqft"] - sqft) <= 0.1 * sqft and _beds(u) is not None]
+        if near:
+            b = collections.Counter(near).most_common(1)[0][0]
+            rooms = "a studio" if b <= 0 else f"{b} bedroom{'s' * (b > 1)}"
+            return {"est_beds": b, "est_note": f"usually {rooms} at this size ({sqft:,} sf) there online"}
+    return {}
+
+
 def lowest5(listing, units):
-    """The 5 cheapest PropertyGuru units of the same kind - same size (within 20%) when there are any.
-    -> (units, True if they are same-size)."""
+    """The 5 cheapest PropertyGuru units of the same kind - same size (within 20%), or same rooms when the owner
+    gave no size, when there are any. -> (units, True if they are like the owner's)."""
     from wa_parser import property_category
     category = property_category(listing.get("property_type"), listing.get("place"), listing.get("message_text"))
-    pool, sqft = same_kind(category, units), listing.get("sqft")
+    pool = same_kind(category, units)
     sized = category in ("Condo / Apartment", "Unknown")  # shop / house sizes are stated differently (land vs floors)
-    similar = [u for u in pool if sized and sqft and u["sqft"] and abs(u["sqft"] - sqft) <= 0.2 * sqft]
+    similar, _ = similar_units(listing, pool, sized)
     pick = similar or pool
     keep = ("price", "sqft", "psf", "beds", "url", "type", "site", "ip_url")
     return [{k: u.get(k) for k in keep} for u in sorted(pick, key=lambda u: u["price"])[:5]], bool(similar)
@@ -444,14 +510,15 @@ def judge(listing, units, prop, left_out=0):
     # Sizes only mean the same thing for condos / apartments: for shops and houses one side often gives the land
     # area and the other the built-up area of all floors - so those are compared on the total price
     sized = category in ("Condo / Apartment", "Unknown")
-    similar = [u for u in units if sized and sqft and u["sqft"] and abs(u["sqft"] - sqft) <= 0.2 * sqft]
+    similar, similar_word = similar_units(listing, units, sized)
     basis = "price"
     if not sized:
         pool, mine, sizes = [u["price"] for u in units], price, ""
         unit_word = "units (total price - shop / house sizes are stated differently)"
-    elif sqft and len(similar) >= 3:  # same-size units: compare prices directly
-        pool, mine, unit_word = [u["price"] for u in similar], price, "similar-size units"
-        sizes = f" ({min(u['sqft'] for u in similar):,}-{max(u['sqft'] for u in similar):,} sf)"
+    elif len(similar) >= (3 if sqft else 2):  # same size (or same rooms): compare prices directly
+        pool, mine, unit_word = [u["price"] for u in similar], price, similar_word
+        sized_units = [u["sqft"] for u in similar if u["sqft"]]
+        sizes = f" ({min(sized_units):,}-{max(sized_units):,} sf)" if sized_units else ""
     elif sqft and sum(1 for u in units if u["psf"]) >= 3:  # different sizes: compare RM per sq ft
         pool, mine, unit_word, sizes, basis = [u["psf"] for u in units if u["psf"]], price / sqft, "units", "", "psf"
     else:  # no size from the owner: plain prices (sizes may differ)
@@ -491,7 +558,7 @@ def run(db, ids=None, progress=print):
     import scraper
     from wa_parser import property_category
     rows = db.table("owner_listings").select("message_id,place,address,listing_type,price_rm,sqft,property_type,"
-                                             "message_text").execute().data
+                                             "message_text,bedrooms").execute().data
     if ids:
         rows = [r for r in rows if r["message_id"] in set(ids)]
     results, cache = load_results(db), {}
@@ -566,8 +633,8 @@ def run(db, ids=None, progress=print):
                         typ = statistics.median([u["price"] for u in units]) if units else None
                         same_kind_all = same_kind(category, both[k])
                         sized = category in ("Condo / Apartment", "Unknown")  # shop / house sizes aren't like-for-like
-                        sim = [u["price"] for u in same_kind_all if sized and r.get("sqft") and u["sqft"]
-                               and abs(u["sqft"] - r["sqft"]) <= 0.2 * r["sqft"]] or [u["price"] for u in same_kind_all]
+                        sim = [u["price"] for u in similar_units(r, same_kind_all, sized)[0]] \
+                            or [u["price"] for u in same_kind_all]
                         typ = statistics.median(sim) if sim else typ
                         lists[k] = (check_cheapest(browser.data, units, typ, k == "rent", checks), same)
                         fake_urls |= {u["url"] for u in units if (u.get("check") or {}).get("exclude")}
@@ -578,6 +645,12 @@ def run(db, ids=None, progress=print):
                     for k, (units, same) in lists.items():
                         res[f"{k}_lowest"], res[f"{k}_same_size"] = units, same
                     res["owner_sqft"] = r.get("sqft")
+                    # owner gave only rooms (or only a size): what's usual for the other one there
+                    est = estimate(r, same_kind(category, both["sale"] + both["rent"])) \
+                        if category in ("Condo / Apartment", "Unknown") else {}
+                    if est:
+                        res.update(est)
+                        res["reason"] = (res.get("reason") or "") + f" Size / rooms not given: {est['est_note']}."
                     if failed:
                         res["reason"] = (res.get("reason") or "") + f" ({', '.join(failed)} didn't load this time.)"
                     # Same price as the owner's, same place = probably this very unit, already advertised (by an
@@ -624,6 +697,41 @@ def run_requests(db, log=print):
     log(f"PropertyGuru comparison started from the online page: {len(ids)} listing(s)")
 
 
+AUTO = ROOT / "data" / "market_auto.json"  # when the last automatic comparison started
+
+
+def auto(db, log=print):
+    """keeper.py, every few minutes: compare saved listings by themselves - new ones, and ones a scan changed since
+    they were last compared. Never while a comparison runs; at most every 30 minutes (so a failing run doesn't
+    keep opening Chrome)."""
+    s = status()
+    if s.get("state") == "running" and time.time() - s.get("at", 0) < 600:
+        return
+    try:
+        last = json.loads(AUTO.read_text(encoding="utf-8")).get("at", 0)
+    except (OSError, ValueError):
+        last = 0
+    if time.time() - last < 1800:
+        return
+    results = load_results(db)
+
+    def changed(r):
+        done = results.get(r["message_id"])
+        if not done:
+            return True
+        try:
+            return datetime.fromisoformat(r["scanned_at"]).timestamp() > done.get("checked_at", 0)
+        except (TypeError, ValueError):
+            return False
+
+    rows = db.table("owner_listings").select("message_id,scanned_at").execute().data
+    todo = [r["message_id"] for r in rows if changed(r)]
+    if todo:
+        _save(AUTO, {"at": time.time(), "ids": todo})
+        start(todo)
+        log(f"PropertyGuru & iProperty comparison started by itself: {len(todo)} new / changed listing(s)")
+
+
 def start(ids=None):
     """Run the comparison in the background on this PC."""
     import subprocess
@@ -634,6 +742,7 @@ def start(ids=None):
     subprocess.Popen([str(python if python.exists() else sys.executable), "-u", str(ROOT / "market_check.py")]
                      + (["--ids", *ids] if ids else []), cwd=ROOT,
                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                     env={**os.environ, "PYTHONIOENCODING": "utf-8"},  # ✅ / ❌ in the log, not a crash
                      stdout=open(ROOT / "logs" / "market_check.log", "a", encoding="utf-8"), stderr=subprocess.STDOUT)
 
 

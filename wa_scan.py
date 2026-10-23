@@ -69,13 +69,61 @@ def _digits(s):
     return re.sub(r"\D", "", s or "")
 
 
-def _chat_export(z, infos, media, prefix):
+# You introducing yourself ("Hi I'm <name> property agent here…") - that author is you, not the owner
+MY_INTRO = re.compile(r"\b(?:i'?m|i am|this is|saya)\b.{0,40}\b(?:property|real estate|hartanah)?\s*(?:agent|"
+                      r"negotiator|ejen)\b", re.I)
+
+
+# A price you quoted in the chat: "around 4-4.3k" (a range -> its top), "Around 800k~", "RM 4,500"
+QUOTE_RANGE = re.compile(r"(?:rm\s*)?(\d+(?:\.\d+)?)\s*(k|mil|m)?\s*(?:-|–|~|to)\s*(\d+(?:\.\d+)?)\s*(k|mil|m)\b",
+                         re.I)
+QUOTE_ONE = re.compile(r"\brm\s*(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(k|mil|m)?\b|\b(\d+(?:\.\d+)?)\s*(k|mil|m)\b",
+                       re.I)
+# The owner's answer pushing back on a quoted price
+OBJECTION = re.compile(r"\b(no|not|cannot|can'?t|too\s+(low|cheap)|higher|more\s+than|tak|tidak|x\s*boleh)\b", re.I)
+
+
+def _quoted_price(text):
+    def amt(num, unit):
+        v = float(num.replace(",", ""))
+        return v * {"k": 1e3, "m": 1e6, "mil": 1e6}.get((unit or "").lower(), 1)
+    if m := QUOTE_RANGE.search(text or ""):
+        top = amt(m.group(3), m.group(4))
+        return top if 300 <= top <= 500_000_000 else None
+    for m in QUOTE_ONE.finditer(text or ""):
+        v = amt(m.group(1), m.group(2)) if m.group(1) else amt(m.group(3), m.group(4))
+        if 300 <= v <= 500_000_000:
+            return v
+    return None
+
+
+def _agreed_price(lines, party_author):
+    """The owner gave no price, but you quoted one and they went on (sent the details) without pushing back - the
+    price they're OK with. -> a line for the listing, or None."""
+    if not party_author or any(_quoted_price(l["text"]) for l in lines if l["author"] == party_author):
+        return None
+    for i in range(len(lines) - 1, -1, -1):
+        l = lines[i]
+        v = _quoted_price(l["text"]) if l["author"] != party_author else None
+        if not v:
+            continue
+        reply = next((x for x in lines[i + 1:] if x["author"] == party_author), None)
+        if reply and not OBJECTION.search(reply["text"]):
+            return f"Price RM {v:,.0f} (you quoted \"{l['text'].strip()[:60]}\" and the owner went on without objecting)"
+        return None  # the last quote was argued with (or never answered) - no price
+    return None
+
+
+def _chat_export(z, infos, media, prefix, original_name=""):
     """A WhatsApp 'Export chat' ZIP (one conversation with an owner) -> (party, items): party = {'name', 'phone'} of
     the person the chat is with; items = their messages and the files THEY sent, in chat order. Your own messages
-    (questions, name card) are left out - they say nothing about the owner's property."""
+    (questions, prices you quoted, name card) are left out - they say nothing about the owner's property.
+    original_name = the ZIP's name as sent ("WhatsApp Chat - +60 19-622 9148.zip"): the export's own text file is
+    often just "_chat.txt" (iPhone), and the copy here is renamed."""
     txt = next(i for i in infos if i.filename.lower().endswith(".txt"))
-    who = EXPORT_NAME.search(Path(txt.filename).name) or EXPORT_NAME.search(Path(z.filename or "").name)
-    party_label = (who.group(1).strip() if who else "")
+    who = (EXPORT_NAME.search(Path(txt.filename).name) or EXPORT_NAME.search(original_name or "")
+           or EXPORT_NAME.search(Path(z.filename or "").name))
+    party_label = re.sub(r"[‪-‮‎‏]", "", who.group(1)).strip() if who else ""
     party = {"phone": _digits(party_label) if len(_digits(party_label)) >= 9 else None,
              "name": None if len(_digits(party_label)) >= 9 else (party_label or None)}
     files = {Path(i.filename).name: i for i in infos}
@@ -87,12 +135,34 @@ def _chat_export(z, infos, media, prefix):
             lines.append(cur)
         elif cur is not None:  # a message over several lines
             cur["text"] += "\n" + raw
-    authors = {l["author"] for l in lines}
-    if not party_label and len(authors) == 2:  # file renamed - the other person is the one who isn't you
-        party_label = sorted(authors, key=lambda a: -sum(1 for l in lines if l["author"] == a))[0]
+    authors = list(dict.fromkeys(l["author"] for l in lines))
+    me = {l["author"] for l in lines if MY_INTRO.search(l["text"])}
+
+    def find_party():
+        """Which author is the owner: the number / name from the file name, else (iPhone) the author of the
+        "end-to-end encrypted" line - it's written under the other person's name - else a "~Name" (not in your
+        contacts), else whoever isn't the one introducing themselves as an agent."""
+        for a in authors:
+            if party["phone"] and _digits(a).endswith(party["phone"][-9:]):
+                return a
+            if party["name"] and a.lstrip("~").strip().lower() == party["name"].lstrip("~").strip().lower():
+                return a
+        notice = next((l["author"] for l in lines if "end-to-end encrypted" in l["text"]), None)
+        others = [a for a in authors if a not in me]
+        for pick in ([notice] if notice and notice not in me else []) + [a for a in others if a.startswith("~")]:
+            return pick
+        if len(authors) == 2 and len(others) == 1:
+            return others[0]
+        if len(others) == 2:  # nothing else to go on: the one who wrote most
+            return sorted(others, key=lambda a: -sum(1 for l in lines if l["author"] == a))[0]
+        return None
+
+    party_author = find_party()
+    if party_author and not party["name"] and not _digits(party_author):
+        party["name"] = party_author.lstrip("~").strip()
 
     def is_party(a):
-        return (party["phone"] and _digits(a).endswith(party["phone"][-9:])) or a.strip() == party_label
+        return a == party_author
 
     items, total = [], 0
     for l in lines:
@@ -113,11 +183,18 @@ def _chat_export(z, infos, media, prefix):
                 items.append((kind, out_name, ""))
             continue
         if "end-to-end encrypted" not in l["text"] and l["text"].strip() not in ("<Media omitted>", "null"):
-            items.append(("text", None, l["text"]))
+            # "Hi, <your name>" - the owner greeting YOU: that name isn't the owner's
+            text = re.sub(r"^(\s*(hi|hello|hey|hai|dear|morning|good\s+\w+)\b[\s,!.]*)[A-Z][a-z]+\b", r"\1", l["text"],
+                          flags=re.I)
+            items.append(("text", None, text))
+    agreed = _agreed_price(lines, party_author)
+    if agreed:  # the owner's words and the price read together as one message, so the listing gets both
+        said = [t for k, f, t in items if k == "text"]
+        items = [("text", None, "\n".join(said + [agreed]))] + [x for x in items if x[0] != "text"]
     return party, items
 
 
-def _unzip(path, media, mid):
+def _unzip(path, media, mid, original_name=""):
     """A ZIP from a chat -> (party, [(kind, file name in media/ or None, text)]) for its photos / PDFs / videos /
     .txt. party is set when it's a WhatsApp chat export (see _chat_export). Files are written flat into media/
     under new names (never outside it); other file types are skipped."""
@@ -130,7 +207,7 @@ def _unzip(path, media, mid):
             if len(txts) == 1:
                 head = z.read(txts[0])[:3000].decode("utf-8", "replace")
                 if sum(1 for line in head.splitlines() if CHAT_LINE.match(line)) >= 2:
-                    return _chat_export(z, infos, media, prefix)
+                    return _chat_export(z, infos, media, prefix, original_name)
             for info in sorted(infos, key=lambda i: i.filename):
                 name = Path(info.filename).name
                 kind = ZIP_KINDS.get(Path(name).suffix.lower())
@@ -155,13 +232,26 @@ def expand_zips(msgs, got, media):
     """Replace each ZIP message by one message per file inside it (same sender and time, so a ZIP posted
     between two '.' separators belongs to that owner). A WhatsApp chat export is one owner of its own: it is
     wrapped in '.' separators and starts with the owner's number / name from the file name.
+    Photos / videos / PDFs the same person posts right after a chat export (within 3 minutes, nothing else in
+    between - e.g. the owner's unit photos) belong to that owner too.
     A ZIP that can't be opened stays as its caption."""
-    out = []
+    out, closing = [], None  # closing = (the export's ZIP message, its end separator) while it can still take photos
     for m in msgs:
+        if closing:
+            z, end = closing
+            if (m.get("has_image") or m.get("is_video") or m.get("is_pdf")) and not m.get("is_zip") \
+                    and not (m.get("body") or "").strip() and m.get("author") == z.get("author") \
+                    and 0 <= (m.get("timestamp") or 0) - (z.get("timestamp") or 0) <= 180:
+                out.append(m)  # the owner's photos, posted right after their chat
+                end["timestamp"] = m["timestamp"]  # owners' parts are sorted by time: the end stays after them
+                continue
+            out.append(end)
+            closing = None
         if not m.get("is_zip"):
             out.append(m)
             continue
-        party, inner = _unzip(media / got[m["id"]], media, m["id"]) if m["id"] in got else (None, [])
+        party, inner = (_unzip(media / got[m["id"]], media, m["id"], m.get("body") or "") if m["id"] in got
+                        else (None, []))
         caption = (m.get("body") or "").strip()
         if (caption and not caption.lower().endswith(".zip") and not party) or not inner:
             out.append({**m, "is_zip": False})  # its caption (or just the file name if it couldn't be opened)
@@ -178,7 +268,37 @@ def expand_zips(msgs, got, media):
             out.append({**plain, "id": f"{m['id']}-z{i}", "body": text or "", "photo": fname,
                         "has_image": kind == "photo", "is_pdf": kind == "pdf", "is_video": kind == "video"})
         if party:
-            out.append({**plain, "id": f"{m['id']}-s1", "body": "."})
+            closing = (m, {**plain, "id": f"{m['id']}-s1", "body": "."})
+    if closing:
+        out.append(closing[1])
+    return out
+
+
+def merge_repeats(listings, media):
+    """The same owner's same property sent twice (e.g. a chat exported and sent again) -> one listing, the first
+    one sent, with every file from both - a file that's in both (the same video) only once."""
+    import hashlib
+    from wa_parser import EXTRA_FIELDS, _same_property
+
+    def digest(p):
+        f = media / p
+        return hashlib.sha1(f.read_bytes()).hexdigest() if f.exists() else p
+
+    out = []
+    for l in sorted(listings, key=lambda l: l["posted_at"]):
+        phones = set(l.get("phones") or [])
+        same = next((o for o in out if phones & set(o.get("phones") or []) and _same_property(o, l)), None)
+        if not same:
+            out.append(l)
+            continue
+        have = {digest(p) for p in same["photos"]}
+        for p in l["photos"]:
+            if digest(p) not in have:
+                same["photos"].append(p)
+                have.add(digest(p))
+        for k in EXTRA_FIELDS + ("owner_name",):
+            if not same.get(k) and l.get(k):
+                same[k] = l[k]
     return out
 
 
@@ -239,6 +359,7 @@ def scan(db, picked, days, read_pictures, scanned_by, progress=None):
         for l in listings:
             l["photos"] = [p if isinstance(p, str) else files[p[1]] for p in l["photos"]
                            if isinstance(p, str) or p[1] in files]
+    listings = merge_repeats(listings, run_dir / "media")
     for l in listings:  # sender's number in local 01x format when possible
         nums = [n for n, _, _ in extract_from_text(l["sender_phone"] or "") if n]
         l["sender_phone"] = nums[0] if nums else l["sender_phone"]

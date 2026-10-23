@@ -85,6 +85,14 @@ def blast_sync_loop():
             import market_check  # Saved listings: "Compare with PropertyGuru" pressed online
             importlib.reload(market_check)
             market_check.run_requests(db, log)
+            if n % 20 == 11:  # every 5 minutes: new / changed saved listings compared by themselves
+                market_check.auto(db, log)
+            import agent_post  # PropertyGuru draft / post pressed online
+            importlib.reload(agent_post)
+            agent_post.run_requests(db, log)
+            import gmaps  # Google Map Extractor: "Extract" / "Stop" pressed online
+            importlib.reload(gmaps)
+            gmaps.run_requests(db, log)
             if n % 4 == 1:
                 wa_scan.sync_chats(db)
             last_wa_error = None

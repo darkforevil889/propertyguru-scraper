@@ -103,7 +103,8 @@ def _place_line(line):
     s = re.sub(r"\s+", " ", s).strip(" -:|*,.")
     # Chatty openings in private chats: "Hi bro, my unit The Conlay ..." -> "The Conlay ..."
     s = re.sub(r"^((hi|hello|hey|hai|dear|good\s*(morning|afternoon|evening)|selamat\s*\w+|bro|sis|boss|sir|"
-               r"madam|mr\.?|ms\.?|tuan|puan|encik|cik|thanks?|tq|ok)\b[\s,!.]*)+", "", s, flags=re.I)
+               r"madam|mr\.?|ms\.?|tuan|puan|encik|cik|thanks?|tq|ok(ay)?|yes|yeah|ya|yup|actually|"
+               r"(do\s+)?(u|you)\s+know)\b[\s,!.]*)+", "", s, flags=re.I)
     s = re.sub(r"^((i|we)\s+(have|got|want\s+to\s+(rent|sell))\s+|(my|our|this|the)\s+)?"
                r"(unit|condo|house|property|place|apartment|rumah)\s*(is\s+|at\s+|in\s+|@\s*)?", "", s, flags=re.I)
     # Captions on media: "Above photos for sky suite B15-06", "This is the video for ..."
@@ -122,8 +123,9 @@ def _place_line(line):
     return s[:80]
 
 
-def parse(text):
-    """Return a dict of listing fields, or None if the message doesn't look like a property listing."""
+def parse(text, need_price=True):
+    """Return a dict of listing fields, or None if the message doesn't look like a property listing.
+    need_price=False: the fields even without a price (an owner's part that has no price yet)."""
     if not text or len(text) < 10:
         return None
     phones = list(dict.fromkeys(n for n, _, _ in extract_from_text(text) if n))
@@ -162,7 +164,7 @@ def parse(text):
     elif rent_v and (not price or price < 50_000):
         price, kind = rent_v, "Rent"
     # Needs a price plus at least one other property clue to count as a listing
-    if not price or not (kind or sqft or beds or furnishing):
+    if need_price and (not price or not (kind or sqft or beds or furnishing)):
         return None
     return {"type": kind, "price_rm": price, "sqft": sqft, "bedrooms": beds, "bathrooms": baths,
             "furnishing": furnishing, "place": _place(text), "phones": phones, "rental_rm": rental}
@@ -628,7 +630,8 @@ def _owner_part(part, n, mine):
         if not (owner_phones or price):
             return []
         first = next((m for m, _ in texts), part[0])
-        fields = parse(everything) or {"type": None, "price_rm": price, "sqft": None, "bedrooms": None,
+        fields = parse(everything) or parse(everything, need_price=False) or {
+            "type": None, "price_rm": price, "sqft": None, "bedrooms": None,
                                        "bathrooms": None, "furnishing": furnishing_in(everything), "place": _place(everything),
                                        "phones": owner_phones}
         props.append(_listing(fields, first, everything, []))

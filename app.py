@@ -110,8 +110,8 @@ with st.sidebar:
         st.session_state.logged_out = True
         write_cookie("", days=0)
         st.rerun()
-    pages = ["Listings", "Condo prices", "WhatsApp listing", "WhatsApp blast", "Chat bot", "AI call", "Phone filter",
-             "Price filter"]
+    pages = ["Listings", "Condo prices", "WhatsApp listing", "PropertyGuru posting", "WhatsApp blast", "Chat bot",
+             "AI call", "Google Map Extractor", "Phone filter", "Price filter"]
     if st.session_state.get("page") not in pages:  # e.g. a page that was renamed since
         st.session_state.page = {"WhatsApp": "WhatsApp listing"}.get(st.session_state.get("page"), pages[0])
     tool = st.radio("Page", pages, key="page")
@@ -361,6 +361,189 @@ def signed_urls(paths, ttl=3600):
     return {p: cache[p][0] for p in paths if p in cache}
 
 
+def agent_post_state():
+    """PropertyGuru posting (agent_post.py, runs on the PC) -> (module, on_pc, status, {message_id: result})."""
+    import agent_post
+    on_pc = (ROOT_DIR / "agent_post.py").exists() and bool(os.environ.get("AGENTNET_USER"))
+    s = agent_post.status() if on_pc else (blast_remote_status(db).get("agent_post") or {})
+    return agent_post, on_pc, s, agent_post.load_results(db)
+
+
+def agent_post_busy(s):
+    return s.get("state") == "running" and datetime.now().timestamp() - s.get("at", 0) < 600
+
+
+def agent_post_progress(agent_post, on_pc):
+    """While the PC works: "Saving drafts 2 of 5: Stonor 3 - Uploading photos…" + Stop."""
+    @st.fragment(run_every="4s")
+    def progress():
+        s = agent_post.status() if on_pc else (blast_remote_status(db).get("agent_post") or {})
+        if not agent_post_busy(s):
+            st.rerun(scope="app")
+        total = s.get("total") or 1
+        st.progress(min(1.0, (s.get("done") or 0) / total),
+                    text=f"⏳ On your PC ({s.get('done', 0)} of {total} done): {s.get('text', '')} - a Chrome window "
+                         "is filling AgentNet")
+        if st.button("⏹ Stop after this listing", key="ap-stop"):
+            agent_post.stop() if on_pc else agent_post.request_stop(db)
+            st.toast("Stopping after the listing it's on…")
+    progress()
+
+
+def agent_post_actions(ids, key, results):
+    """The action bar for ticked listings: save as drafts (preview, no credits) / post now - and post the ones that
+    already have a draft. Posting needs a tick: 2 Universal Credits each."""
+    agent_post, on_pc, s, _ = agent_post_state()
+    if agent_post_busy(s):
+        agent_post_progress(agent_post, on_pc)
+        return
+    # posted, or Post now pressed but unconfirmed ("check") - never posted (paid) twice
+    posted = [i for i in ids if (results.get(i) or {}).get("state") in ("posted", "check")]
+    todo = [i for i in ids if i not in posted]
+    no_draft = [i for i in todo if not (results.get(i) or {}).get("draft_id")]
+    if posted:
+        st.caption(f"{len(posted)} of the ticked listing(s) already posted (or to check in AgentNet) - left out.")
+    if not todo:
+        return
+
+    def go(which, action):
+        agent_post.start(which, action) if on_pc else agent_post.request(db, which, action)
+        st.session_state.pop(f"{key}-sure", None)
+        st.rerun()
+
+    plural = lambda n: "s" * (n > 1)  # noqa: E731
+    c1, c2, c3 = st.columns([1.2, 1.5, 1.3])
+    if c1.button(f"📝 Save {len(no_draft)} as draft{plural(len(no_draft))} (preview)" if no_draft else
+                 "📝 Already saved as draft", key=f"{key}-draft",
+                 disabled=not no_draft,
+                 help="Fills AgentNet's Create Listing for each with your usual choices and saves it as a draft - "
+                      "nothing is posted, no credits used. Check them, then post. Listings that already have a "
+                      "draft are left out."):
+        go(no_draft, "draft")
+    sure = c2.checkbox(f"I checked - post {len(todo)} listing{plural(len(todo))} ({2 * len(todo)} Universal "
+                       "Credits)", key=f"{key}-sure")
+    if c3.button(f"🚀 Post {len(todo)} now", key=f"{key}-post", type="primary", disabled=not sure,
+                 help="A listing with a draft posts that draft (what you checked); the others are filled in and "
+                      "posted straight away"):
+        go(todo, "post")
+
+
+def agent_post_box(r, results):
+    """This listing on PropertyGuru: its draft / post (made on the PropertyGuru posting page or with the ticks)."""
+    done = results.get(r["message_id"]) or {}
+    if not done:
+        return
+    with st.expander("📤 On PropertyGuru (AgentNet)", expanded=True):
+        agent_post_detail(done)
+
+
+def agent_post_detail(done):
+    word = {"posted": "✅ Posted", "draft": "📝 Draft saved (not posted yet)", "check": "⚠️ Check in AgentNet",
+            "error": "❌ Couldn't make it"}.get(done.get("state"), done.get("state"))
+    when = datetime.fromtimestamp(done.get("posted_at") or done.get("at") or 0, MYT).strftime("%d %b %Y %H:%M")
+    ident = f" · AgentNet ID {done['draft_id']}" if done.get("draft_id") else ""
+    link = f" · [Open it in AgentNet ↗]({done['edit_url']})" if done.get("edit_url") else ""
+    st.markdown(f"**{word}**{ident}{link} · {when}")
+    if done.get("error"):
+        st.error(done["error"])
+    if done.get("note"):
+        st.warning(done["note"])
+    if done.get("headline"):
+        st.markdown(f"**Headline:** {done['headline']}")
+        st.text(done.get("description", ""))
+        pl = done.get("plan") or {}
+        st.caption(f"{done.get('property', '')} · {done.get('types', '')} · {pl.get('beds')} bed {pl.get('baths')} "
+                   f"bath · {pl.get('sqft')} sf{' (estimated)' if pl.get('sqft_estimated') else ''} · "
+                   f"{pl.get('furnishing_words')} · RM {pl.get('price') or 0:,} · {done.get('photos', 0)} photos")
+    if done.get("shot"):
+        url = signed_urls([done["shot"]]).get(done["shot"])
+        if url:
+            st.image(url, caption="AgentNet preview", width=520)
+
+
+# ---------- PropertyGuru posting ----------
+def propertyguru_posting_page():
+    """Everything on PropertyGuru through AgentNet: drafts / posts the robot made, and saved listings not posted."""
+    st.title("PropertyGuru posting")
+    st.caption("Your saved listings on PropertyGuru through AgentNet (your agent account). Tick listings to save them "
+               "as drafts first (preview - no credits) or post them. Runs on your PC: a Chrome window fills AgentNet "
+               "one listing after another (about 2 minutes each). Posting = 2 Universal Credits each, on "
+               "PropertyGuru + iProperty for 60 days.")
+    agent_post, on_pc, s, results = agent_post_state()
+    if agent_post_busy(s):
+        agent_post_progress(agent_post, on_pc)
+    elif s.get("state") == "done" and s.get("total"):
+        st.success(f"Last run: {s.get('ok', 0)} done, {s.get('failed', 0)} couldn't"
+                   + (f" · {s['credits']} Universal Credits left" if s.get("credits") else "")
+                   + (" · stopped early" if s.get("stopped") else ""))
+    elif s.get("state") == "error":
+        st.error(f"The last run stopped: {s.get('error')}")
+    try:
+        rows = {r["message_id"]: r for r in load_owner_listings(db)}
+    except Exception as e:
+        st.warning(f"Couldn't load saved listings ({str(e).splitlines()[0]}).")
+        return
+
+    # ----- on AgentNet: what the robot made -----
+    st.subheader("📤 On AgentNet")
+    made = sorted(((mid, d) for mid, d in results.items() if mid in rows),
+                  key=lambda x: -(x[1].get("posted_at") or x[1].get("at") or 0))
+    counts = {k: sum(1 for _, d in made if d.get("state") == k) for k in ("draft", "posted", "check", "error")}
+    st.caption(f"{counts['draft']} draft(s) · {counts['posted']} posted · {counts['check']} to check · "
+               f"{counts['error']} couldn't")
+    if made:
+        word = {"posted": "✅ Posted", "draft": "📝 Draft", "check": "⚠️ Check", "error": "❌ Problem"}
+        table = pd.DataFrame([{
+            "Status": word.get(d.get("state"), d.get("state")),
+            "Place": rows[mid].get("place"), "Owner": rows[mid].get("owner_name"),
+            "Rent / Sale": rows[mid].get("listing_type"), "Price (RM)": rows[mid].get("price_rm"),
+            "Headline": d.get("headline"), "Problem": d.get("error") or d.get("note"),
+            "AgentNet": d.get("edit_url"),
+            "When": datetime.fromtimestamp(d.get("posted_at") or d.get("at") or 0, MYT).strftime("%d %b %H:%M"),
+        } for mid, d in made])
+        picked = st.dataframe(table, hide_index=True, width="stretch", on_select="rerun", selection_mode="multi-row",
+                              key="ap-made", height=min(420, 38 + 35 * len(table)),
+                              column_config={"Price (RM)": st.column_config.NumberColumn(format="%,d"),
+                                             "Headline": st.column_config.TextColumn(width="medium"),
+                                             "AgentNet": st.column_config.LinkColumn(display_text="Open ↗")})
+        sel = [made[i][0] for i in picked.selection.rows if i < len(made)]
+        if sel:
+            agent_post_actions(sel, "ap-made-act", results)
+            if len(sel) == 1:
+                agent_post_detail(results[sel[0]])
+        else:
+            st.caption("☝️ Tick listings to post their drafts (or redo them). Tick one to see its preview.")
+    else:
+        st.info("Nothing on AgentNet yet - tick listings below.")
+
+    # ----- saved listings not on AgentNet yet -----
+    st.subheader("🏠 Saved listings not on PropertyGuru yet")
+    waiting = [r for mid, r in rows.items() if mid not in results or results[mid].get("state") == "error"]
+    if not waiting:
+        st.caption("All saved listings have a draft or are posted.")
+        return
+    table = pd.DataFrame([{
+        "Place": r.get("place"), "Owner": r.get("owner_name"), "Rent / Sale": r.get("listing_type"),
+        "Price (RM)": r.get("price_rm"), "sf": r.get("sqft"), "Furnish": r.get("furnishing"),
+        "Photos": sum(1 for p in r.get("photo_paths") or [] if p.lower().endswith(".jpg")),
+        "Posted in chat": pd.to_datetime(r.get("posted_at"), utc=True).tz_convert(MYT).strftime("%d %b"),
+    } for r in waiting])
+    picked = st.dataframe(table, hide_index=True, width="stretch", on_select="rerun", selection_mode="multi-row",
+                          key="ap-waiting", height=min(420, 38 + 35 * len(table)),
+                          column_config={"Price (RM)": st.column_config.NumberColumn(format="%,d"),
+                                         "Photos": st.column_config.NumberColumn(
+                                             help="PropertyGuru needs at least 5 photos")})
+    sel = [waiting[i]["message_id"] for i in picked.selection.rows if i < len(waiting)]
+    if sel:
+        few = [rows[i].get("place") for i in sel
+               if sum(1 for p in rows[i].get("photo_paths") or [] if p.lower().endswith(".jpg")) < 5]
+        if few:
+            st.warning(f"Fewer than 5 photos (PropertyGuru needs 5) - these will be skipped: {', '.join(few)}")
+        agent_post_actions(sel, "ap-wait-act", results)
+    else:
+        st.caption("☝️ Tick listings to save them as drafts (preview) or post them.")
+
+
 def saved_listings_tab():
     from wa_export import describe, from_row, listing_zip
 
@@ -421,7 +604,9 @@ def saved_listings_tab():
         with m2:
             market_progress()
     elif m1.button(f"🔍 Compare with PropertyGuru & iProperty ({len(shown)})", disabled=not shown,
-                   help="For each listing shown: finds it on PropertyGuru and iProperty, reads the current rent / sale prices and "
+                   help="New and changed listings are compared by themselves every few minutes (when the PC is "
+                        "on) - press this to compare the listings shown again now. "
+                        "For each listing shown: finds it on PropertyGuru and iProperty, reads the current rent / sale prices and "
                         "sizes there, and says whether the owner's price is OK to post. Runs on your PC (a Chrome "
                         "window opens) - about 20 seconds per property."):
         ids = [r["message_id"] for r in shown]
@@ -434,6 +619,10 @@ def saved_listings_tab():
     if st.session_state.get("market_asked") and not on_pc:
         m2.caption("⏳ Sent to your PC - results appear here within a few minutes (if the PC is on).")
 
+    # what the posting robot made for each (agent_post.py)
+    import agent_post
+    ap_results = agent_post.load_results(db)
+    ap_word = {"posted": "✅ Posted", "draft": "📝 Draft", "check": "⚠️ Check", "error": "❌ Problem"}
     # Left: the owner's listing | right: PropertyGuru & iProperty
     table = pd.DataFrame([{
         "Owner": r.get("owner_name"),
@@ -444,7 +633,9 @@ def saved_listings_tab():
         # a sale that comes with a tenant also shows its rental
         "Rent Price (RM)": r.get("price_rm") if r.get("listing_type") == "Rent" else r.get("rental_rm"),
         "Sale Price (RM)": r.get("price_rm") if r.get("listing_type") != "Rent" else None,
-        "sf": r.get("sqft"),
+        # the owner's size, else the usual size of such units there online (estimated, marked "est.")
+        "sf": f"{r['sqft']:,}" if r.get("sqft") else (f"~{market[r['message_id']]['est_sqft']:,} est."
+                                                     if (market.get(r["message_id"]) or {}).get("est_sqft") else None),
         "Rent / Sale": r.get("listing_type"),
         "Furnish": r.get("furnishing"),
         "PG + iProperty": (market.get(r["message_id"]) or {}).get("label", ""),
@@ -452,15 +643,18 @@ def saved_listings_tab():
         "Lowest sale": market_check.lowest_real(market.get(r["message_id"]) or {}, "sale"),
         "Lowest rent": market_check.lowest_real(market.get(r["message_id"]) or {}, "rent"),
         "Already listed?": (market.get(r["message_id"]) or {}).get("same_unit_url"),
+        "On PropertyGuru": ap_word.get((ap_results.get(r["message_id"]) or {}).get("state"), ""),
     } for r in shown])
     picked = st.dataframe(table, hide_index=True, width="stretch", height=480, on_select="rerun",
-                          selection_mode="single-row", key="saved_listings_table",
+                          selection_mode="multi-row", key="saved_listings_table",
                           column_config={"Place": st.column_config.TextColumn(width="medium"),
                                          "Rent Price (RM)": st.column_config.NumberColumn(
                                              format="%,d", help="Monthly rent - for a sale, the rental it comes "
                                                                 "with (sold tenanted)"),
                                          "Sale Price (RM)": st.column_config.NumberColumn(format="%,d"),
-                                         "sf": st.column_config.NumberColumn(format="%,d"),
+                                         "sf": st.column_config.TextColumn(
+                                             help="\"est.\" = the owner didn't say - the usual size of units with "
+                                                  "the same rooms there on PropertyGuru / iProperty"),
                                          "PG + iProperty": st.column_config.TextColumn(
                                              help="Owner's price compared with PropertyGuru and iProperty now"),
                                          "Why": st.column_config.TextColumn(width="large"),
@@ -477,7 +671,14 @@ def saved_listings_tab():
                                                                           "already advertised")})
     sel = [i for i in picked.selection.rows if i < len(shown)]
     if not sel:
-        st.caption("👆 Click a row for its description and pictures.")
+        st.caption("👆 Tick a row for its description and pictures - tick several to save them as PropertyGuru "
+                   "drafts or post them together.")
+        return
+    # ticked listings -> PropertyGuru: save as drafts (preview) / post (see also the PropertyGuru posting page)
+    st.markdown(f"**{len(sel)} ticked** → PropertyGuru (AgentNet)")
+    agent_post_actions([shown[i]["message_id"] for i in sel], "sl-ap", ap_results)
+    if len(sel) > 1:
+        st.caption("Tick just one row to see its description and pictures.")
         return
 
     r = shown[sel[0]]
@@ -497,6 +698,7 @@ def saved_listings_tab():
         sites = "PropertyGuru & iProperty" if mk.get("sites") else "PropertyGuru (compare again to add iProperty)"
         box(f"**📊 Compared with {sites}: {mk.get('label')}**\n\n{mk.get('reason')}\n\n{links}  \n"
             f"_Checked {when}_")
+    agent_post_box(r, ap_results)
     name = re.sub(r"[^A-Za-z0-9 ]+", "", r.get("place") or "listing").strip() or "listing"
     paths = r.get("photo_paths") or []
     left, right = st.columns(2, gap="large")  # half owner, half PropertyGuru & iProperty
@@ -506,21 +708,28 @@ def saved_listings_tab():
         st.markdown("### 🏠 Owner's listing")
         rent = r.get("listing_type") == "Rent"
         money = (f"RM {r['price_rm']:,}" + ("/mo" if rent else "")) if r.get("price_rm") else "-"
+        est = (mk or {}).get("est_note")  # owner left out the size / rooms: what's usual there online
+        rooms = " / ".join(x for x in (f"{r['bedrooms']} bed" if r.get("bedrooms") else "",
+                                       f"{r['bathrooms']} bath" if r.get("bathrooms") else "") if x)
         facts = [("Rent / Sale", r.get("listing_type")), ("Price", money),
-                 ("Size", f"{r['sqft']:,} sf" if r.get("sqft") else None),
+                 ("Size", f"{r['sqft']:,} sf" if r.get("sqft") else
+                  f"~{mk['est_sqft']:,} sf (estimated: {est})" if (mk or {}).get("est_sqft") else None),
                  ("Property type", r["_category"] + (f" ({r['property_type'][:60]})" if r.get("property_type") else "")),
-                 ("Rooms", " / ".join(x for x in (f"{r['bedrooms']} bed" if r.get("bedrooms") else "",
-                                                  f"{r['bathrooms']} bath" if r.get("bathrooms") else "") if x)),
+                 ("Rooms", rooms or (f"estimated: {est}" if (mk or {}).get("est_beds") is not None else "")),
                  ("Furnishing", r.get("furnishing")), ("Unit", r.get("unit_no")),
                  ("Rental (if sold tenanted)", f"RM {r['rental_rm']:,}/mo" if r.get("rental_rm") and not rent else None),
                  ("Owner", r.get("owner_name")),
                  ("Number", (r.get("phones") or "").replace("; ", ", ") or r.get("sender_phone")),
                  ("Posted", pd.to_datetime(r.get("posted_at"), utc=True).tz_convert(MYT).strftime("%d %b %Y"))]
         st.markdown("\n".join(f"- **{k}:** {v}" for k, v in facts if v))
+        hide = st.checkbox("Without phone numbers (to share)", key="owner_hide_phones",
+                           help="For sending to other agents / clients: no owner or sender number, and any phone "
+                                "number in the message shows as [number hidden]")
+        tag = " (no numbers)" if hide else ""
         b1, b2 = st.columns(2)
-        b1.download_button("Download description (.txt)", describe(listing).encode("utf-8-sig"),
-                           f"{name}.txt", "text/plain", on_click="ignore")
-        if paths and b2.button(f"Prepare ZIP ({len(paths)} files)", key=f"zip-{r['message_id']}"):
+        b1.download_button(f"Download description{tag} (.txt)", describe(listing, hide).encode("utf-8-sig"),
+                           f"{name}{tag}.txt", "text/plain", on_click="ignore")
+        if paths and b2.button(f"Prepare ZIP{tag} ({len(paths)} files)", key=f"zip-{r['message_id']}"):
             with st.spinner("Collecting pictures…"):
                 photos = []
                 for p in paths:
@@ -528,9 +737,10 @@ def saved_listings_tab():
                         photos.append((p, db.storage.from_(PHOTO_BUCKET).download(p)))
                     except Exception:
                         pass
-            st.session_state.owner_zip = (r["message_id"], listing_zip(listing, photos), f"{name}.zip")
+            st.session_state.owner_zip = (r["message_id"], listing_zip(listing, photos, hide), f"{name}{tag}.zip",
+                                          hide)
         oz = st.session_state.get("owner_zip")
-        if oz and oz[0] == r["message_id"]:
+        if oz and oz[0] == r["message_id"] and oz[3] == hide:  # the ZIP ready matches the tick box
             b2.download_button(f"Download {oz[2]}", oz[1], oz[2], "application/zip", type="primary",
                                on_click="ignore")
         with st.expander("Owner's full description", expanded=True):
@@ -551,8 +761,9 @@ def saved_listings_tab():
             site_word = {"pg": "PropertyGuru", "ip": "iProperty", "both": "Both"}
             for k, title in (("sale", "🏷️ 5 cheapest for sale"), ("rent", "🔑 5 cheapest for rent")):
                 units = mk.get(f"{k}_lowest")
-                size_note = (f"same size as the owner's (±20% of {mk['owner_sqft']:,} sf)" if mk.get(f"{k}_same_size")
-                             else "sizes vary")
+                size_note = ("sizes vary" if not mk.get(f"{k}_same_size") else
+                             f"same size as the owner's (±20% of {mk['owner_sqft']:,} sf)" if mk.get("owner_sqft")
+                             else "same rooms as the owner's")
                 st.markdown(f"**{title}** <small>· {size_note}</small>", unsafe_allow_html=True)
                 if units is None:
                     st.caption("Compare again to see this.")
@@ -1692,6 +1903,170 @@ def load_ai_rows(_db):
     return ai_call_remote.load_rows(_db)
 
 
+# ---------- Google Map Extractor ----------
+def gmaps_page():
+    """Search Google Maps and list the businesses found (gmaps.py - runs on the PC, also when asked online)."""
+    import importlib
+    import io
+    import gmaps
+    importlib.reload(gmaps)
+    st.title("Google Map Extractor")
+    st.caption("Search Google Maps like on your phone (\"property agency Mont Kiara\", \"interior design Cheras\") "
+               "and get each business found: company name, address, postcode, state, website, email and phone "
+               "number. Runs on your PC in a hidden Chrome window; emails come from each company's own website. "
+               "Google shows about 120 places per search at most - for more, search area by area.")
+    on_pc = (ROOT_DIR / "gmaps.py").exists() and bool(os.environ.get("SUPABASE_SECRET_KEY"))
+
+    def now_status():
+        return gmaps.status() if on_pc else (blast_remote_status(db).get("gmaps") or {})
+
+    s = now_status()
+    if s.get("state") == "running" and datetime.now().timestamp() - s.get("at", 0) < 300:
+        @st.fragment(run_every="4s")
+        def progress():
+            s = now_status()
+            if s.get("state") != "running":
+                st.session_state.gmaps_pick = s.get("id")
+                st.rerun(scope="app")
+            st.info(f"🔍 Extracting \"{s.get('query')}\" on your PC… {s.get('done', 0)} of {s.get('total', '?')}"
+                    f" · {s.get('text', '')}")
+            if st.button("⏹ Stop", help="Stops after the place it's on - what's found so far is kept"):
+                gmaps.stop() if on_pc else gmaps.request_stop(db)
+                st.toast("Stopping…")
+        progress()
+    else:
+        # Google Maps stops at about 120 places a search - "split by area" runs one search per area and joins them
+        split = st.toggle("Split by area (more than 120 places)", key="gmaps_split",
+                          help="Google Maps gives about 100-120 places per search at most. This searches each area "
+                               "on its own (\"property agency Bangsar\", \"property agency Mont Kiara\", …) and "
+                               "joins the results - each company once.")
+        areas = []
+        if split:
+            regions = st.multiselect("Areas of", list(gmaps.AREAS), default=["Kuala Lumpur"], key="gmaps_regions")
+            preset = [a for r in regions for a in gmaps.AREAS[r]]
+            # a new text box when the regions change, so the list follows them (your edits stay until then)
+            areas_text = st.text_area("Areas to search (one per line - add, remove or change any)", "\n".join(preset),
+                                      height=150, key=f"gmaps_areas-{'|'.join(regions)}")
+            areas = list(dict.fromkeys(a.strip() for a in areas_text.splitlines() if a.strip()))
+        with st.form("gmaps_form"):
+            c1, c2 = st.columns([3, 1])
+            q = c1.text_input("Search Google Maps for", placeholder="property agency" if split else
+                              "property agency Mont Kiara",
+                              help="With Split by area, leave the area out - it's added for each area" if split
+                              else None)
+            if split:
+                n = c2.number_input("How many places in all", 1, 5000, 1000, step=100,
+                                    help="Stops when it has this many (or when the areas run out)")
+            else:
+                n = c2.number_input("How many places", 1, 120, 50, step=10,
+                                    help="Google Maps gives about 100-120 places per search at most - for more, "
+                                         "turn on Split by area")
+            em = st.checkbox("Find emails on their websites (slower - a few seconds more per place)", value=True)
+            if split:
+                st.caption(f"{len(areas)} areas: {', '.join(areas[:6])}{'…' if len(areas) > 6 else ''} · roughly "
+                           f"{max(1, round(min(int(n), len(areas) * 60) * (8 if em else 4) / 3600 + len(areas) / 60))}"
+                           " hour(s) for the whole list - you can stop any time and keep what's found")
+            go = st.form_submit_button("🔍 Extract", type="primary")
+        if go and q.strip() and not (split and not areas):
+            if on_pc:
+                st.session_state.gmaps_pick = gmaps.start(q.strip(), int(n), em, areas or None)
+            else:
+                gmaps.request(db, q.strip(), int(n), em, areas or None)
+                st.session_state.gmaps_asked = True
+            st.rerun()
+        if go and split and not areas:
+            st.warning("Add at least one area.")
+        if go and not q.strip():
+            st.warning("Type what to search for first.")
+        if st.session_state.get("gmaps_asked") and not on_pc and s.get("state") != "running":
+            st.caption("⏳ Sent to your PC - it starts within a minute (if the PC is on).")
+    if s.get("state") == "error":
+        st.error(f"The last search stopped with a problem: {s.get('error')}")
+
+    # ----- past searches -----
+    index = sorted(gmaps.load_index(db), key=lambda j: -(j.get("at") or 0))
+    if not index:
+        st.info("No searches yet - type one above and press Extract.")
+        return
+    by_id = {j["id"]: j for j in index}
+    if st.session_state.get("gmaps_pick") not in by_id:
+        st.session_state.gmaps_pick = index[0]["id"]
+    st.subheader("Results")
+    pick = st.selectbox("Search", list(by_id), key="gmaps_pick", format_func=lambda i: (
+        by_id[i]["query"] + (f" · {by_id[i]['areas']} areas" if by_id[i].get("areas") else "")
+        + f" · {by_id[i]['count']} places · "
+        f"{datetime.fromtimestamp(by_id[i]['at'], MYT):%d %b %Y %H:%M}"
+        + (" · still running" if by_id[i].get("state") == "running" else "")
+        + (" · stopped" if by_id[i].get("state") == "stopped" else "")))
+    job = gmaps.load_job(db, pick)
+    if not job:
+        st.warning("Couldn't load this search.")
+        return
+    rows = job["rows"]
+    f1, f2, f3, f4 = st.columns([1, 1.3, 2, 2])
+    only_email = f1.checkbox("Only with email")
+    only_mobile = f2.checkbox("Only with mobile (WhatsApp)")
+    states = f3.multiselect("State", sorted({r["state"] for r in rows if r.get("state")}), placeholder="All states")
+    text = f4.text_input("Search name / address / category")
+    # Google's own category for each place ("Investment company", "Real estate agency", ...), most common first
+    cat_count = pd.Series([r.get("category") or "(no category)" for r in rows]).value_counts()
+    split = any(r.get("area") for r in rows)
+    g1, g2 = st.columns(2) if split else (st.container(), None)
+    cats = g1.multiselect("Category", list(cat_count.index), placeholder="All categories",
+                          format_func=lambda c: f"{c} ({cat_count[c]})",
+                          help="Google Maps' own category for each place - e.g. tick \"Investment company\" only")
+    found_in = g2.multiselect("Found in area", list(dict.fromkeys(r["area"] for r in rows if r.get("area"))),
+                              placeholder="All areas") if split else []
+    view = [r for r in rows if (not only_email or r.get("email")) and (not only_mobile or r.get("whatsapp"))
+            and (not states or r.get("state") in states) and (not found_in or r.get("area") in found_in)
+            and (not cats or (r.get("category") or "(no category)") in cats)
+            and (not text or text.lower() in f"{r.get('name')} {r.get('address')} {r.get('category')}".lower())]
+    st.caption(f"{len(view)} of {len(rows)} places · {sum(1 for r in view if r.get('email'))} with email · "
+               f"{sum(1 for r in view if r.get('whatsapp'))} mobile numbers (WhatsApp)")
+    table = pd.DataFrame([{
+        "Company name": r.get("name"), "Category": r.get("category"), "Address": r.get("address"),
+        "Postcode": r.get("postcode"), "State": r.get("state"), "Website": r.get("website") or None,
+        "Email": r.get("email"), "Phone number": r.get("phone"), "Rating": r.get("rating"),
+        "Google Maps": r.get("maps_url"), "Area": r.get("area")} for r in view],
+        columns=["Company name", "Category", "Address", "Postcode", "State", "Website", "Email", "Phone number",
+                 "Rating", "Google Maps", "Area"])
+    if not split:
+        table = table.drop(columns=["Area"])
+    st.dataframe(table, hide_index=True, width="stretch", height=min(650, 38 + 35 * max(len(table), 1)),
+                 column_config={"Address": st.column_config.TextColumn(width="large"),
+                                "Website": st.column_config.LinkColumn(display_text=r"https?://(?:www\.)?([^/?]+)"),
+                                "Google Maps": st.column_config.LinkColumn(display_text="Open ↗")})
+
+    mobiles = list(dict.fromkeys(r["whatsapp"] for r in view if r.get("whatsapp")))
+
+    def to_blast(phones):
+        """Open the WhatsApp blast page with these numbers already in its number box."""
+        st.session_state.page = "WhatsApp blast"
+        st.session_state[f"blast-numbers-{st.session_state.get('blast_v', 0)}"] = "\n".join(phones)
+
+    name = re.sub(r"[^A-Za-z0-9 ]+", "", job["query"]).strip() or "Google Maps"
+    xlsx = io.BytesIO()
+    table.drop(columns=["Rating"]).to_excel(xlsx, index=False, sheet_name="Google Maps")
+    d1, d2, d3, d4 = st.columns(4)
+    d1.download_button("⬇️ Download Excel", xlsx.getvalue(), f"{name}.xlsx", type="primary", on_click="ignore",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", disabled=not view)
+    d2.download_button("⬇️ Download CSV", table.to_csv(index=False).encode("utf-8-sig"), f"{name}.csv", "text/csv",
+                       on_click="ignore", disabled=not view)
+    d3.button(f"📣 Send mobiles to WhatsApp blast ({len(mobiles)})", disabled=not mobiles, on_click=to_blast,
+              args=(mobiles,), help="Opens WhatsApp blast with the mobile numbers shown filled in (landlines "
+                                    "can't get WhatsApp)")
+    if d4.button("🗑 Delete this search", disabled=job.get("state") == "running"):
+        gmaps.delete_job(db, pick)
+        st.session_state.pop("gmaps_pick", None)
+        st.rerun()
+
+
+if tool == "PropertyGuru posting":
+    propertyguru_posting_page()
+    st.stop()
+if tool == "Google Map Extractor":
+    gmaps_page()
+    st.stop()
 if tool == "AI call":
     ai_call_page()
     st.stop()
