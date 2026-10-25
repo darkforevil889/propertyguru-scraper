@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WhatsApp chats</title>
+<style>
+  :root {
+    --bg: #f4f6f5; --panel: #ffffff; --line: #e6e9e8; --text: #1f2a2e; --muted: #8a9599; --green: #25c35a;
+    --green-dark: #1ea64c; --bubble-in: #eef1f2; --bubble-out: #25c35a; --out-text: #ffffff; --hover: #f2f7f4;
+    --active: #e5f6eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b141a; --panel: #111b21; --line: #222d34; --text: #e9edef; --muted: #8696a0; --green: #25d366;
+      --green-dark: #1fae55; --bubble-in: #202c33; --bubble-out: #005c4b; --out-text: #e9edef; --hover: #1d282f;
+      --active: #2a3942;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 14px/1.4 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .app { display: flex; height: 100vh; border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+    background: var(--panel); }
+  /* ---------- chat list ---------- */
+  .side { width: 34%; min-width: 260px; max-width: 420px; display: flex; flex-direction: column;
+    border-right: 1px solid var(--line); }
+  .search { padding: 12px; border-bottom: 1px solid var(--line); }
+  .search input { width: 100%; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--bg); color: var(--text); font-size: 14px; outline: none; }
+  .list { flex: 1; overflow-y: auto; }
+  .row { display: flex; gap: 12px; align-items: center; padding: 10px 14px; cursor: pointer;
+    border-bottom: 1px solid var(--line); }
+  .row:hover { background: var(--hover); }
+  .row.on { background: var(--active); }
+  .row .mid { flex: 1; min-width: 0; }
+  .row .name { font-weight: 600; color: var(--green-dark); white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; }
+  .row .prev { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
+  .row .time { color: var(--muted); font-size: 12px; white-space: nowrap; align-self: flex-start; padding-top: 2px; }
+  .av { width: 46px; height: 46px; border-radius: 50%; flex: none; object-fit: cover; background: #cfd8d4;
+    display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 600; font-size: 17px; }
+  .av.sm { width: 38px; height: 38px; font-size: 14px; }
+  /* ---------- conversation ---------- */
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .head { display: flex; gap: 12px; align-items: center; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  .head .to { color: var(--muted); }
+  .head .who { font-weight: 600; }
+  .head .num { color: var(--muted); font-size: 12px; }
+  .back { display: none; border: 0; background: none; color: var(--green-dark); font-size: 22px; cursor: pointer; }
+  .thread { flex: 1; overflow-y: auto; padding: 18px 22px; }
+  .day { text-align: center; margin: 14px 0; }
+  .day span { background: var(--bubble-in); color: var(--muted); padding: 4px 12px; border-radius: 8px; font-size: 12px; }
+  .msg { display: flex; gap: 10px; align-items: flex-end; margin: 8px 0; }
+  .msg.me { flex-direction: row-reverse; }
+  .msg .col { max-width: 62%; display: flex; flex-direction: column; }
+  .msg.me .col { align-items: flex-end; }
+  .bubble { padding: 9px 13px; border-radius: 16px; background: var(--bubble-in); white-space: pre-wrap;
+    word-wrap: break-word; overflow-wrap: anywhere; }
+  .msg.me .bubble { background: var(--bubble-out); color: var(--out-text); }
+  .msg.me .bubble a { color: var(--out-text); }
+  .bubble.media { padding: 4px; background: transparent; }
+  .msg.me .bubble.media { background: transparent; }
+  .bubble img.photo { display: block; max-width: 280px; max-height: 320px; border-radius: 12px; cursor: zoom-in; }
+  .bubble img.sticker { width: 130px; height: 130px; object-fit: contain; }
+  .bubble audio { width: 260px; }
+  .from { font-size: 12px; color: var(--green-dark); font-weight: 600; margin: 0 4px 2px; }
+  .meta { font-size: 11px; color: var(--muted); margin: 3px 6px 0; }
+  .tick { color: var(--green); }
+  .empty { color: var(--muted); text-align: center; margin-top: 30vh; }
+  .compose { display: flex; gap: 10px; padding: 12px 16px; border-top: 1px solid var(--line); }
+  .compose textarea { flex: 1; resize: none; height: 42px; max-height: 120px; padding: 10px 14px; border-radius: 21px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--text); font: inherit; outline: none; }
+  .compose button { border: 0; border-radius: 50%; width: 42px; height: 42px; background: var(--green); color: #fff;
+    font-size: 18px; cursor: pointer; }
+  .compose button:disabled { opacity: .5; cursor: default; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 16px; }
+  .chips:not(:empty) { padding: 8px 16px 0; }
+  .chip { border: 1px solid var(--green); color: var(--green-dark); background: var(--panel); border-radius: 16px;
+    padding: 6px 12px; cursor: pointer; font: inherit; font-size: 13px; text-align: left; }
+  .chip:hover { background: var(--active); }
+  .err { color: #d9534f; font-size: 12px; padding: 0 16px 8px; }
+  .zoom { position: fixed; inset: 0; background: rgba(0,0,0,.85); display: none; align-items: center;
+    justify-content: center; z-index: 9; cursor: zoom-out; }
+  .zoom img { max-width: 92vw; max-height: 92vh; border-radius: 8px; }
+  @media (max-width: 720px) {
+    .side { width: 100%; max-width: none; }
+    .main { display: none; }
+    .app.open .side { display: none; }
+    .app.open .main { display: flex; }
+    .back { display: block; }
+    .msg .col { max-width: 80%; }
+  }
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <div class="side">
+    <div class="search"><input id="q" placeholder="Search…" autocomplete="off"></div>
+    <div class="list" id="list"></div>
+  </div>
+  <div class="main">
+    <div class="head" id="head"></div>
+    <div class="thread" id="thread"><div class="empty">Pick a chat</div></div>
+    <div class="chips" id="chips"></div>
+    <div class="err" id="err"></div>
+    <div class="compose">
+      <textarea id="box" placeholder="Type something…" disabled></textarea>
+      <button id="send" title="Send" disabled>➤</button>
+    </div>
+  </div>
+</div>
+<div class="zoom" id="zoom"><img id="zoomimg" alt=""></div>
+<script>
+let allChats = [], current = null, lastSig = "", me = null;
+const $ = id => document.getElementById(id);
+const esc = s => (s || "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const linkify = s => esc(s).replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+const COLORS = ["#7fb3a3", "#e39b7b", "#8fa6d6", "#c99bd6", "#d6b46f", "#6fb8d6", "#d67f8f"];
+
+function initials(name) {
+  const w = (name || "?").replace(/[^\p{L}\p{N} ]/gu, "").trim().split(/\s+/);
+  return ((w[0] || "?")[0] + (w[1] ? w[1][0] : "")).toUpperCase();
+}
+function avatar(jid, name, cls) {
+  const color = COLORS[[...(jid || "x")].reduce((a, c) => a + c.charCodeAt(0), 0) % COLORS.length];
+  const fallback = `<div class="av ${cls || ""}" style="background:${color}">${esc(initials(name))}</div>`;
+  return `<img class="av ${cls || ""}" src="/api/avatar?jid=${encodeURIComponent(jid)}" alt=""
+          onerror="this.outerHTML=this.dataset.fb" data-fb='${fallback.replace(/'/g, "&#39;")}'>`;
+}
+function when(ts) {
+  const d = new Date(ts * 1000), now = new Date();
+  if (d.toDateString() === now.toDateString()) return d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+  const y = new Date(now); y.setDate(now.getDate() - 1);
+  if (d.toDateString() === y.toDateString()) return "Yesterday";
+  return d.toLocaleDateString([], {day: "2-digit", month: "short"});
+}
+function dayLabel(ts) {
+  const d = new Date(ts * 1000), now = new Date(), y = new Date(now); y.setDate(now.getDate() - 1);
+  if (d.toDateString() === now.toDateString()) return "Today";
+  if (d.toDateString() === y.toDateString()) return "Yesterday";
+  return d.toLocaleDateString([], {day: "numeric", month: "long", year: "numeric"});
+}
+function title(c) { return (c.is_group ? "👥 " : "") + (c.name || ("+" + c.phone)); }
+
+async function loadChats() {
+  try {
+    allChats = await (await fetch("/api/chats")).json();
+    drawList();
+  } catch (e) { $("err").textContent = "Can't reach your WhatsApp connection - is the PC's WhatsApp linked?"; }
+}
+function drawList() {
+  const q = $("q").value.trim().toLowerCase();
+  const shown = allChats.filter(c => !q || (c.name || "").toLowerCase().includes(q) || (c.phone || "").includes(q));
+  $("list").innerHTML = shown.map(c => `
+    <div class="row ${current && current.jid === c.jid ? "on" : ""}" data-jid="${esc(c.jid)}">
+      ${avatar(c.send_to, c.name || c.phone)}
+      <div class="mid"><div class="name">${esc(title(c))}</div><div class="prev">${esc(c.preview || "")}</div></div>
+      <div class="time">${when(c.last_ts)}</div>
+    </div>`).join("") || '<div class="empty" style="margin-top:20px">No chats</div>';
+  document.querySelectorAll(".row").forEach(r => r.onclick = () => openChat(r.dataset.jid));
+}
+function openChat(jid) {
+  current = allChats.find(c => c.jid === jid);
+  if (!current) return;
+  lastSig = "";
+  $("app").classList.add("open");
+  $("head").innerHTML = `<button class="back" onclick="document.getElementById('app').classList.remove('open')">‹</button>
+    ${avatar(current.send_to, current.name || current.phone, "sm")}
+    <div><div><span class="to">To:</span> <span class="who">${esc(title(current))}</span></div>
+    ${current.phone && !current.is_group ? `<div class="num">+${esc(current.phone)}</div>` : ""}</div>`;
+  $("thread").innerHTML = '<div class="empty">Loading…</div>';
+  $("chips").innerHTML = "";
+  $("box").disabled = $("send").disabled = false;
+  $("box").focus();
+  drawList();
+  loadMessages(true);
+}
+function mediaHtml(m) {
+  const src = `/api/media?chat=${encodeURIComponent(m.chat)}&id=${encodeURIComponent(m.id)}`;
+  if (m.kind === "photo") return `<img class="photo" src="${src}" loading="lazy" alt="photo" onclick="zoom(this.src)"
+                                   onerror="this.outerHTML='📷 Photo'">`;
+  if (m.kind === "sticker") return `<img class="sticker" src="${src}" loading="lazy" alt="sticker"
+                                     onerror="this.outerHTML='Sticker'">`;
+  if (m.kind === "voice") return `<audio controls preload="none" src="${src}"></audio>`;
+  return {pdf: "📄 PDF", video: "🎬 Video", zip: "🗂 Files"}[m.kind] || "";
+}
+async function loadMessages(scrollDown) {
+  if (!current) return;
+  const jid = current.jid;
+  let msgs;
+  try { msgs = await (await fetch("/api/messages?chat=" + encodeURIComponent(jid))).json(); }
+  catch (e) { return; }
+  if (!current || current.jid !== jid) return;
+  const sig = msgs.length + "|" + (msgs.length ? msgs[msgs.length - 1].id : "");
+  if (sig === lastSig) return;  // nothing new - keep the page as it is (a voice note keeps playing)
+  lastSig = sig;
+  const t = $("thread");
+  const nearBottom = t.scrollHeight - t.scrollTop - t.clientHeight < 120;
+  let html = "", lastDay = "";
+  for (const m of msgs) {
+    const day = dayLabel(m.ts);
+    if (day !== lastDay) { html += `<div class="day"><span>${day}</span></div>`; lastDay = day; }
+    const media = m.kind ? mediaHtml(m) : "";
+    const who = current.is_group && !m.me && m.who ? `<div class="from">${esc(m.who)}</div>` : "";
+    const pic = m.me ? (me ? avatar(me + "@s.whatsapp.net", "Me", "sm") : "") : avatar(current.send_to, current.name, "sm");
+    html += `<div class="msg ${m.me ? "me" : ""}">${pic}<div class="col">${who}
+      ${media ? `<div class="bubble ${m.text ? "" : "media"}">${media}${m.text ? "<br>" + linkify(m.text) : ""}</div>`
+              : `<div class="bubble">${linkify(m.text)}</div>`}
+      <div class="meta">${new Date(m.ts * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})}
+      ${m.me ? '<span class="tick">✓✓</span>' : ""}</div></div></div>`;
+  }
+  t.innerHTML = html || '<div class="empty">No messages stored for this chat yet</div>';
+  if (scrollDown || nearBottom) t.scrollTop = t.scrollHeight;
+  loadSuggestions(jid, msgs.length && !msgs[msgs.length - 1].me);
+}
+async function loadSuggestions(jid, theyWroteLast) {
+  // smart reply (your rules): tap one to put it in the box - you still press send yourself
+  $("chips").innerHTML = "";
+  if (!theyWroteLast) return;
+  let got = [];
+  try { got = await (await fetch("/api/suggest?chat=" + encodeURIComponent(jid))).json(); } catch (e) { return; }
+  if (!current || current.jid !== jid || !Array.isArray(got)) return;
+  $("chips").innerHTML = got.map(t => `<button class="chip" title="Put in the message box">⚡ ${esc(t)}</button>`).join("");
+  $("chips").querySelectorAll(".chip").forEach((b, i) => b.onclick = () => {
+    $("box").value = got[i];
+    $("box").focus();
+  });
+}
+async function send() {
+  const text = $("box").value.trim();
+  if (!text || !current) return;
+  $("send").disabled = true;
+  $("err").textContent = "";
+  try {
+    const r = await (await fetch("/api/send", {method: "POST", headers: {"Content-Type": "application/json"},
+                                              body: JSON.stringify({to: current.send_to, text})})).json();
+    if (r.ok) { $("box").value = ""; await loadMessages(true); loadChats(); }
+    else $("err").textContent = "Not sent: " + (r.error || "unknown problem");
+  } catch (e) { $("err").textContent = "Not sent - is the PC's WhatsApp connected?"; }
+  $("send").disabled = false;
+  $("box").focus();
+}
+function zoom(src) { $("zoomimg").src = src; $("zoom").style.display = "flex"; }
+$("zoom").onclick = () => $("zoom").style.display = "none";
+$("send").onclick = send;
+$("box").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
+$("q").addEventListener("input", drawList);
+
+(async () => {
+  try { const s = await (await fetch("/api/status")).json(); me = s.me && s.me.number; } catch (e) {}
+  await loadChats();
+  setInterval(loadChats, 6000);
+  setInterval(() => loadMessages(false), 3000);
+})();
+</script>
+</body>
+</html>

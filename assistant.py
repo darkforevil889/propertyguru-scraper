@@ -1,4 +1,4 @@
-"""Your personal WhatsApp assistant (Chat bot page -> My assistant).
+"""Your personal WhatsApp assistant (AI Chat bot page -> My assistant).
 
 Runs inside wa_bot.py on the bot's number and talks ONLY to your own number (settings "number"):
 * reminders, one thing per message, at random times inside your hours (default 9 AM - 8 PM, a few a day):
@@ -99,6 +99,9 @@ def _day(ts):
 
 
 # ---------- what's due ----------
+PRIORITY = {"red": 0, "yellow": 1, "green": 2}  # urgent / important / normal - urgent comes first
+
+
 def due(st, today=None):
     """Tasks to bring up today, most pressing first - each at most once a day."""
     today = today or now().date()
@@ -106,7 +109,10 @@ def due(st, today=None):
     for t in st["tasks"]:
         if t.get("status") in ("done", "cancelled") or _day(t.get("last_asked")) == today:
             continue
-        if t["kind"] == "todo":
+        if t["kind"] == "once":  # its own time first (exact_time); still not done after that -> daily like a to-do
+            if t.get("nudges", 0) >= 2:
+                out.append((1, t.get("last_asked") or 0, t))
+        elif t["kind"] == "todo":
             out.append((1, t.get("last_asked") or 0, t))
         elif t["kind"] == "monthly" and t.get("due"):
             d = date.fromisoformat(t["due"])
@@ -116,7 +122,25 @@ def due(st, today=None):
             last = _day(t.get("last_asked"))
             if not last or (today - last).days >= int(t.get("every_days") or 7):
                 out.append((2, t.get("last_asked") or 0, t))
-    return [t for *_, t in sorted(out, key=lambda x: (x[0], x[1]))]
+    return [t for *_, t in sorted(out, key=lambda x: (PRIORITY.get(x[2].get("priority"), 2), x[0], x[1]))]
+
+
+def exact_time(st, n):
+    """A one-time reminder whose time has come (sent then, whatever the plan / quiet time), and once more an hour
+    later if you haven't said it's done. -> the task or None."""
+    for t in sorted(st["tasks"], key=lambda t: PRIORITY.get(t.get("priority"), 2)):
+        if t["kind"] != "once" or t.get("status") in ("done", "cancelled") or not t.get("at"):
+            continue
+        try:
+            at = datetime.fromisoformat(t["at"]).replace(tzinfo=MYT)
+        except ValueError:
+            continue
+        nudges = t.get("nudges", 0)
+        if nudges == 0 and n >= at and n - at < timedelta(hours=12):
+            return t
+        if nudges == 1 and n.timestamp() - (t.get("last_asked") or 0) >= 3600                 and (t.get("answered_at") or 0) < (t.get("last_asked") or 0):
+            return t
+    return None
 
 
 def plan_today(st):
@@ -149,6 +173,7 @@ TEMPLATES = {
     "monthly": ["eh {title} due {due} leh, {days} days only - settled anot?",
                 "记得 {title} ah, due {due} ({days} days)", "{title} - {due} due hor, top up already?"],
     "checkin": ["eh {title}?", "boss, {title}?", "quick one - {title}?"],
+    "once": ["eh 记得 {title} ah, now's the time", "oi {title} now hor, don't forget", "{title} - time liao"],
 }
 
 
@@ -161,7 +186,10 @@ def compose(task, st, extra=""):
              "due": f"{d.day} {d:%b}" if d else None, "days_left": days, "extra": extra}
     asks = {"todo": "Ask casually whether it's done yet.",
             "monthly": "Nudge to renew / settle it before the due date (mention the date and days left).",
-            "checkin": "Ask about it casually, like a friend checking in."}[task["kind"]]
+            "checkin": "Ask about it casually, like a friend checking in.",
+            "once": "It's time to do it NOW - remind him to do it (if it says a time, mention it)."}[task["kind"]]
+    if task.get("priority") == "red":
+        asks += " It's very important to him - make that clear."
     # a different flavour each time, and never like the last few messages - so it doesn't get boring
     flavour = random.choice(["Singlish", "Chinese-English mix (a few Chinese words / 一点华语)", "very short Manglish",
                              "playful, a bit cheeky", "chill, like texting a close friend"])
@@ -197,6 +225,15 @@ def tick(send, force=False):
     if not st.get("enabled") and not force:
         return None
     n = now()
+    t = exact_time(st, n) if not force else None
+    if t:  # a one-time reminder's own time: send it now
+        text = no_emoji(compose(t, st))
+        send(text)
+        t["last_asked"], t["nudges"] = n.timestamp(), t.get("nudges", 0) + 1
+        st["waiting"] = {"task": t["id"], "at": n.timestamp(), "text": text}
+        st["recent"] = ((st.get("recent") or []) + [text])[-10:]
+        save(st)
+        return text
     if not force:
         if not (int(st["start_hour"]) <= n.hour < int(st["end_hour"])):
             return None
@@ -245,9 +282,13 @@ TOOLS = [
             "note": {"type": "string", "description": "what he said, short"}}, "required": ["task_id", "result"]}}},
     {"type": "function", "function": {"name": "add_task", "description": (
         "Add a reminder. kind: todo (remind daily until done), monthly (due date each month, remind N days before), "
-        "checkin (ask every N days)."), "parameters": {"type": "object", "properties": {
-            "title": {"type": "string"}, "kind": {"type": "string", "enum": ["todo", "monthly", "checkin"]},
+        "checkin (ask every N days), once (at a set date and time, e.g. 'remind me tomorrow 9am to call X' - again an "
+        "hour later if not done). priority: red = urgent / very important, yellow = important, green = normal."),
+        "parameters": {"type": "object", "properties": {
+            "title": {"type": "string"}, "kind": {"type": "string", "enum": ["todo", "monthly", "checkin", "once"]},
             "due": {"type": "string", "description": "YYYY-MM-DD (monthly)"},
+            "at": {"type": "string", "description": "YYYY-MM-DDTHH:MM, Malaysia time (once)"},
+            "priority": {"type": "string", "enum": ["red", "yellow", "green"]},
             "remind_days_before": {"type": "integer"}, "every_days": {"type": "integer"}},
             "required": ["title", "kind"]}}},
     {"type": "function", "function": {"name": "list_tasks", "description": "All reminders and their state.",
@@ -259,6 +300,20 @@ TOOLS = [
         "Scan the WhatsApp listing group(s) on the PC now for the last N days and save the owner listings; the "
         "result is sent to Kelvin when done (a few minutes)."),
         "parameters": {"type": "object", "properties": {"days": {"type": "integer"}}}}},
+    {"type": "function", "function": {"name": "practice_customer_reply", "description": (
+        "PRACTICE chat with a pretend owner, step by step: Kelvin writes what the owner says ('customer: Axon 650sf'; "
+        "'customer: rent' = the same owner's next answer; 'new customer: ...' = a different owner -> new_customer). "
+        "Returns 3 drafts for Kelvin's next message; while something is missing they ask only that. Once all is "
+        "known it checks PropertyGuru & iProperty live (about a minute) and returns the 5 lowest prices (fake "
+        "marked), the lowest real for that size and a suggested price. Show any prices given and the 3 drafts "
+        "numbered 1-3 exactly as given. Drafts only - nothing is sent."),
+        "parameters": {"type": "object", "properties": {"message": {"type": "string"},
+                                                        "new_customer": {"type": "boolean"}},
+                       "required": ["message"]}}},
+    {"type": "function", "function": {"name": "pick_customer_reply", "description": (
+        "Kelvin chose the best draft of the last practice ('2 is best', 'pick 1') or wrote his own better reply - "
+        "saved so later drafts sound like him."), "parameters": {"type": "object", "properties": {
+            "number": {"type": "integer"}, "own_text": {"type": "string"}}}}},
     {"type": "function", "function": {"name": "call_progress", "description": (
         "Today's ipline AI calls (单任务外呼): numbers left, on the line now, called today, finished or not, "
         "ipline's message. Read only - calls are started / stopped by Kelvin himself on ipline, never by you."),
@@ -298,14 +353,16 @@ def _update_task(st, task_id, result, started_on=None, note=None):
                                                                                          now().date().isoformat())
             t["due"], t["last_asked"] = add_month(base).isoformat(), time.time()
             t["status"] = "open"
-        elif t["kind"] == "todo":
+        elif t["kind"] in ("todo", "once"):
             t["status"] = "done"
     return {"ok": True, "task": t}
 
 
-def _add_task(st, title, kind, due=None, remind_days_before=10, every_days=None):
+def _add_task(st, title, kind, due=None, remind_days_before=10, every_days=None, at=None, priority="green"):
     tid = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:30] or f"t{int(time.time())}"
-    t = {"id": tid, "title": title, "kind": kind, "status": "open"}
+    t = {"id": tid, "title": title, "kind": kind, "status": "open", "priority": priority or "green"}
+    if kind == "once":
+        t["at"] = (at or (now() + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M"))[:16]
     if kind == "monthly":
         t.update(due=due or add_month(now().date()).isoformat(), remind_days_before=remind_days_before or 10)
     if kind == "checkin":
@@ -332,6 +389,38 @@ def _blasts():
                     "sent": sent, "failed": sum(1 for r in res.values() if r.get("status") != "sent"),
                     "to_go": len(j["numbers"]) - len(res), "state": wa_blast.state_of(j)})
     return out or {"result": "no blasts"}
+
+
+def _practice(message, new_customer=False):
+    import customer_reply
+    db = _db()
+    chats = customer_reply.load(db)["chats"]
+    last = chats[-1] if chats else None
+    same = last and not new_customer and time.time() - last.get("at", 0) < 6 * 3600
+    c = customer_reply.analyse(db, re.sub(r"^\s*(new\s+)?customer\s*:\s*", "", message, flags=re.I),
+                               chat_id=last["id"] if same else None)
+    m = c.get("market") or {}
+    out = {"still_missing": c.get("missing"), "drafts": c.get("options")}
+    if not c.get("missing") and m:  # price facts only once everything is known
+        out.update(building=m.get("property"), rent_or_sale=m.get("kind"),
+                   five_lowest=[f"RM{u['price']:,}" + (" fake/bait" if u["fake"] else "") for u in m.get("five") or []],
+                   lowest_real_for_size=m.get("lowest_real"), typical=m.get("typical"), suggested=m.get("suggested"))
+    return out
+
+
+def _practice_pick(number=None, own_text=None):
+    import customer_reply
+    db = _db()
+    chats = customer_reply.load(db)["chats"]
+    if not chats:
+        return {"error": "no practice yet"}
+    c = chats[-1]
+    text = own_text or ((c.get("options") or [])[number - 1] if number and 0 < number <= len(c.get("options") or [])
+                        else None)
+    if not text:
+        return {"error": "which one? 1, 2 or 3 - or his own words"}
+    customer_reply.pick(db, c["id"], text)
+    return {"ok": True, "saved_as_his_style": text}
 
 
 def _blast_control(blast_id=None, action="run"):
@@ -583,7 +672,7 @@ def _blast(st, turn, source, days=1, numbers="", message=None, confirm=False):
         st["pending_action"] = {"kind": "blast", "key": key, "at": time.time()}
         return {"needs_confirm": True, "preview": preview,
                 "say": "show the count + message and ask Kelvin to confirm (yes) before sending"}
-    kw = {k: last[k] for k in ("triggers", "delay", "daily_limit", "window") if last and last.get(k)}
+    kw = {k: last[k] for k in ("delay", "daily_limit", "window") if last and last.get(k)}
     if last and last.get("rest"):
         kw["rest"] = (last["rest"].get("every", 0), last["rest"].get("minutes", 0))
     bid = wa_blast.create("main", nums, msg, **kw)
@@ -714,44 +803,54 @@ def _pg_overview():
             "running_now": s.get("text") if s.get("state") == "running" else None}
 
 
+DDG_PAUSED = {"until": 0}  # DuckDuckGo asked "are you human?" -> leave it alone a while (asking again keeps it on)
+
+
 def _web(query):
-    """Internet search - top results: Tavily (TAVILY_API_KEY in .env, 1,000 free a month), else DuckDuckGo."""
+    """Internet search - top results: DuckDuckGo (free) first; Tavily (TAVILY_API_KEY in .env, 1,000 free a month)
+    only when DuckDuckGo is blocking or finds nothing."""
     import html
     import urllib.parse
     import urllib.request
-    if os.environ.get("TAVILY_API_KEY"):
+    out = []
+    if time.time() > DDG_PAUSED["until"]:
+        try:
+            req = urllib.request.Request("https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query), headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/130 Safari/537.36"})
+            page = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "replace")
+            if "bots use DuckDuckGo" in page:
+                DDG_PAUSED["until"] = time.time() + 2 * 3600
+                print("duckduckgo: human check - Tavily for the next 2 hours", flush=True)
+            else:
+                clean = lambda x: html.unescape(re.sub(r"<[^>]+>", "", x)).strip()  # noqa: E731
+                links = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page, re.S)
+                snips = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', page, re.S)
+                for (url, title), snip in list(zip(links, snips))[:6]:
+                    real = urllib.parse.parse_qs(urllib.parse.urlparse(html.unescape(url)).query).get("uddg",
+                                                                                                      [url])[0]
+                    out.append({"title": clean(title), "snippet": clean(snip)[:300], "link": real})
+        except Exception as e:
+            print("duckduckgo:", str(e)[:200], flush=True)
+    if not out and os.environ.get("TAVILY_API_KEY"):
         try:
             req = urllib.request.Request("https://api.tavily.com/search", method="POST", data=json.dumps({
                 "query": query, "max_results": 6, "search_depth": "basic"}).encode(), headers={
                 "Content-Type": "application/json", "Authorization": f"Bearer {os.environ['TAVILY_API_KEY']}"})
             found = json.loads(urllib.request.urlopen(req, timeout=30).read()).get("results") or []
-            if found:
-                return [{"title": r.get("title", ""), "snippet": (r.get("content") or "")[:300],
-                         "link": r.get("url", "")} for r in found]
-        except Exception as e:  # out of free searches / down: DuckDuckGo below
+            out = [{"title": r.get("title", ""), "snippet": (r.get("content") or "")[:300],
+                    "link": r.get("url", "")} for r in found]
+        except Exception as e:
             print("tavily:", str(e)[:200], flush=True)
-    req = urllib.request.Request("https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query), headers={
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 "
-                      "Safari/537.36"})
-    page = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "replace")
-    if "bots use DuckDuckGo" in page:
-        return {"result": "internet search not available right now - try again later"}
-    clean = lambda x: html.unescape(re.sub(r"<[^>]+>", "", x)).strip()  # noqa: E731
-    links = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page, re.S)
-    snips = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', page, re.S)
-    out = []
-    for (url, title), snip in list(zip(links, snips))[:6]:
-        real = urllib.parse.parse_qs(urllib.parse.urlparse(html.unescape(url)).query).get("uddg", [url])[0]
-        out.append({"title": clean(title), "snippet": clean(snip)[:300], "link": real})
-    return out or {"result": "nothing found"}
+    return out or {"result": "nothing found (internet search may be busy - try again later)"}
 
 
 EMOJI = re.compile("[🀀-🫿☀-➿⬀-⯿️‍⃣]+")
 
 
 def no_emoji(text):
-    """Kelvin doesn't want emojis (stickers instead) - strip any the AI still put in."""
-    return re.sub(r"[ 	]{2,}", " ", EMOJI.sub("", text or "")).strip()
+    """Kelvin doesn't want emojis (stickers instead) - strip any the AI still put in (and runs of dots: "......")."""
+    return re.sub(r"\.{4,}", ".", re.sub(r"[ 	]{2,}", " ", EMOJI.sub("", text or ""))).strip()
 
 
 LINK = re.compile(r"https?://\S+|\b(?:www\.)?[\w-]+(?:\.[\w-]+)*\.(?:com|my|net|org|io|sg|co|gov|edu|ai|app)\b(?:/\S*)?",
@@ -778,7 +877,7 @@ def _tidy(text):
 
 HIS_DATA = {"whatsapp_listings", "find_saved_listing", "search_pg_listings", "condo_price", "propertyguru_posts",
             "propertyguru_overview", "ai_call_results", "blast_status", "leads_today", "google_maps_results",
-            "call_progress"}
+            "call_progress", "practice_customer_reply"}
 
 
 def _made_up(text, real, prices=True):
@@ -890,6 +989,7 @@ def reply(history, send, send_photos=None):
         "list_tasks": lambda: st["tasks"], "whatsapp_listings": lambda days=1: _listings(days),
         "scan_listing_group": lambda days=1: _scan(days, send), "blast_status": _blasts,
         "call_progress": lambda: __import__("ai_call_watch").progress(),
+        "practice_customer_reply": _practice, "pick_customer_reply": _practice_pick,
         "blast_control": lambda action, blast_id=None: _blast_control(blast_id, action),
         "condo_price": lambda name: bot_brain.condo_price(name), "propertyguru_posts": lambda day: _posts(day),
         "leads_today": lambda: {"count": len(leads_today()), "places": [r["place"] for r in leads_today()][:15]},

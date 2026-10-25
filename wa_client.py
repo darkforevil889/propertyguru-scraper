@@ -9,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent
 DATA = ROOT / "wa_data"
+EXPORT_ROOT = (ROOT / "wa_exports").resolve()  # full path: the connector runs in another folder
 URL = "http://127.0.0.1:3078"
 
 
@@ -56,6 +57,41 @@ def ensure_running():
 def download(ids, out_dir):
     """ids: [(chat_jid, msg_id)] -> {msg_id: filename} for photos that could still be downloaded."""
     return _call("POST", "/download", {"ids": [list(i) for i in ids], "outDir": str(out_dir)}, timeout=3600)
+
+
+def send(to, text):
+    """Send your reply to a chat (its jid: '60123456789@s.whatsapp.net', '...@lid' or a group '...@g.us')."""
+    return _call("POST", "/send", {"to": to, "text": text}, timeout=60)
+
+
+def avatar(jid):
+    """Profile picture file of a chat (the connector keeps them on this PC), or None."""
+    try:
+        return _call("POST", "/avatar", {"jid": jid}, timeout=30).get("path")
+    except Exception:
+        return None
+
+
+def media(chat_jid, msg_id):
+    """A photo / voice note / sticker of the WhatsApp chats page -> its file on this PC (downloaded once), or None."""
+    folder = EXPORT_ROOT / "chat_media"
+    have = list(folder.glob(f"{''.join(ch for ch in msg_id if ch.isalnum())[:40]}.*")) if folder.exists() else []
+    if have:
+        return str(have[0])
+    name = download([(chat_jid, msg_id)], folder).get(msg_id)
+    return str(folder / name) if name else None
+
+
+def last_lines(chat_jids):
+    """{chat jid: (last message text, its time)} - the preview line in the chat list."""
+    if not chat_jids or not (DATA / "messages.sqlite").exists():
+        return {}
+    marks = ",".join("?" * len(chat_jids))
+    with _db() as con:
+        rows = con.execute(f"""SELECT chat_jid, body, has_image, MAX(ts) FROM messages
+                               WHERE chat_jid IN ({marks}) GROUP BY chat_jid""", chat_jids).fetchall()
+    kinds = {1: "📷 Photo", 2: "📄 PDF", 3: "🎬 Video", 4: "🗂 Files", 5: "🎤 Voice message", 6: "Sticker"}
+    return {c: ((body or kinds.get(media, "")).replace("\n", " ")[:70], ts) for c, body, media, ts in rows}
 
 
 def logout():
@@ -143,8 +179,9 @@ def chats():
     return sorted(merged.values(), key=lambda e: -e["last_ts"])
 
 
-def messages(chat_jids, since_ts):
-    """Stored messages for these chats since a unix time, in the record format wa_parser.group_listings expects."""
+def messages(chat_jids, since_ts, everything=False):
+    """Stored messages for these chats since a unix time, in the record format wa_parser.group_listings expects.
+    Voice notes and stickers only with everything=True (the WhatsApp chats page) - scans never see them."""
     if not chat_jids:
         return []
     lid_phone, names = _contacts()
@@ -155,7 +192,8 @@ def messages(chat_jids, since_ts):
         has_reply = any(c[1] == "reply_to" for c in con.execute("PRAGMA table_info(messages)"))
         rows = con.execute(f"""SELECT chat_jid, id, sender_jid, sender_name, sender_phone, ts, from_me, body, has_image,
                                       {'reply_to' if has_reply else 'NULL'}
-                               FROM messages WHERE chat_jid IN ({marks}) AND ts >= ? ORDER BY ts""",
+                               FROM messages WHERE chat_jid IN ({marks}) AND ts >= ?
+                               {'' if everything else 'AND has_image NOT IN (5, 6)'} ORDER BY ts""",
                            [*chat_jids, int(since_ts)]).fetchall()
     out = []
     for chat, mid, sender, sname, sphone, ts, from_me, body, has_image, reply in rows:
@@ -165,6 +203,7 @@ def messages(chat_jids, since_ts):
         out.append({"chatId": chat, "id": mid, "author": phone or sender or chat, "authorName": name,
                     "authorNumber": phone, "timestamp": ts, "fromMe": bool(from_me), "body": body or "",
                     "has_image": has_image == 1, "is_pdf": has_image == 2, "is_video": has_image == 3,
-                    "is_zip": has_image == 4, "photo": None, "reply_to": reply,
+                    "is_zip": has_image == 4, "is_voice": has_image == 5, "is_sticker": has_image == 6,
+                    "photo": None, "reply_to": reply,
                     "chatName": cname or (f"+{cphone}" if cphone else chat.split("@")[0])})
     return out

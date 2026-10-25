@@ -1,4 +1,4 @@
-"""Dashboard side of the WhatsApp bot (wa_bot.py): start it, status, settings, FAQ, conversation log."""
+"""Dashboard side of your WhatsApp assistant (wa_bot.py): start it, status, link / unlink, chat log."""
 import json
 import re
 import sqlite3
@@ -67,19 +67,6 @@ def assistant_say(text):
 def assistant_nudge():
     """Your assistant sends you one reminder now (the bot words and sends it in the background)."""
     return _call("POST", "/assistant_nudge", timeout=10)
-
-
-def load_settings():
-    try:
-        s = json.loads((DATA / "bot_settings.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        s = {}
-    return {"enabled": True, "max_replies_per_day": 500, "ignore_numbers": [], **s}
-
-
-def save_settings(s):
-    DATA.mkdir(exist_ok=True)
-    (DATA / "bot_settings.json").write_text(json.dumps(s, indent=1), encoding="utf-8")
 
 
 def set_env(key, value):

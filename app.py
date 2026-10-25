@@ -112,10 +112,11 @@ with st.sidebar:
         st.session_state.logged_out = True
         write_cookie("", days=0)
         st.rerun()
-    pages = ["Listings", "Condo prices", "WhatsApp listing", "PropertyGuru posting", "WhatsApp blast", "Chat bot",
+    pages = ["Listings", "Condo prices", "WhatsApp chats", "WhatsApp listing", "PropertyGuru posting",
+             "WhatsApp blast", "AI Chat bot",
              "AI call", "Google Map Extractor", "Phone filter", "Price filter"]
     if st.session_state.get("page") not in pages:  # e.g. a page that was renamed since
-        st.session_state.page = {"WhatsApp": "WhatsApp listing"}.get(st.session_state.get("page"), pages[0])
+        st.session_state.page = {"WhatsApp": "WhatsApp listing", "Chat bot": "AI Chat bot"}.get(st.session_state.get("page"), pages[0])
     tool = st.radio("Page", pages, key="page")
 
 
@@ -1056,6 +1057,140 @@ def saved_listings_tab():
                 col.markdown(f"[⬇ Download picture {n + 1}]({link})")
 
 
+def whatsapp_chats_page():
+    """Your WhatsApp (the number linked on the WhatsApp listing page) in a WhatsApp-style window (wa_chat_ui.py,
+    a small page on this PC). Online, the copy your PC keeps up to date (wa_chat_sync.py)."""
+    import streamlit.components.v1 as components
+
+    import wa_chat_ui
+    import wa_client
+    try:
+        import neonize  # noqa: F401 - only installed on the PC
+    except ImportError:
+        return whatsapp_chats_online()  # online dashboard: what your PC copied up, replies sent by the PC
+    try:
+        s = wa_client.ensure_running()
+    except Exception as e:
+        st.error(str(e))
+        return
+    if s.get("status") != "ready":
+        st.title("WhatsApp chats")
+        st.warning("Your WhatsApp isn't connected - link it on the WhatsApp listing page first.")
+        return
+    wa_chat_ui.ensure_running()
+    url = f"http://127.0.0.1:{wa_chat_ui.PORT}"
+    st.markdown(f"**WhatsApp chats** · [open in its own window ↗]({url}) · messages since your WhatsApp was linked "
+                "to the KL Tracker (voice notes and stickers from now on)")
+    components.iframe(url, height=760)
+
+
+def whatsapp_chats_online():
+    """WhatsApp chats on the online dashboard: what your PC copied up (wa_chat_sync.py); replies go to the PC, which
+    sends them within about 15 seconds."""
+    import time
+
+    import wa_chat_sync
+    st.title("WhatsApp chats")
+    ix = wa_chat_sync.index(db)
+    if not ix.get("chats"):
+        st.info("Your PC hasn't copied your chats up yet - make sure it's on, then reload in a minute.")
+        return
+    age = time.time() - (ix.get("at") or 0)
+    if age > 300:
+        st.warning(f"🖥️ Your PC was last seen {age / 60:.0f} minutes ago - new messages and your replies wait until "
+                   "it's back on.")
+    st.markdown("<style>.st-key-wco-list img, .st-key-wco-head img, .st-key-wco-thread "
+                "[data-testid='stChatMessageAvatarCustom'] img {border-radius: 50%; object-fit: cover;}</style>",
+                unsafe_allow_html=True)
+
+    def when(ts):
+        d = datetime.fromtimestamp(ts or 0, MYT)
+        return d.strftime("%I:%M %p").lstrip("0") if d.date() == datetime.now(MYT).date() else d.strftime("%d %b")
+
+    chats = ix["chats"]
+    pics = signed_urls([c["avatar"] for c in chats if c.get("avatar")])
+    left, right = st.columns([1, 2.2])
+    with left:
+        q = st.text_input("Search", placeholder="🔍 Search…", label_visibility="collapsed", key="wco-q")
+        shown = [c for c in chats if not q or q.lower() in (c["name"] or "").lower() or q in (c["phone"] or "")]
+        if not shown:
+            st.caption("No chats.")
+            return
+        if st.session_state.get("wco-chat") not in {c["key"] for c in shown}:
+            st.session_state["wco-chat"] = shown[0]["key"]
+        with st.container(height=640, key="wco-list"):
+            for c in shown:
+                a, b, t = st.columns([0.17, 0.6, 0.23], vertical_alignment="center", gap="small")
+                if pics.get(c.get("avatar")):
+                    a.image(pics[c["avatar"]], width=42)
+                else:
+                    a.markdown("### 👥" if c["is_group"] else "### 👤")
+                name = ("👥 " if c["is_group"] else "") + (c["name"] or f"+{c['phone']}")
+                if b.button(name, key=f"wco-{c['key']}", width="stretch",
+                            type="primary" if c["key"] == st.session_state["wco-chat"] else "tertiary"):
+                    st.session_state["wco-chat"] = c["key"]
+                    st.rerun()
+                b.caption(c.get("preview") or " ")
+                t.caption(when(c["last_ts"]))
+    cur = next(c for c in shown if c["key"] == st.session_state["wco-chat"])
+    title = ("👥 " if cur["is_group"] else "") + (cur["name"] or f"+{cur['phone']}")
+    with right:
+        with st.container(key="wco-head"):
+            h1, h2 = st.columns([0.1, 0.9], vertical_alignment="center")
+            if pics.get(cur.get("avatar")):
+                h1.image(pics[cur["avatar"]], width=48)
+            h2.subheader(title)
+            if cur["phone"] and not cur["is_group"]:
+                h2.caption(f"+{cur['phone']}")
+
+        @st.fragment(run_every="10s")
+        def thread():
+            data = wa_chat_sync.chat(db, cur["key"])
+            msgs = data.get("messages") or []
+            files = signed_urls([m["file"] for m in msgs if m.get("file")])
+            waiting = [t["params"]["text"] for t in wa_chat_sync.pending_sends(db)
+                       if (t.get("params") or {}).get("to") == cur["send_to"]]
+            with st.container(height=500, key="wco-thread"):
+                if not msgs:
+                    st.caption("No messages copied for this chat yet.")
+                for m in msgs:
+                    with st.chat_message("assistant" if m["me"] else "user",
+                                         avatar="🟢" if m["me"] else (pics.get(cur.get("avatar")) or "👤")):
+                        if cur["is_group"] and not m["me"] and m.get("who"):
+                            st.caption(m["who"])
+                        url = files.get(m.get("file"))
+                        if url and m["kind"] == "photo":
+                            st.image(url, width=260)
+                        elif url and m["kind"] == "sticker":
+                            st.image(url, width=120)
+                        elif url and m["kind"] == "voice":
+                            st.audio(url)
+                        elif m["kind"]:
+                            st.write({"photo": "📷 Photo", "pdf": "📄 PDF", "video": "🎬 Video", "zip": "🗂 Files",
+                                      "voice": "🎤 Voice message", "sticker": "Sticker"}.get(m["kind"], ""))
+                        if m.get("text"):
+                            st.write(m["text"])
+                        st.caption(("You · " if m["me"] else "") + when(m["ts"]))
+                for text in waiting:
+                    with st.chat_message("assistant", avatar="⏳"):
+                        st.write(text)
+                        st.caption("sending through your PC…")
+            if data.get("suggest") and msgs and not msgs[-1]["me"]:
+                for s_ in data["suggest"]:
+                    if st.button(f"⚡ {s_}", key=f"wco-sug-{cur['key']}-{hash(s_)}",
+                                 help="Put it in the message box - you still press Send"):
+                        st.session_state["wco-box"] = s_
+                        st.rerun(scope="app")
+        thread()
+        with st.form("wco-send", clear_on_submit=True, border=False):
+            f1, f2 = st.columns([0.85, 0.15], vertical_alignment="bottom")
+            text = f1.text_area("Message", key="wco-box", placeholder=f"Type a message to {title}", height=68,
+                                label_visibility="collapsed")
+            if f2.form_submit_button("Send ➤", type="primary", width="stretch") and text.strip():
+                wa_chat_sync.request_send(db, cur["send_to"], text.strip())
+                st.toast("Sending through your PC (about 15 seconds)…")
+
+
 def whatsapp_page():
     st.title("WhatsApp owner listings")
     scan, saved = st.tabs(["Scan chats", "Saved listings"])
@@ -1451,12 +1586,110 @@ def condo_prices_page():
 
 # ---------- WhatsApp chat bot (auto-replies on a separate number) ----------
 def chat_bot_page():
-    st.title("WhatsApp chat bot")
-    mine, prop = st.tabs(["🙋 My assistant", "🏠 Property bot"])
+    st.title("AI Chat bot")
+    mine, smart, practice = st.tabs(["🙋 My assistant", "⚡ Smart reply", "💬 Customer reply"])
     with mine:
         assistant_tab()
-    with prop:
-        property_bot_page()
+    with smart:
+        smart_reply_tab()
+    with practice:
+        customer_reply_tab()
+
+
+def smart_reply_tab():
+    """Your smart reply rules (smart_reply.py): shown as tap-to-use buttons in the WhatsApp chats window."""
+    import smart_reply
+    st.caption("When a customer writes, the reply whose rule fits shows as a ⚡ button above the message box in "
+               "**WhatsApp chats**. Tap it, change it if you like, then press send yourself - nothing is ever sent "
+               "by itself. Add a rule on the last row, delete with the bin, then **Save**.")
+    rules = smart_reply.load(db)
+    edited = st.data_editor(
+        pd.DataFrame(rules or [{"when": "", "reply": ""}]), num_rows="dynamic", hide_index=True, width="stretch",
+        key="sr-rules",
+        column_config={"when": st.column_config.TextColumn("When the customer…", width="medium", required=True),
+                       "reply": st.column_config.TextColumn("Suggested reply", width="large", required=True)})
+    c1, c2 = st.columns([1, 4])
+    if c1.button("💾 Save", key="sr-save", type="primary"):
+        kept = smart_reply.save(db, edited.fillna("").to_dict("records"))
+        st.toast(f"Saved {len(kept)} rules")
+        st.rerun()
+    if c2.button("↩️ Back to the original rules", key="sr-reset"):
+        smart_reply.save(db, smart_reply.DEFAULT)
+        st.rerun()
+
+
+def customer_reply_tab():
+    """Practice: what an owner / customer says -> PropertyGuru now + 3 reply drafts -> you pick the best
+    (customer_reply.py). Drafts only - nothing is sent."""
+    import importlib
+    import customer_reply
+    importlib.reload(customer_reply)
+    on_pc = (ROOT_DIR / "market_check.py").exists() and bool(os.environ.get("SUPABASE_SECRET_KEY"))
+    st.caption("Practise a WhatsApp chat with an owner, step by step: type what the owner says, pick the best of 3 "
+               "replies (or write your own), then type the owner's next answer. While the building, rent or sale, "
+               "or size is still missing, it asks only that one thing. Once all three are known it checks "
+               "PropertyGuru & iProperty right now - the 5 lowest prices, fake ones marked, the lowest real one and "
+               "a suggested price - and the replies give the price advice. Your picks teach it your style. "
+               "Practice only - nothing is sent to anyone. Also on WhatsApp: tell your assistant "
+               "\"customer: Axon 650sf\".")
+    data = customer_reply.load(db)
+    for c in data["chats"][-6:]:
+        for line in customer_reply._lines(c):
+            if line["who"] == "customer":
+                with st.chat_message("user", avatar="🧑"):
+                    st.write(line["text"])
+            else:
+                with st.chat_message("assistant", avatar="✅"):
+                    st.write(line["text"])
+        m = c.get("market")
+        if m or c.get("missing"):
+            practice_market_box(c, m)
+        for i, opt in enumerate(c.get("options") or []):
+            with st.chat_message("assistant", avatar="💬"):
+                st.write(opt)
+                if st.button("👍 Pick this one", key=f"cr-pick-{c['id']}-{i}"):
+                    customer_reply.pick(db, c["id"], opt)
+                    st.rerun()
+        if c.get("options"):
+            with st.expander("✏️ My own better reply", expanded=False):
+                mine = st.text_area("Your reply", key=f"cr-own-{c['id']}", label_visibility="collapsed")
+                if st.button("Save as my pick", key=f"cr-own-btn-{c['id']}", disabled=not mine.strip()):
+                    customer_reply.pick(db, c["id"], mine.strip())
+                    st.rerun()
+        st.divider()
+    last = data["chats"][-1] if data["chats"] else None
+    who = st.radio("Next message is from", ["The same owner (continue)", "A new owner"], horizontal=True,
+                   index=0 if last and not last.get("options") else 1, key="cr-who", disabled=not last)
+    said = st.chat_input("What does the owner say?", disabled=not on_pc)
+    if said:
+        with st.status("Thinking…", expanded=True) as box:
+            try:
+                customer_reply.analyse(db, said, progress=lambda t: box.update(label=t),
+                                       chat_id=last["id"] if last and who.startswith("The same") else None)
+                box.update(label="Done", state="complete")
+            except Exception as e:
+                box.update(label=f"Couldn't check: {e}", state="error")
+                st.stop()
+        st.rerun()
+
+
+def practice_market_box(c, m):
+    """The market check of a practice chat (or what's still missing before it can check)."""
+    with st.chat_message("assistant", avatar="📊"):
+        if m and m.get("five"):
+            st.markdown(f"**{m.get('property') or c['details'].get('place')}** · {m['kind']} · lowest real "
+                        f"**RM{m['lowest_real'] or 0:,.0f}** · typical RM{m.get('typical') or 0:,.0f} · "
+                        f"suggested **RM{m.get('suggested') or 0:,.0f}**"
+                        + (f" · _{m['note']}_" if m.get("note") else ""))
+            st.dataframe(pd.DataFrame([{"Price (RM)": u["price"], "Size (sf)": u.get("sqft"), "Rooms": u.get("beds"),
+                                        "Real?": "❌ fake / bait" if u["fake"] else "✅", "Why": u.get("why") or "",
+                                        "Link": u.get("url")} for u in m["five"]]),
+                         hide_index=True, width="stretch",
+                         column_config={"Link": st.column_config.LinkColumn("Link", display_text="open")})
+        elif m:
+            st.write(m.get("why") or "Nothing to compare with on PropertyGuru right now.")
+        else:
+            st.write("Price check waits until it knows: " + ", ".join(c["missing"]))
 
 
 def assistant_tab():
@@ -1474,13 +1707,15 @@ def assistant_tab():
                "your hours, in Singlish / Chinese-English, worded differently every time. Answer it like a friend "
                "(\"not yet\", \"done\", \"bought, starts 5 Nov\") - and ask it things: \"give me whatsapp listing\", "
                "\"blast 30 done?\", \"resume the blast\", \"Residence 22 price?\", \"yesterday post what on "
-               "PropertyGuru?\", \"scan the listing group\", \"remind me pay TNB every 15th\". Works even when the "
-               "property bot is off. Runs on your PC.")
+               "PropertyGuru?\", \"scan the listing group\", \"remind me pay TNB every 15th\". Runs on your "
+               "PC.")
     me = (bot.get("me") or {}).get("number")
     status = bot.get("status") or "off"
     (st.success if status == "ready" else st.warning)(
         f"Bot WhatsApp: **{status}**" + (f" (+{me})" if me else "") + f" → texts **+{a.get('number')}**"
         + ("" if a.get("enabled") else " · ⏸ assistant switched off"))
+    if on_pc:
+        bot_connection(status)
 
     # ----- settings -----
     with st.expander("⚙️ Settings", expanded=False):
@@ -1500,11 +1735,16 @@ def assistant_tab():
     # ----- reminders -----
     st.markdown("**Your reminders** - change, add (last row) or delete (tick the row, then the bin), then **Save "
                 "reminders**")
-    kinds = {"todo": "To-do (daily until done)", "monthly": "Monthly (due date)", "checkin": "Check-in (every N days)"}
+    kinds = {"todo": "To-do (daily until done)", "monthly": "Monthly (due date)", "checkin": "Check-in (every N days)",
+             "once": "One time (date & time)"}
     back = {v: k for k, v in kinds.items()}
+    levels = {"red": "🔴 Urgent", "yellow": "🟡 Important", "green": "🟢 Normal"}
+    level_back = {v: k for k, v in levels.items()}
     table = pd.DataFrame([{
+        "Importance": levels.get(t.get("priority"), levels["green"]),
         "Reminder": t.get("title"), "Type": kinds.get(t.get("kind")),
-        "Due date": pd.to_datetime(t["due"]).date() if t.get("due") else None,
+        "Due date": pd.to_datetime(t.get("at") or t["due"]).date() if t.get("at") or t.get("due") else None,
+        "Time": pd.to_datetime(t["at"]).time() if t.get("at") else None,
         "Remind days before": t.get("remind_days_before"), "Ask every N days": t.get("every_days"),
         "Status": t.get("status") or "open", "Last answer": t.get("note") or "",
         "Last asked": datetime.fromtimestamp(t["last_asked"], MYT).strftime("%d %b %H:%M") if t.get("last_asked")
@@ -1512,8 +1752,13 @@ def assistant_tab():
     edited = st.data_editor(
         table, hide_index=True, width="stretch", num_rows="dynamic", key="as-tasks",
         disabled=["Last answer", "Last asked"],
-        column_config={"Type": st.column_config.SelectboxColumn(options=list(kinds.values()), required=True),
-                       "Due date": st.column_config.DateColumn(format="DD MMM YYYY"),
+        column_config={"Importance": st.column_config.SelectboxColumn(options=list(levels.values()), required=True,
+                                                                      default=levels["green"]),
+                       "Type": st.column_config.SelectboxColumn(options=list(kinds.values()), required=True),
+                       "Due date": st.column_config.DateColumn(format="DD MMM YYYY",
+                                                               help="Monthly: due date · One time: the day"),
+                       "Time": st.column_config.TimeColumn(format="hh:mm a", step=300,
+                                                           help="One time reminders: when to WhatsApp you"),
                        "Remind days before": st.column_config.NumberColumn(min_value=0, max_value=60),
                        "Ask every N days": st.column_config.NumberColumn(min_value=1, max_value=60),
                        "Status": st.column_config.SelectboxColumn(options=["open", "done", "cancelled"]),
@@ -1527,8 +1772,16 @@ def assistant_tab():
             tid = r["_id"] if isinstance(r["_id"], str) and r["_id"] in old else \
                 re.sub(r"[^a-z0-9]+", "-", r["Reminder"].lower()).strip("-")[:30] or f"t{len(tasks)}"
             t = {**old.get(tid, {}), "id": tid, "title": r["Reminder"].strip(),
-                 "kind": back.get(r["Type"], "todo"), "status": r["Status"] or "open"}
-            t["due"] = r["Due date"].isoformat() if not pd.isna(r["Due date"]) and r["Due date"] else None
+                 "kind": back.get(r["Type"], "todo"), "status": r["Status"] or "open",
+                 "priority": level_back.get(r["Importance"], "green")}
+            day = r["Due date"] if not pd.isna(r["Due date"]) and r["Due date"] else None
+            if t["kind"] == "once":
+                when = r["Time"] if not pd.isna(r["Time"]) and r["Time"] else datetime.strptime("09:00", "%H:%M").time()
+                at = f"{day or datetime.now(MYT).date()}T{when:%H:%M}"
+                if at != t.get("at"):  # a new time: it goes out (again) at that time
+                    t["at"], t["nudges"] = at, 0
+                day = None
+            t["due"] = day.isoformat() if day else None
             t["remind_days_before"] = int(r["Remind days before"]) if not pd.isna(r["Remind days before"]) else 10
             t["every_days"] = int(r["Ask every N days"]) if not pd.isna(r["Ask every N days"]) else 7
             tasks.append(t)
@@ -1566,200 +1819,52 @@ def assistant_tab():
                         f"{text}", unsafe_allow_html=True)
 
 
-def property_bot_page():
+def bot_connection(status):
+    """Link the assistant's WhatsApp by QR code / unlink it, and the free AI key (PC only)."""
     import base64
 
-    import bot_brain
     import bot_client
-
-    st.caption("Auto-replies on a SEPARATE WhatsApp number: finds listings, quotes condo prices, answers your FAQ and "
-               "collects owner listings (saved to WhatsApp → Saved listings). Replies to private chats only - never "
-               "groups, never messages anyone first. Runs on your PC: keep it on for instant replies.")
-    try:
-        import neonize  # noqa: F401 - only installed on the PC
-    except ImportError:
-        return chat_bot_remote()  # online dashboard: the bot runs on the PC, settings go through Supabase
-    try:
-        s = bot_client.ensure_running()
-    except Exception as e:
-        st.error(str(e))
-        return
-
-    # 1) link the bot's number
-    if s["status"] not in ("ready", "connecting"):
-        @st.fragment(run_every="3s")
-        def link_box():
-            try:
-                cur = bot_client.ensure_running()
-            except Exception as e:
-                st.error(str(e))
-                return
-            if cur.get("status") in ("ready", "connecting"):
-                st.rerun(scope="app")
-            if cur.get("status") == "qr" and cur.get("qr"):
-                st.image(base64.b64decode(cur["qr"].split(",", 1)[1]), width=300)
-                st.markdown("On the phone of the number the bot should use: **WhatsApp → ⋮ / Settings → Linked "
-                            "devices → Link a device**, then scan. It shows as **KL Tracker Bot**. Your main number "
-                            "is fine - with the property bot OFF, other people's chats aren't read or kept.")
-            elif cur.get("status") in ("error", "logged_out"):
-                st.error(cur.get("error") or "Disconnected.")
-                if st.button("Start again"):
-                    bot_client.logout()
+    with st.expander("📱 WhatsApp connection & AI key", expanded=status != "ready"):
+        try:
+            s = bot_client.ensure_running()
+        except Exception as e:
+            st.error(str(e))
+            return
+        if s["status"] not in ("ready", "connecting"):
+            @st.fragment(run_every="3s")
+            def link_box():
+                try:
+                    cur = bot_client.ensure_running()
+                except Exception as e:
+                    st.error(str(e))
+                    return
+                if cur.get("status") in ("ready", "connecting"):
                     st.rerun(scope="app")
-            else:
-                st.info("Starting the bot… (about 30 seconds)")
-        link_box()
-        return
-
-    me = s.get("me") or {}
-    settings = bot_client.load_settings()
-    c1, c2, c3 = st.columns([3, 1, 1])
-    c1.success(f"Bot number connected: **+{me.get('number') or '?'}** · replies today: {s.get('replies_today', 0)}")
-    on = c2.toggle("Bot ON", value=settings["enabled"])
-    if on != settings["enabled"]:
-        settings["enabled"] = on
-        bot_client.save_settings(settings)
-        st.rerun()
-    if c3.button("Unlink number"):
-        bot_client.logout()
-        st.rerun()
-
-    # 2) AI brain
-    with st.expander("🧠 AI (free Groq key)", expanded=not os.environ.get("BOT_LLM_API_KEY")):
+                if cur.get("status") == "qr" and cur.get("qr"):
+                    st.image(base64.b64decode(cur["qr"].split(",", 1)[1]), width=300)
+                    st.markdown("On the phone of the number the assistant should use: **WhatsApp → ⋮ / Settings → "
+                                "Linked devices → Link a device**, then scan. It shows as **KL Tracker Bot**. Only "
+                                "your own messages are read - other chats never are.")
+                elif cur.get("status") in ("error", "logged_out"):
+                    st.error(cur.get("error") or "Disconnected.")
+                    if st.button("Start again"):
+                        bot_client.logout()
+                        st.rerun(scope="app")
+                else:
+                    st.info("Starting… (about 30 seconds)")
+            link_box()
+        elif st.button("Unlink number", help="Then link another number by QR code"):
+            bot_client.logout()
+            st.rerun()
         has_key = bool(os.environ.get("BOT_LLM_API_KEY"))
-        st.markdown(("✅ AI key saved - the bot replies with AI." if has_key else
-                     "⚠️ No AI key yet - the bot only gives simple keyword replies.") +
-                    "\n\nGet a free key: **console.groq.com → sign in → API Keys → Create API key**, paste it below. "
-                    "It's stored only in `.env` on this PC.")
+        st.markdown(("✅ AI key saved." if has_key else "⚠️ No AI key yet - the assistant needs one.")
+                    + " Free key: **console.groq.com → sign in → API Keys → Create API key**. Kept only in `.env` on "
+                      "this PC.")
         key = st.text_input("Groq API key", type="password", placeholder="gsk_...")
         if st.button("Save key") and key.strip():
             bot_client.set_env("BOT_LLM_API_KEY", key.strip())
             os.environ["BOT_LLM_API_KEY"] = key.strip()
-            st.success("Saved - new replies use AI straight away.")
-        test = st.text_input("Try the bot here (nothing is sent on WhatsApp)",
-                             placeholder="e.g. any 3 room Mont Kiara below 10k?")
-        if test:
-            with st.spinner("Thinking…"):
-                st.info(bot_brain.reply([{"role": "user", "content": test}], lambda **k: {"saved": "test - not saved"}))
-
-    # 3) the agent's real details - the bot never invents these
-    prof = bot_brain.profile()
-    with st.expander("👤 Your details (name card) - the bot only uses these, never makes them up",
-                     expanded=not prof.get("agent_name")):
-        new_prof = {k: st.text_input(label, prof.get(k, ""), key=f"prof-{k}")
-                    for k, label in bot_brain.PROFILE_FIELDS.items()}
-        st.caption("Leave a field empty if you don't want the bot to share it - it will say you'll send it yourself.")
-        if st.button("Save details"):
-            s2 = bot_client.load_settings()
-            s2["profile"] = {k: v.strip() for k, v in new_prof.items()}
-            bot_client.save_settings(s2)
-            st.success("Saved - the bot uses these from the next message.")
-
-    # 4) FAQ
-    with st.expander("📝 Your agency info / FAQ (the bot answers from this)"):
-        current = bot_brain.faq()
-        new = st.text_area("FAQ", current, height=220, label_visibility="collapsed")
-        if st.button("Save FAQ") and new != current:
-            bot_brain.FAQ_FILE.parent.mkdir(exist_ok=True)
-            bot_brain.FAQ_FILE.write_text(new, encoding="utf-8")
             st.success("Saved.")
-
-    # 4) conversations
-    st.subheader("Recent conversations")
-    convs = bot_client.conversations()
-    if not convs:
-        st.caption("No messages yet - send the bot's number a WhatsApp from another phone to test it.")
-    for cv in convs:
-        when = datetime.fromtimestamp(cv["last_ts"], MYT).strftime("%d %b %H:%M")
-        who = cv["name"] or cv["chat"].split("@")[0]
-        with st.expander(f"{who} · {when}"):
-            for role, text, ts in cv["messages"]:
-                st.markdown(f"**{'🤖 Bot' if role == 'assistant' else '👤 ' + who}:** {text}")
-
-
-def chat_bot_remote():
-    """Chat bot page on the online dashboard: shows what the PC copied up (bot_remote.sync) and sends changes /
-    test questions to the PC (pc_tasks), which applies them within about 15 seconds."""
-    import time
-
-    import bot_brain
-    import bot_remote
-
-    try:
-        bot = bot_remote.state(db)
-        waiting = bot_remote.pending(db)
-    except Exception as e:
-        st.error(f"Couldn't reach Supabase: {e}")
-        return
-    if not bot:
-        st.warning("🖥️ Your PC hasn't sent the bot's status yet - make sure it's on, then reload in a minute.")
-        return
-    age = time.time() - (bot.get("at") or 0)
-    if age > 300:
-        st.warning(f"🖥️ Your PC was last seen {age / 60:.0f} minutes ago - the bot only replies while the PC is on, "
-                   "and changes made here wait until it's back.")
-    if bot.get("status") not in ("ready", "connecting"):
-        st.warning("The bot's WhatsApp isn't connected - link it by QR code on the PC (Chat bot page) once.")
-        return
-    if [t for t in waiting if t["kind"] == "bot_settings"]:
-        st.info("⏳ Your change was sent to the PC - it's applied within about 15 seconds. Reload to see it.")
-
-    me = bot.get("me") or {}
-    c1, c2 = st.columns([3, 1])
-    c1.success(f"Bot number connected: **+{me.get('number') or '?'}** · replies today: {bot.get('replies_today', 0)}"
-               f" · updated {max(0, age):.0f} s ago")
-    on = c2.toggle("Bot ON", value=bool(bot.get("enabled", True)))
-    if on != bool(bot.get("enabled", True)):
-        bot_remote.request(db, "bot_settings", {"enabled": on})
-        st.rerun()
-
-    with st.expander("🧠 AI", expanded=False):
-        st.markdown("✅ AI key saved on your PC - the bot replies with AI." if bot.get("has_key") else
-                    "⚠️ No AI key on your PC yet - add it on the PC's Chat bot page (it's kept there only).")
-        q = st.text_input("Try the bot here (nothing is sent on WhatsApp) - your PC answers in about 15-30 seconds",
-                          placeholder="e.g. any 3 room Mont Kiara below 10k?")
-        if st.button("Ask") and q.strip():
-            bot_remote.request(db, "bot_test", {"question": q.strip()})
-            st.session_state.bot_test_asked = q.strip()
-        asked = st.session_state.get("bot_test_asked")
-        if asked:
-            @st.fragment(run_every="5s")
-            def test_answer():
-                t = (bot_remote.state(db) or {}).get("test") or {}
-                if t.get("question") == asked:
-                    st.info(t.get("answer") or "(no answer)")
-                else:
-                    st.caption("⏳ Waiting for your PC to answer…")
-            test_answer()
-
-    prof = bot.get("profile") or {}
-    with st.expander("👤 Your details (name card) - the bot only uses these, never makes them up",
-                     expanded=not prof.get("agent_name")):
-        new_prof = {k: st.text_input(label, prof.get(k, ""), key=f"rprof-{k}")
-                    for k, label in bot_brain.PROFILE_FIELDS.items()}
-        st.caption("Leave a field empty if you don't want the bot to share it - it will say you'll send it yourself.")
-        if st.button("Save details"):
-            bot_remote.request(db, "bot_settings", {"profile": {k: v.strip() for k, v in new_prof.items()}})
-            st.success("Sent to your PC - the bot uses these within about 15 seconds.")
-
-    with st.expander("📝 Your agency info / FAQ (the bot answers from this)"):
-        current = bot.get("faq") or ""
-        new = st.text_area("FAQ", current, height=220, label_visibility="collapsed")
-        if st.button("Save FAQ") and new != current:
-            bot_remote.request(db, "bot_settings", {"faq": new})
-            st.success("Sent to your PC - saved within about 15 seconds.")
-
-    st.subheader("Recent conversations")
-    st.caption("Copied from your PC every 30 seconds.")
-    convs = bot.get("conversations") or []
-    if not convs:
-        st.caption("No messages yet - send the bot's number a WhatsApp from another phone to test it.")
-    for cv in convs:
-        when = datetime.fromtimestamp(cv["last_ts"], MYT).strftime("%d %b %H:%M")
-        who = cv["name"] or cv["chat"].split("@")[0]
-        with st.expander(f"{who} · {when}"):
-            for role, text, ts in cv["messages"]:
-                st.markdown(f"**{'🤖 Bot' if role == 'assistant' else '👤 ' + who}:** {text}")
 
 
 # ---------- WhatsApp blast (one message to many numbers, sent slowly from this PC) ----------
@@ -1773,7 +1878,7 @@ def whatsapp_blast_page():
     wa_blast = importlib.reload(wa_blast)  # always the latest version, even if the dashboard has run for days
 
     st.title("WhatsApp blast")
-    st.caption("Send one message - with photos / videos / PDF and auto replies if you like - to a list of numbers, "
+    st.caption("Send one message - with photos / videos / PDF if you like - to a list of numbers, "
                "one person at a time with a random pause in between, now or at a time you choose. Your PC does the "
                "sending, so keep it on until a blast finishes (it won't go to sleep while a blast is waiting).")
     try:
@@ -1826,7 +1931,7 @@ def whatsapp_blast_page():
     with new:
         if not senders:
             st.warning("No WhatsApp connected yet - link your number on the **WhatsApp listing** page on your PC first "
-                       "(or the bot number on the **Chat bot** page), then come back.")
+                       "(or the bot number on the **AI Chat bot** page), then come back.")
         else:
             new_blast_form(store, senders, default_test)
     with mine:
@@ -1858,7 +1963,7 @@ def whatsapp_blast_page():
                                                             key=f"retry-{j['id']}",
                                                             help="Numbers not on WhatsApp are left out."):
                             store.create(j["sender"], retry, j["message"], store.attachments_of(j),
-                                         triggers=j.get("triggers") or [], delay=j["delay"],
+                                         delay=j["delay"],
                                          daily_limit=j["daily_limit"], window=wa_blast.window_of(j),
                                          rest=((j.get("rest") or {}).get("every", 0),
                                                (j.get("rest") or {}).get("minutes", 0)))
@@ -1948,21 +2053,6 @@ def new_blast_form(wa_blast, senders, default_test=""):
     atts = st.file_uploader("Photos / videos / PDF (optional - the message goes with the first one)",
                             accept_multiple_files=True, key=f"blast-atts-{v}",
                             type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "pdf", "doc", "docx", "xls", "xlsx"])
-    st.markdown("**Auto replies** - when someone answers this blast, the AI reads their reply and sends the "
-                "matching auto reply below.")
-    triggers = []
-    if st.toggle("Auto reply to people who answer", value=True, key=f"blast-trig-on-{v}"):
-        for i, (when0, reply0) in enumerate(wa_blast.DEFAULT_TRIGGERS):
-            c1, c2 = st.columns([1, 1])
-            when = c1.text_input(f"{i + 1}. When they…", when0, key=f"blast-tw{i}-{v}",
-                                 placeholder="(leave empty for no rule)")
-            reply = c2.text_area("…auto reply", reply0, key=f"blast-tr{i}-{v}", height=68, disabled=not when.strip())
-            if when.strip() and reply.strip():
-                triggers.append({"when": when.strip(), "reply": reply.strip()})
-        st.caption(f"Each person gets **one** auto reply - the first time their message fits a rule - only for "
-                   f"people from this blast, for {wa_blast.REPLY_DAYS} days, and not after you've replied to them "
-                   "yourself. Messages that fit no rule are left for you. Your own test numbers (\"my numbers\" on "
-                   "the WhatsApp listing page) get an auto reply every time, for testing.")
     spec = {"message": msg}
     if msg.strip():
         sample = numbers[0] if numbers else {"name": "Ali"}
@@ -2017,7 +2107,7 @@ def new_blast_form(wa_blast, senders, default_test=""):
     files = [(a.name, a.getvalue()) for a in atts or []]
     if not (msg.strip() or files):
         return
-    look = dict(triggers=triggers)
+    look = {}
     st.divider()
     t_col, go_col = st.columns(2)
     test_to = t_col.text_input("Test number", default_test if sender == "main" else "",
@@ -2480,7 +2570,7 @@ if tool == "AI call":
 if tool == "WhatsApp blast":
     whatsapp_blast_page()
     st.stop()
-if tool == "Chat bot":
+if tool == "AI Chat bot":
     chat_bot_page()
     st.stop()
 if tool == "Condo prices":
@@ -2488,6 +2578,9 @@ if tool == "Condo prices":
     st.stop()
 if tool == "WhatsApp listing":
     whatsapp_page()
+    st.stop()
+if tool == "WhatsApp chats":
+    whatsapp_chats_page()
     st.stop()
 if tool == "Phone filter":
     phone_filter_page()

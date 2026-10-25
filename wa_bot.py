@@ -1,10 +1,10 @@
-"""WhatsApp auto-reply bot (runs on this PC, on a SEPARATE number from the scanner).
+"""Your personal WhatsApp assistant (assistant.py) - runs on this PC.
 
 * links by QR as a linked device ("KL Tracker Bot") - its own session in wa_bot_data/
-* replies instantly to PRIVATE chats only (never groups / status / channels); never messages anyone first
-* waits a few seconds so several messages / photos from one person get one answer
-* answers via bot_brain (AI + your listings, condo prices, FAQ; saves owner listings with their photos)
-Control API on 127.0.0.1:3079, protected by wa_bot_data/.token. Start it from the dashboard's "Chat bot" page.
+* reads and answers ONLY your own number (assistant.py "number"); everyone else's messages are ignored, never
+  read, kept or answered
+* also sends blasts set to go "from the bot's number" (wa_blast.py)
+Control API on 127.0.0.1:3079, protected by wa_bot_data/.token. Linked from the dashboard's "AI Chat bot" page.
 """
 import json
 import random
@@ -15,16 +15,13 @@ import sqlite3
 import sys
 import threading
 import time
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).parent.resolve()
 DATA = ROOT / "wa_bot_data"
-MEDIA = DATA / "media"
 PORT = 3079
 DATA.mkdir(exist_ok=True)
-MEDIA.mkdir(exist_ok=True)
 sys.path.insert(0, str(ROOT))
 os.chdir(DATA)  # the bot's own WhatsApp session file lives here
 
@@ -35,13 +32,11 @@ from neonize.utils.enum import ChatPresence, ChatPresenceMedia  # noqa: E402
 import segno  # noqa: E402
 
 import assistant  # noqa: E402
-import bot_brain  # noqa: E402
 
 TOKEN = secrets.token_hex(24)
 (DATA / ".token").write_text(TOKEN)
-SETTINGS = DATA / "bot_settings.json"
 STARTED = time.time()
-state = {"status": "starting", "qr": None, "me": None, "error": None, "replies_today": 0, "day": time.strftime("%Y%m%d")}
+state = {"status": "starting", "qr": None, "me": None, "error": None}
 
 db_lock = threading.Lock()
 db = sqlite3.connect(DATA / "bot.sqlite", check_same_thread=False)
@@ -49,14 +44,6 @@ db.executescript("""
 CREATE TABLE IF NOT EXISTS log (chat TEXT, name TEXT, role TEXT, text TEXT, ts INTEGER);
 CREATE INDEX IF NOT EXISTS log_chat ON log (chat, ts);
 """)
-
-
-def settings():
-    try:
-        s = json.loads(SETTINGS.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        s = {}
-    return {"enabled": True, "max_replies_per_day": 500, "ignore_numbers": [], **s}
 
 
 def log(chat, name, role, text):
@@ -74,88 +61,6 @@ def history(chat, limit=14):
 
 def jid_str(j):
     return f"{j.User}@{j.Server}" if j is not None and j.User else ""
-
-
-# ---------- per-chat waiting: several messages / photos -> one reply ----------
-pending = {}  # chat -> {"timer", "jid", "name", "phone", "photos": [paths]}
-photos_by_chat = {}  # chat -> photo paths sent since the last saved owner listing
-
-
-def schedule(chat, info, delay):
-    old = pending.get(chat)
-    if old and old.get("timer"):
-        old["timer"].cancel()
-    t = threading.Timer(delay, answer, args=(chat,))
-    pending[chat] = {**info, "timer": t}
-    t.daemon = True
-    t.start()
-
-
-def answer(chat):
-    info = pending.pop(chat, None)
-    if not info:
-        return
-    s = settings()
-    today = time.strftime("%Y%m%d")
-    if state["day"] != today:
-        state.update(day=today, replies_today=0)
-    if not s["enabled"] or state["replies_today"] >= s["max_replies_per_day"]:
-        return
-    try:
-        client.send_chat_presence(info["jid"], ChatPresence.CHAT_PRESENCE_COMPOSING,
-                                  ChatPresenceMedia.CHAT_PRESENCE_MEDIA_TEXT)
-    except Exception:
-        pass
-
-    def save_owner_listing(**fields):
-        return save_listing(chat, info, fields)
-
-    text = bot_brain.reply(history(chat), save_owner_listing)
-    if not text:
-        return
-    # Like a person: separate thoughts go out as separate bubbles, each after a short "typing" pause
-    parts = [p.strip() for p in text.split("\n\n") if p.strip()][:4]
-    try:
-        for i, part in enumerate(parts):
-            if i:
-                try:
-                    client.send_chat_presence(info["jid"], ChatPresence.CHAT_PRESENCE_COMPOSING,
-                                              ChatPresenceMedia.CHAT_PRESENCE_MEDIA_TEXT)
-                except Exception:
-                    pass
-            time.sleep(min(5, 1.2 + len(part) / 45))  # human-ish typing time
-            client.send_message(info["jid"], part)
-        log(chat, info.get("name"), "assistant", text)
-        state["replies_today"] += 1
-    except Exception as e:
-        print("send failed:", e, flush=True)
-
-
-def save_listing(chat, info, f):
-    """Owner listing collected by the bot -> Supabase owner_listings (+ the photos they sent)."""
-    from phone_filter import extract_from_text
-    db_ = bot_brain._db()
-    lid = f"bot-{''.join(c for c in chat if c.isalnum())[:30]}-{int(time.time())}"
-    paths = []
-    for p in photos_by_chat.pop(chat, []):
-        try:
-            name = f"files/{lid}-{Path(p).name}"
-            db_.storage.from_("owner-photos").upload(name, Path(p).read_bytes(),
-                                                     {"content-type": "image/jpeg", "upsert": "true"})
-            paths.append(name)
-        except Exception:
-            pass
-    phone = next((n for n, _, _ in extract_from_text(info.get("phone") or "") if n), info.get("phone"))
-    transcript = "\n".join(f"{m['role']}: {m['content']}" for m in history(chat, 30))
-    row = {"message_id": lid, "chat": "WhatsApp bot", "posted_at": datetime.now(timezone.utc).isoformat(),
-           "sender_name": info.get("name"), "sender_phone": phone, "listing_type": f.get("listing_type"),
-           "price_rm": f.get("price_rm"), "sqft": f.get("sqft"), "bedrooms": f.get("bedrooms"),
-           "bathrooms": f.get("bathrooms"), "furnishing": f.get("furnishing"), "place": f.get("place"),
-           "unit_no": f.get("unit_no"), "owner_name": f.get("owner_name") or info.get("name"),
-           "phones": phone or "", "photo_count": len(paths), "photo_paths": paths,
-           "message_text": (f.get("notes") or "") + "\n\n--- chat ---\n" + transcript, "scanned_by": "WhatsApp bot"}
-    db_.table("owner_listings").upsert(row, on_conflict="message_id").execute()
-    return {"saved": True, "photos_attached": len(paths)}
 
 
 # ---------- WhatsApp client ----------
@@ -232,16 +137,15 @@ def on_message(c, ev):
         return  # old backlog after being offline long - don't answer stale messages
     phone_jid = jid_str(src.SenderAlt) if src.HasField("SenderAlt") else chat
     phone = phone_jid.split("@")[0] if phone_jid.endswith("@s.whatsapp.net") else lid_phone(c, src.Chat, chat)
-    if phone and phone in settings()["ignore_numbers"]:
-        return
+    if not is_owner_chat(chat, phone):
+        return  # only you - anyone else's message is ignored (not read, not kept, not answered)
     m = ev.Message
     for w in ("ephemeralMessage", "viewOnceMessage", "viewOnceMessageV2"):
         if m.HasField(w):
             m = getattr(m, w).message
     name = ev.Info.Pushname or None
     info = {"jid": src.Chat, "name": name, "phone": phone}
-    owner = is_owner_chat(chat, phone)
-    if m.HasField("stickerMessage") and owner:  # your stickers: kept for the assistant to use
+    if m.HasField("stickerMessage"):  # your stickers: kept for the assistant to use
         try:
             save_sticker(c.download_any(m))
             log(assistant.HISTORY_KEY, name, "user", "[sent a sticker]")
@@ -250,7 +154,7 @@ def on_message(c, ev):
         except Exception as e:
             print("sticker:", str(e)[:200], flush=True)
         return
-    if m.HasField("imageMessage") and owner:  # your photo / screenshot: the assistant looks at it
+    if m.HasField("imageMessage"):  # your photo / screenshot: the assistant looks at it
         try:
             folder = ROOT / "data" / "assistant_photos"  # in the project, so a change request can show it to Claude Code
             folder.mkdir(parents=True, exist_ok=True)
@@ -262,33 +166,11 @@ def on_message(c, ev):
         except Exception as e:
             print("owner photo:", str(e)[:200], flush=True)
         return
-    if not owner and not settings()["enabled"]:
-        # property bot OFF: other people's chats are neither kept nor answered (this may be your own main number) -
-        # only a quick-reply option someone tapped from a blast still gets its set answer
-        text = text_of(m)
-        if text.strip():
-            threading.Thread(target=blast_option_only, args=(chat, info, phone, text), daemon=True).start()
-        return
-    if m.HasField("imageMessage"):
-        try:
-            path = MEDIA / f"{''.join(ch for ch in chat if ch.isalnum())[:30]}_{ev.Info.ID}.jpg"
-            path.write_bytes(c.download_any(m))
-            photos_by_chat.setdefault(chat, []).append(str(path))
-        except Exception:
-            pass
-        cap = m.imageMessage.caption or ""
-        log(chat, name, "user", f"[sent a photo] {cap}".strip())
-        schedule(chat, info, 25)  # owners often send several photos - answer once they pause
-        return
     text = text_of(m)
     if not text.strip():
         return
-    if owner:  # your own number: your personal assistant (works even with the bot OFF)
-        log(assistant.HISTORY_KEY, name, "user", text.strip())
-        threading.Thread(target=assistant_reply, args=(info,), daemon=True).start()
-        return
-    log(chat, name, "user", text.strip())
-    threading.Thread(target=route_reply, args=(chat, info, phone, text), daemon=True).start()
+    log(assistant.HISTORY_KEY, name, "user", text.strip())
+    threading.Thread(target=owner_text, args=(info, text), daemon=True).start()
 
 
 # ---------- your personal assistant (assistant.py): only your own number ----------
@@ -358,6 +240,23 @@ def send_to_owner(text, jid=None, sticker=False):
         send_sticker(jid)
 
 
+def owner_text(info, text):
+    """Your message: practice mode (customer_reply.py - you play the owner, it gives you 5 options) or else your
+    assistant as usual."""
+    def say(t):
+        send_to_owner(t, info["jid"])
+        log(assistant.HISTORY_KEY, "assistant", "assistant", t)
+    try:
+        import customer_reply
+        if customer_reply.whatsapp(assistant._db(), text, say):
+            return
+    except Exception as e:
+        print("practice:", str(e)[:300], flush=True)
+        say(f"practice check failed - {str(e)[:150]}")
+        return
+    assistant_reply(info)
+
+
 def assistant_reply(info, wait=4):
     time.sleep(wait)  # you often send a few lines / photos - answer them together
     if not assistant_lock.acquire(blocking=False):
@@ -389,40 +288,6 @@ def assistant_clock():
             assistant.tick(send_to_owner)
         except Exception as e:
             print("assistant clock:", str(e)[:300], flush=True)
-
-
-def route_reply(chat, info, phone, text):
-    """They answered a blast from this number and a trigger fits -> that auto reply; otherwise the AI as usual."""
-    import wa_blast
-    answer = wa_blast.auto_reply("bot", phone, text)
-    if answer:
-        send_option_reply(chat, info, answer)
-    else:
-        schedule(chat, info, 6)  # wait a moment in case they send more lines
-
-
-def blast_option_only(chat, info, phone, text):
-    """Bot OFF: answer only a blast's quick-reply option (logged only then)."""
-    import wa_blast
-    answer = wa_blast.auto_reply("bot", phone, text)
-    if answer:
-        log(chat, info.get("name"), "user", text.strip())
-        send_option_reply(chat, info, answer)
-
-
-def send_option_reply(chat, info, answer):
-    time.sleep(3)
-    try:
-        client.send_chat_presence(info["jid"], ChatPresence.CHAT_PRESENCE_COMPOSING,
-                                  ChatPresenceMedia.CHAT_PRESENCE_MEDIA_TEXT)
-    except Exception:
-        pass
-    time.sleep(min(6, 1.5 + len(answer) / 40))
-    try:
-        client.send_message(info["jid"], answer)
-        log(chat, info.get("name"), "assistant", answer)
-    except Exception as e:
-        print("blast auto reply:", e, flush=True)
 
 
 # ---------- control API (dashboard) ----------

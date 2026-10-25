@@ -11,7 +11,6 @@ import mimetypes
 import os
 import random
 import re
-import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -21,7 +20,7 @@ MYT = timezone(timedelta(hours=8))  # Malaysia time - the online dashboard's ser
 ROOT = Path(__file__).parent.resolve()
 DIR = ROOT / "wa_blast"
 FILES = DIR / "files"
-SENDERS = {"main": "My WhatsApp (linked on the WhatsApp listing page)", "bot": "Chat bot number"}
+SENDERS = {"main": "My WhatsApp (linked on the WhatsApp listing page)", "bot": "AI Chat bot number"}
 IMAGE, VIDEO = {".jpg", ".jpeg", ".png", ".webp"}, {".mp4", ".mov", ".3gp", ".m4v"}
 
 
@@ -85,14 +84,13 @@ def safe_name(name):
     return re.sub(r'[\\/:*?"<>|]+', "_", Path(name).name) or "file"
 
 
-def new_spec(sender, numbers, message, files=(), triggers=(), start_at=None, delay=(45, 120), daily_limit=40,
-             window=(9 * 60, 21 * 60), rest=(0, 0), test=False):
+def new_spec(sender, numbers, message, files=(), start_at=None, delay=(45, 120), daily_limit=40,
+             window=(9 * 60, 21 * 60), rest=(0, 0), test=False, **_old):
     """A blast as saved (here on the PC, or online in Supabase). files = attachment file names.
-    window = (from, until) in minutes of the day; rest = (every N sent messages, rest that many minutes);
-    triggers = [{'when', 'reply'}] - auto replies for people who answer the blast."""
+    window = (from, until) in minutes of the day; rest = (every N sent messages, rest that many minutes).
+    _old: settings of earlier versions (auto reply rules) - ignored."""
     return {"id": datetime.now(MYT).strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:4], "created": time.time(),
             "sender": sender, "numbers": numbers, "message": message, "files": list(files),
-            "triggers": [t for t in triggers or [] if t.get("when") and t.get("reply")],
             "start_at": start_at or time.time(), "delay": list(delay), "daily_limit": int(daily_limit),
             "window": list(window) if window else None, "rest": {"every": int(rest[0]), "minutes": int(rest[1])},
             "test": test, "control": "run", "control_at": time.time()}
@@ -197,118 +195,7 @@ def personalise(text, name):
     return re.sub(r"[ ,]*\{name\}", "", text)
 
 
-# ---------- auto-reply triggers: "when they ... -> reply ..." for people who answer a blast ----------
-DEFAULT_TRIGGERS = [
-    ("say they want to rent or sell (rent / sell / sewa / jual / 出租 / 卖)",
-     "Where is the place ah? Do you have the details?"),
-    ("mention a property, condo or place name",
-     "Do you have the details and the size (sf)?"),
-    ("ask who this is or how I got their number",
-     "Hi, I'm Kelvin Low, property agent focusing on KLCC & Mont Kiara 😊 Do you have any property to rent or sell?"),
-    ("", ""),
-]
-REPLY_DAYS = 14  # people who answer a blast get auto replies for this long
-MAX_AUTO = 1     # auto replies per person per blast (your own test numbers: no limit)
-SENT_IDS = set()  # ids of messages this PC sent itself - so they are never mistaken for you typing on the phone
-_reply_lock = threading.Lock()
-
-
-def _local(phone):
-    digits = re.sub(r"\D", "", phone or "")
-    return "0" + digits[2:] if digits.startswith("60") else digits
-
-
-def _recent_job(sender, local):
-    """Newest blast from this number that reached this person in the last REPLY_DAYS days and has triggers."""
-    since = time.time() - REPLY_DAYS * 86400
-    for j in jobs():
-        r = ((j.get("progress") or {}).get("results") or {}).get(local) or {}
-        if j["sender"] == sender and j.get("triggers") and r.get("status") == "sent" and r.get("at", 0) >= since:
-            return j
-    return None
-
-
-def _pick_trigger(blast, text, rules):
-    """Ask the free AI which rule fits their reply -> index into rules, or None."""
-    import httpx
-    from dotenv import load_dotenv
-    load_dotenv(ROOT / ".env")
-    listing = "\n".join(f'{n}. When they {r["when"]} -> auto reply: "{r["reply"]}"'
-                        for n, (_, r) in enumerate(rules, 1))
-    prompt = (f'A Malaysian property agent sent this WhatsApp message to many people:\n"{blast}"\n\n'
-              f'One person replied:\n"{text}"\n\nAuto-reply rules:\n{listing}\n\n'
-              "Check every rule on its own:\n"
-              '- "fits": does the "When they ..." part clearly describe this reply?\n'
-              '- "redundant": would its auto reply ask for something the reply already gives (e.g. it asks where '
-              "the place is but they already named the place)?\n"
-              "People may write English, Malay, Chinese or a mix.\n"
-              'Reply ONLY with JSON: {"rules": [{"n": 1, "fits": true/false, "redundant": true/false}, ...]}')
-    for model in ("qwen/qwen3.8-27b", "openai/gpt-oss-20b", "openai/gpt-oss-120b"):
-        body = {"model": model, "temperature": 0, "max_tokens": 400, "response_format": {"type": "json_object"},
-                "messages": [{"role": "user", "content": prompt}]}
-        if "gpt-oss" in model:
-            body["reasoning_effort"] = "low"
-        try:
-            r = httpx.post("https://api.groq.com/openai/v1/chat/completions", json=body, timeout=40, headers={
-                "Authorization": f"Bearer {os.environ.get('BOT_LLM_API_KEY', '')}", "User-Agent": "KLTracker/1.0"})
-            if r.status_code != 200:
-                continue  # busy / limit / model gone - try the next one
-            checks = json.loads(re.search(r"\{.*\}", r.json()["choices"][0]["message"]["content"], re.S)
-                                .group(0)).get("rules") or []
-            ok = sorted(int(c["n"]) for c in checks
-                        if c.get("fits") is True and c.get("redundant") is not True and 1 <= int(c["n"]) <= len(rules))
-            return rules[ok[0] - 1][0] if ok else None  # first fitting rule in your order
-        except Exception:
-            continue
-    return None
-
-
-def my_numbers():
-    """Your own numbers (WhatsApp page settings) - used for testing, so they get auto replies every time."""
-    s = _read(ROOT / "wa_data" / "settings.json", {}) or {}
-    return {_local(n) for n in s.get("my_numbers") or [] if _local(n)}
-
-
-def auto_reply(sender, phone, text):
-    """Someone answered a recent blast -> the auto reply whose trigger fits their message, or None.
-    Anyone else gets MAX_AUTO auto reply (the first time a rule fits), never after you replied yourself;
-    your own test numbers get one every time."""
-    local = _local(phone)
-    if not local or not (text or "").strip():
-        return None
-    with _reply_lock:
-        j = _recent_job(sender, local)
-        if not j:
-            return None
-        tester = local in my_numbers()
-        path, key = DIR / f"replied_{sender}.json", f"{j['id']}|{local}"
-        state = _read(path, {}) or {}
-        mine = state.get(key) or {"used": [], "human": False}
-        if not tester and (mine.get("human") or len(mine["used"]) >= MAX_AUTO):
-            return None
-        rules = [(i, t) for i, t in enumerate(j["triggers"]) if t.get("reply") and (tester or i not in mine["used"])]
-        if not rules:
-            return None
-        i = _pick_trigger(personalise(j.get("message") or "", None), text.strip(), rules)
-        if i is None:
-            return None
-        if not tester:
-            mine["used"].append(i)
-            state[key] = mine
-            _write(path, state)
-        return j["triggers"][i]["reply"]
-
-
-def human_replied(sender, phone):
-    """You wrote to this person yourself -> no more auto replies to them for their latest blast."""
-    local = _local(phone)
-    with _reply_lock:
-        j = _recent_job(sender, local) if local else None
-        if j:
-            path, key = DIR / f"replied_{sender}.json", f"{j['id']}|{local}"
-            state = _read(path, {}) or {}
-            state.setdefault(key, {"used": [], "human": False})["human"] = True
-            _write(path, state)
+SENT_IDS = set()  # ids of messages this PC sent itself (see remember_sent)
 
 
 def full_text(spec, name, body_only=False):

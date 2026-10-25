@@ -117,9 +117,19 @@ def blast_sync_loop():
             except Exception as e:
                 if "allowance" not in str(e):
                     log(f"furnishing check problem: {str(e)[:200]}")
-        try:  # Chat bot page: changes / test questions from online every 15 s, status + conversations every 30 s
+        try:  # WhatsApp chats online: replies typed online sent every 15 s, new messages copied up every 30 s
+            import wa_chat_sync
+            importlib.reload(wa_chat_sync)
+            sent = wa_chat_sync.run_requests(db, log)
+            if sent or n % 2 == 1:
+                wa_chat_sync.sync(db, log)
+        except Exception as e:
+            if str(e) != last_bot_error:
+                log(f"whatsapp chats online problem: {str(e)[:300]}")
+                last_bot_error = str(e)
+        try:  # AI Chat bot page: the assistant's status + your chat with it up every 30 s
             importlib.reload(bot_remote)
-            if not bot_remote.run_requests(db, log) and n % 2 == 0:
+            if n % 2 == 0:
                 bot_remote.sync(db)
             last_bot_error = None
         except Exception as e:

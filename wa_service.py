@@ -4,7 +4,8 @@ Runs in the background on this PC:
   * links as a WhatsApp "linked device" by QR code (shows up as "KL Tracker" on your phone)
   * stores message history your phone sends at link time + new messages, in wa_data/messages.sqlite
   * downloads photos on request (only for chats you scan)
-  * sends only the blasts you set up on the dashboard's "WhatsApp blast" page (wa_blast.py) - nothing else
+  * sends only the blasts you set up on the dashboard's "WhatsApp blast" page (wa_blast.py) - nothing else,
+    and never replies to anyone by itself
 Control API on 127.0.0.1:3078, protected by wa_data/.token.
 
 Start it from the dashboard's WhatsApp page (or: python wa_service.py).
@@ -66,11 +67,12 @@ def phone_of(jid):
     return user.split(":")[0] if server == "s.whatsapp.net" and user.isdigit() else None
 
 
-PHOTO, PDF, VIDEO, ZIP = 1, 2, 3, 4  # stored in messages.has_image
+PHOTO, PDF, VIDEO, ZIP, VOICE, STICKER = 1, 2, 3, 4, 5, 6  # stored in messages.has_image
 
 
 def unwrap(m):
-    """Return (text, media) from a WhatsApp message - media 0 none / 1 photo / 2 PDF / 3 video - looking inside
+    """Return (text, media) from a WhatsApp message - media 0 none / 1 photo / 2 PDF / 3 video / 4 ZIP / 5 voice
+    note / 6 sticker - looking inside
     disappearing / view-once / document-with-caption wrappers."""
     for wrapper in ("ephemeralMessage", "viewOnceMessage", "viewOnceMessageV2", "documentWithCaptionMessage"):
         if m.HasField(wrapper):
@@ -79,6 +81,10 @@ def unwrap(m):
         return m.imageMessage.caption or "", PHOTO
     if m.HasField("videoMessage"):
         return m.videoMessage.caption or "", VIDEO
+    if m.HasField("audioMessage"):  # voice notes (for the WhatsApp chats page - scans skip them)
+        return "", VOICE
+    if m.HasField("stickerMessage"):
+        return "", STICKER
     if m.HasField("documentMessage"):
         d = m.documentMessage
         if d.mimetype == "application/pdf" or (d.fileName or "").lower().endswith(".pdf"):
@@ -250,19 +256,6 @@ def on_message(c, ev):
                     src.IsFromMe, ev.Message):
         with db_lock:
             db.commit()
-    if not src.IsGroup and ts > time.time() - 600:
-        import wa_blast
-        if src.IsFromMe:  # you wrote to them from your phone -> blast auto replies stop for this person
-            if ev.Info.ID not in wa_blast.SENT_IDS:
-                to = jid_str(src.RecipientAlt) if src.HasField("RecipientAlt") else ""
-                phone = phone_of(to) or pn_of(c, src.Chat)
-                if phone:
-                    wa_blast.human_replied("main", phone)
-        else:
-            text = unwrap(ev.Message)[0]
-            phone = phone_of(alt) or pn_of(c, src.Chat)
-            if text and phone:
-                threading.Thread(target=blast_auto_reply, args=(c, src.Chat, phone, text), daemon=True).start()
 
 
 def pn_of(c, jid):
@@ -287,25 +280,48 @@ def pn_of(c, jid):
         return None
 
 
-def blast_auto_reply(c, chat_jid, phone, text):
-    """They answered a blast and one of its triggers fits -> send that auto reply, like a person would."""
-    import random
-    import wa_blast
-    from neonize.utils.enum import ChatPresence, ChatPresenceMedia
+AVATARS = DATA / "avatars"
+
+
+def avatar(jid):
+    """A chat's profile picture, kept in wa_data/avatars/ for 3 days -> its file path, or None (no / hidden picture)."""
+    import urllib.request
+    from neonize.utils import build_jid
+    user, _, server = (jid or "").partition("@")
+    if not user:
+        return None
+    AVATARS.mkdir(exist_ok=True)
+    f, none = AVATARS / f"{user}.jpg", AVATARS / f"{user}.none"
+    for x in (f, none):
+        if x.exists() and time.time() - x.stat().st_mtime < 3 * 86400:
+            return str(f) if x == f else None
     try:
-        time.sleep(random.uniform(3, 6))  # people often send 2-3 lines - give them a moment
-        answer = wa_blast.auto_reply("main", phone, text)
-        if not answer:
-            return
-        try:
-            c.send_chat_presence(chat_jid, ChatPresence.CHAT_PRESENCE_COMPOSING,
-                                 ChatPresenceMedia.CHAT_PRESENCE_MEDIA_TEXT)
-        except Exception:
-            pass
-        time.sleep(min(6, 1.5 + len(answer) / 40))
-        wa_blast.remember_sent(c.send_message(chat_jid, answer))
-    except Exception as e:
-        print("blast auto reply:", e, flush=True)
+        info = client.get_profile_picture(build_jid(user, server or "s.whatsapp.net"))
+        url = getattr(info, "URL", "") or getattr(info, "url", "")
+        if url:
+            f.write_bytes(urllib.request.urlopen(url, timeout=20).read())
+            none.unlink(missing_ok=True)
+            return str(f)
+    except Exception:
+        pass
+    none.write_text("")
+    return None
+
+
+def send_text(to, text):
+    """Your reply from the dashboard's WhatsApp chats page -> that chat (a person or a group), saved like the rest."""
+    from neonize.utils import build_jid
+    user, _, server = (to or "").partition("@")
+    if not user or not (text or "").strip():
+        return {"ok": False, "error": "nothing to send"}
+    jid = build_jid(user, server or "s.whatsapp.net")
+    resp = client.send_message(jid, text.strip())
+    save_chat(to, None, user if server in ("", "s.whatsapp.net") else None, int(time.time()))
+    save_message(to, resp.ID, jid_str(client.me.JID) if client.me else "", None, int(time.time()), True,
+                 WAMessage(conversation=text.strip()))
+    with db_lock:
+        db.commit()
+    return {"ok": True, "id": resp.ID}
 
 
 # ---------- control API ----------
@@ -323,7 +339,7 @@ def download(ids, out_dir):
             continue
         try:
             data = client.download_any(WAMessage.FromString(row[0]))
-            ext = {PDF: 'pdf', VIDEO: 'mp4', ZIP: 'zip'}.get(row[1], 'jpg')
+            ext = {PDF: 'pdf', VIDEO: 'mp4', ZIP: 'zip', VOICE: 'ogg', STICKER: 'webp'}.get(row[1], 'jpg')
             name = f"{''.join(ch for ch in mid if ch.isalnum())[:40]}.{ext}"
             (out / name).write_bytes(data)
             saved[mid] = name
@@ -363,6 +379,10 @@ class Api(BaseHTTPRequestHandler):
             return
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
         try:
+            if self.path == "/avatar":
+                return self._send(200, {"path": avatar(body.get("jid", ""))})
+            if self.path == "/send":  # you typed a reply on the dashboard's WhatsApp chats page
+                return self._send(200, send_text(body.get("to", ""), body.get("text", "")))
             if self.path == "/download":
                 return self._send(200, download(body.get("ids", []), body.get("outDir", "")))
             if self.path == "/logout":

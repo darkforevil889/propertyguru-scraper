@@ -552,16 +552,19 @@ def judge(listing, units, prop, left_out=0):
             "cheapest_url": min(units, key=lambda u: u["price"])["url"]}
 
 
-def run(db, ids=None, progress=print):
-    """Compare saved listings (all, or only `ids`) - opens Chrome on this PC. Returns {message_id: result}."""
+def run(db, ids=None, progress=print, rows=None, store=True):
+    """Compare saved listings (all, or only `ids`) - opens Chrome on this PC. Returns {message_id: result}.
+    rows: listings given directly (e.g. a practice customer message) instead of saved ones; store=False keeps the
+    results out of the dashboard's saved comparison."""
     from patchright.sync_api import sync_playwright
     import scraper
     from wa_parser import property_category
-    rows = db.table("owner_listings").select("message_id,place,address,listing_type,price_rm,sqft,property_type,"
-                                             "message_text,bedrooms").execute().data
-    if ids:
-        rows = [r for r in rows if r["message_id"] in set(ids)]
-    results, cache = load_results(db), {}
+    if rows is None:
+        rows = db.table("owner_listings").select("message_id,place,address,listing_type,price_rm,sqft,"
+                                                 "property_type,message_text,bedrooms").execute().data
+        if ids:
+            rows = [r for r in rows if r["message_id"] in set(ids)]
+    results, cache = (load_results(db) if store else {}), {}
     try:
         checks = json.loads(CHECKS.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -667,8 +670,9 @@ def run(db, ids=None, progress=print):
                                                 "reason": f"PropertyGuru didn't load ({str(e).splitlines()[0][:120]}).",
                                                 "checked_at": time.time()}
                 progress(f"{r.get('place')!r}: {results[r['message_id']]['label']}")
-                db.storage.from_(BUCKET).upload(RESULTS, json.dumps(results, ensure_ascii=False).encode(),
-                                                {"content-type": "application/json", "upsert": "true"})
+                if store:
+                    db.storage.from_(BUCKET).upload(RESULTS, json.dumps(results, ensure_ascii=False).encode(),
+                                                    {"content-type": "application/json", "upsert": "true"})
         finally:
             browser.close()
     _save(STATUS, {"state": "done", "at": time.time(), "done": len(rows), "total": len(rows)})
