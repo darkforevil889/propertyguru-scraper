@@ -42,7 +42,9 @@ def ensure_running():
                            "the WhatsApp listing page only works on the PC it was set up on.")
     (ROOT / "logs").mkdir(exist_ok=True)
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
-    subprocess.Popen([sys.executable, str(ROOT / "wa_service.py")], cwd=ROOT, creationflags=flags,
+    quiet = Path(sys.executable).with_name("pythonw.exe")  # no console window popping up
+    subprocess.Popen([str(quiet if quiet.exists() else sys.executable), str(ROOT / "wa_service.py")], cwd=ROOT,
+                     creationflags=flags,
                      stdout=open(ROOT / "logs" / "wa_service.log", "a"), stderr=subprocess.STDOUT)
     for _ in range(30):
         time.sleep(1)

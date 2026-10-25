@@ -223,7 +223,7 @@ def undo():
 def start_undo():
     """Undo in the background (the bot may need restarting, which it can't do to itself mid-reply)."""
     (ROOT / "logs").mkdir(exist_ok=True)
-    subprocess.Popen([str(ROOT / ".venv" / "Scripts" / "python.exe"), "-u", str(ROOT / "dev_runner.py"), "--undo"],
+    subprocess.Popen([str(ROOT / ".venv" / "Scripts" / "pythonw.exe"), "-u", str(ROOT / "dev_runner.py"), "--undo"],
                      cwd=ROOT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
                      | getattr(subprocess, "DETACHED_PROCESS", 0),
                      stdout=open(ROOT / "logs" / "dev_runner.log", "a", encoding="utf-8"), stderr=subprocess.STDOUT)
@@ -233,7 +233,7 @@ def start(task):
     """Run a request in the background on this PC (the assistant calls this after you confirm)."""
     _save({"state": "running", "at": time.time(), "task": task, "text": "starting"})
     (ROOT / "logs").mkdir(exist_ok=True)
-    subprocess.Popen([str(ROOT / ".venv" / "Scripts" / "python.exe"), "-u", str(ROOT / "dev_runner.py"),
+    subprocess.Popen([str(ROOT / ".venv" / "Scripts" / "pythonw.exe"), "-u", str(ROOT / "dev_runner.py"),
                       "--task", task], cwd=ROOT,
                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess,
                                                                                          "DETACHED_PROCESS", 0),

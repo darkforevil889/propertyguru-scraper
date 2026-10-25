@@ -41,7 +41,9 @@ def ensure_running():
         raise RuntimeError("The WhatsApp bot only runs on the PC it was set up on.")
     (ROOT / "logs").mkdir(exist_ok=True)
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
-    subprocess.Popen([sys.executable, "-u", str(ROOT / "wa_bot.py")], cwd=ROOT, creationflags=flags,
+    quiet = Path(sys.executable).with_name("pythonw.exe")  # no console window popping up
+    subprocess.Popen([str(quiet if quiet.exists() else sys.executable), "-u", str(ROOT / "wa_bot.py")], cwd=ROOT,
+                     creationflags=flags,
                      stdout=open(ROOT / "logs" / "wa_bot.log", "a"), stderr=subprocess.STDOUT)
     for _ in range(30):
         time.sleep(1)

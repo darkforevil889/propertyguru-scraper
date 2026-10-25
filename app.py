@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 from supabase import ClientOptions, create_client
 
 ROOT_DIR = Path(__file__).parent
+QUIET_PY = Path(__import__("sys").executable).with_name("pythonw.exe")  # background jobs: no console window
+QUIET_PY = QUIET_PY if QUIET_PY.exists() else Path(__import__("sys").executable)
 load_dotenv(ROOT_DIR / ".env")
 SUPABASE_URL = os.environ.get("SUPABASE_URL") or st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = os.environ.get("SUPABASE_PUBLISHABLE_KEY") or st.secrets["SUPABASE_PUBLISHABLE_KEY"]
@@ -1352,7 +1354,7 @@ def condo_prices_page():
         elif st.button("🔄 Update now (runs on this PC, ~1 hour)"):
             (ROOT_DIR / "logs").mkdir(exist_ok=True)
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
-            subprocess.Popen([sys.executable, "-u", str(ROOT_DIR / "condo_summary.py")], cwd=ROOT_DIR,
+            subprocess.Popen([str(QUIET_PY), "-u", str(ROOT_DIR / "condo_summary.py")], cwd=ROOT_DIR,
                              creationflags=flags, stdout=open(ROOT_DIR / "logs" / "condo_summary.log", "a"),
                              stderr=subprocess.STDOUT)
             st.success("Started - it runs in the background; you can close this page.")
@@ -1596,8 +1598,9 @@ def property_bot_page():
                 st.rerun(scope="app")
             if cur.get("status") == "qr" and cur.get("qr"):
                 st.image(base64.b64decode(cur["qr"].split(",", 1)[1]), width=300)
-                st.markdown("On the **bot's phone** (the separate number): **WhatsApp → ⋮ / Settings → Linked devices "
-                            "→ Link a device**, then scan. It shows as **KL Tracker Bot**.")
+                st.markdown("On the phone of the number the bot should use: **WhatsApp → ⋮ / Settings → Linked "
+                            "devices → Link a device**, then scan. It shows as **KL Tracker Bot**. Your main number "
+                            "is fine - with the property bot OFF, other people's chats aren't read or kept.")
             elif cur.get("status") in ("error", "logged_out"):
                 st.error(cur.get("error") or "Disconnected.")
                 if st.button("Start again"):
@@ -2106,7 +2109,7 @@ def ai_call_page():
                 ai_call._save(ai_call.STATUS, {"state": "running", "at": time_now(), "page": start, "call": 0,
                                                "calls": "?", "of_pages": "?", "phone": "logging in…"})
                 flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
-                subprocess.Popen([sys.executable, "-u", str(ROOT_DIR / "ai_call.py"), "--pages", str(pages),
+                subprocess.Popen([str(QUIET_PY), "-u", str(ROOT_DIR / "ai_call.py"), "--pages", str(pages),
                                   "--start", str(start)] + (["--quick"] if quick else []), cwd=ROOT_DIR,
                                  creationflags=flags,
                                  stdout=open(ROOT_DIR / "logs" / "ai_call.log", "a", encoding="utf-8"),

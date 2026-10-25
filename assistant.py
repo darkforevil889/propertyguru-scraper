@@ -260,8 +260,8 @@ TOOLS = [
         "result is sent to Kelvin when done (a few minutes)."),
         "parameters": {"type": "object", "properties": {"days": {"type": "integer"}}}}},
     {"type": "function", "function": {"name": "call_progress", "description": (
-        "Today's ipline AI calls (单任务外呼): numbers left, on the line now, called today, finished or not, ipline's "
-        "message. Read only - calls are started / stopped by Kelvin himself on ipline, never by you."),
+        "Today's ipline AI calls (单任务外呼): numbers left, on the line now, called today, finished or not, "
+        "ipline's message. Read only - calls are started / stopped by Kelvin himself on ipline, never by you."),
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {"name": "blast_status", "description": (
         "WhatsApp blasts: how many sent / to go, paused / resting / finished, for the recent ones."),
@@ -715,14 +715,27 @@ def _pg_overview():
 
 
 def _web(query):
-    """Free internet search (DuckDuckGo) - top results."""
+    """Internet search - top results: Tavily (TAVILY_API_KEY in .env, 1,000 free a month), else DuckDuckGo."""
     import html
     import urllib.parse
     import urllib.request
+    if os.environ.get("TAVILY_API_KEY"):
+        try:
+            req = urllib.request.Request("https://api.tavily.com/search", method="POST", data=json.dumps({
+                "query": query, "max_results": 6, "search_depth": "basic"}).encode(), headers={
+                "Content-Type": "application/json", "Authorization": f"Bearer {os.environ['TAVILY_API_KEY']}"})
+            found = json.loads(urllib.request.urlopen(req, timeout=30).read()).get("results") or []
+            if found:
+                return [{"title": r.get("title", ""), "snippet": (r.get("content") or "")[:300],
+                         "link": r.get("url", "")} for r in found]
+        except Exception as e:  # out of free searches / down: DuckDuckGo below
+            print("tavily:", str(e)[:200], flush=True)
     req = urllib.request.Request("https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query), headers={
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 "
                       "Safari/537.36"})
     page = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "replace")
+    if "bots use DuckDuckGo" in page:
+        return {"result": "internet search not available right now - try again later"}
     clean = lambda x: html.unescape(re.sub(r"<[^>]+>", "", x)).strip()  # noqa: E731
     links = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page, re.S)
     snips = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', page, re.S)

@@ -211,6 +211,15 @@ def lid_phone(c, jid, jid_s):
         return None
 
 
+def text_of(m):
+    text = m.conversation or (m.extendedTextMessage.text if m.HasField("extendedTextMessage") else "")
+    if not text and m.HasField("interactiveResponseMessage"):  # they tapped a quick-reply button from a blast
+        text = m.interactiveResponseMessage.body.text
+    if not text and m.HasField("buttonsResponseMessage"):
+        text = m.buttonsResponseMessage.selectedDisplayText
+    return text
+
+
 @client.event(MessageEv)
 def on_message(c, ev):
     src = ev.Info.MessageSource
@@ -253,6 +262,13 @@ def on_message(c, ev):
         except Exception as e:
             print("owner photo:", str(e)[:200], flush=True)
         return
+    if not owner and not settings()["enabled"]:
+        # property bot OFF: other people's chats are neither kept nor answered (this may be your own main number) -
+        # only a quick-reply option someone tapped from a blast still gets its set answer
+        text = text_of(m)
+        if text.strip():
+            threading.Thread(target=blast_option_only, args=(chat, info, phone, text), daemon=True).start()
+        return
     if m.HasField("imageMessage"):
         try:
             path = MEDIA / f"{''.join(ch for ch in chat if ch.isalnum())[:30]}_{ev.Info.ID}.jpg"
@@ -264,11 +280,7 @@ def on_message(c, ev):
         log(chat, name, "user", f"[sent a photo] {cap}".strip())
         schedule(chat, info, 25)  # owners often send several photos - answer once they pause
         return
-    text = m.conversation or (m.extendedTextMessage.text if m.HasField("extendedTextMessage") else "")
-    if not text and m.HasField("interactiveResponseMessage"):  # they tapped a quick-reply button from a blast
-        text = m.interactiveResponseMessage.body.text
-    if not text and m.HasField("buttonsResponseMessage"):
-        text = m.buttonsResponseMessage.selectedDisplayText
+    text = text_of(m)
     if not text.strip():
         return
     if owner:  # your own number: your personal assistant (works even with the bot OFF)
@@ -387,6 +399,15 @@ def route_reply(chat, info, phone, text):
         send_option_reply(chat, info, answer)
     else:
         schedule(chat, info, 6)  # wait a moment in case they send more lines
+
+
+def blast_option_only(chat, info, phone, text):
+    """Bot OFF: answer only a blast's quick-reply option (logged only then)."""
+    import wa_blast
+    answer = wa_blast.auto_reply("bot", phone, text)
+    if answer:
+        log(chat, info.get("name"), "user", text.strip())
+        send_option_reply(chat, info, answer)
 
 
 def send_option_reply(chat, info, answer):
