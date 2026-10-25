@@ -1449,12 +1449,127 @@ def condo_prices_page():
 
 # ---------- WhatsApp chat bot (auto-replies on a separate number) ----------
 def chat_bot_page():
+    st.title("WhatsApp chat bot")
+    mine, prop = st.tabs(["🙋 My assistant", "🏠 Property bot"])
+    with mine:
+        assistant_tab()
+    with prop:
+        property_bot_page()
+
+
+def assistant_tab():
+    """Your personal assistant on the bot's number - talks only to your own number (assistant.py)."""
+    import assistant
+    import bot_remote
+    on_pc = (ROOT_DIR / "wa_bot.py").exists() and bool(os.environ.get("SUPABASE_SECRET_KEY"))
+    try:
+        import bot_client
+        bot = (bot_client.status() or {}) if on_pc else bot_remote.state(db)
+    except Exception:
+        bot = {}
+    a = assistant.load(db)
+    st.caption("Texts **only your own number** from the bot's WhatsApp: one reminder at a time at random times in "
+               "your hours, in Singlish / Chinese-English, worded differently every time. Answer it like a friend "
+               "(\"not yet\", \"done\", \"bought, starts 5 Nov\") - and ask it things: \"give me whatsapp listing\", "
+               "\"blast 30 done?\", \"resume the blast\", \"Residence 22 price?\", \"yesterday post what on "
+               "PropertyGuru?\", \"scan the listing group\", \"remind me pay TNB every 15th\". Works even when the "
+               "property bot is off. Runs on your PC.")
+    me = (bot.get("me") or {}).get("number")
+    status = bot.get("status") or "off"
+    (st.success if status == "ready" else st.warning)(
+        f"Bot WhatsApp: **{status}**" + (f" (+{me})" if me else "") + f" → texts **+{a.get('number')}**"
+        + ("" if a.get("enabled") else " · ⏸ assistant switched off"))
+
+    # ----- settings -----
+    with st.expander("⚙️ Settings", expanded=False):
+        c1, c2, c3, c4 = st.columns([1, 1.4, 2, 1.2])
+        on = c1.toggle("On", a.get("enabled", True), key="as-on")
+        number = c2.text_input("Your number", a.get("number"), key="as-num")
+        hours = c3.slider("Texts you between", 0, 23, (int(a["start_hour"]), int(a["end_hour"])), format="%d:00",
+                          key="as-hours")
+        per_day = c4.number_input("Messages a day (max)", 1, 10, int(a["per_day"]), key="as-per-day")
+        if st.button("💾 Save settings", key="as-save"):
+            a.update(enabled=on, number=re.sub(r"\D", "", number) or a["number"], start_hour=hours[0],
+                     end_hour=hours[1], per_day=int(per_day), plan={})
+            assistant.save(a, db)
+            st.toast("Saved")
+            st.rerun()
+
+    # ----- reminders -----
+    st.markdown("**Your reminders** - change, add (last row) or delete (tick the row, then the bin), then **Save "
+                "reminders**")
+    kinds = {"todo": "To-do (daily until done)", "monthly": "Monthly (due date)", "checkin": "Check-in (every N days)"}
+    back = {v: k for k, v in kinds.items()}
+    table = pd.DataFrame([{
+        "Reminder": t.get("title"), "Type": kinds.get(t.get("kind")),
+        "Due date": pd.to_datetime(t["due"]).date() if t.get("due") else None,
+        "Remind days before": t.get("remind_days_before"), "Ask every N days": t.get("every_days"),
+        "Status": t.get("status") or "open", "Last answer": t.get("note") or "",
+        "Last asked": datetime.fromtimestamp(t["last_asked"], MYT).strftime("%d %b %H:%M") if t.get("last_asked")
+        else "", "_id": t.get("id")} for t in a["tasks"]])
+    edited = st.data_editor(
+        table, hide_index=True, width="stretch", num_rows="dynamic", key="as-tasks",
+        disabled=["Last answer", "Last asked"],
+        column_config={"Type": st.column_config.SelectboxColumn(options=list(kinds.values()), required=True),
+                       "Due date": st.column_config.DateColumn(format="DD MMM YYYY"),
+                       "Remind days before": st.column_config.NumberColumn(min_value=0, max_value=60),
+                       "Ask every N days": st.column_config.NumberColumn(min_value=1, max_value=60),
+                       "Status": st.column_config.SelectboxColumn(options=["open", "done", "cancelled"]),
+                       "_id": None})
+    if st.button("💾 Save reminders", key="as-save-tasks"):
+        old = {t["id"]: t for t in a["tasks"]}
+        tasks = []
+        for _, r in edited.iterrows():
+            if not (isinstance(r["Reminder"], str) and r["Reminder"].strip()):
+                continue
+            tid = r["_id"] if isinstance(r["_id"], str) and r["_id"] in old else \
+                re.sub(r"[^a-z0-9]+", "-", r["Reminder"].lower()).strip("-")[:30] or f"t{len(tasks)}"
+            t = {**old.get(tid, {}), "id": tid, "title": r["Reminder"].strip(),
+                 "kind": back.get(r["Type"], "todo"), "status": r["Status"] or "open"}
+            t["due"] = r["Due date"].isoformat() if not pd.isna(r["Due date"]) and r["Due date"] else None
+            t["remind_days_before"] = int(r["Remind days before"]) if not pd.isna(r["Remind days before"]) else 10
+            t["every_days"] = int(r["Ask every N days"]) if not pd.isna(r["Ask every N days"]) else 7
+            tasks.append(t)
+        a["tasks"] = tasks
+        assistant.save(a, db)
+        st.toast(f"Saved {len(tasks)} reminders")
+        st.rerun()
+
+    # ----- today -----
+    plan = a.get("plan") or {}
+    if plan.get("day") == datetime.now(MYT).date().isoformat():
+        times = ", ".join(datetime.fromtimestamp(t, MYT).strftime("%I:%M %p").lstrip("0") for t in plan["times"])
+        st.caption(f"Today's message times (random): {times} · {plan.get('sent', 0)} used")
+    w = a.get("waiting")
+    if w:
+        st.caption(f"Last asked: \"{w.get('text')}\" - "
+                   + ("answered ✅" if w.get("answered") else "waiting for your answer"))
+    if on_pc and status == "ready" and st.button("📨 Send one now", key="as-nudge",
+                                                 help="It texts you the next reminder right away (to try it)"):
+        try:
+            bot_client.assistant_nudge()
+            st.toast("Sending - check your WhatsApp in a few seconds")
+        except Exception as e:
+            st.error(f"Couldn't reach the bot: {e}")
+
+    # ----- your chat with it -----
+    convs = bot_client.conversations() if on_pc else (bot.get("conversations") or [])
+    chat = next((c for c in convs if c.get("chat") == assistant.HISTORY_KEY), None)
+    with st.expander("💬 Your chat with it (latest)", expanded=bool(chat)):
+        if not chat:
+            st.caption("Nothing yet.")
+        for role, text, ts in (chat or {}).get("messages", []):
+            when = datetime.fromtimestamp(ts, MYT).strftime("%d %b %H:%M")
+            st.markdown(f"{'🙋 **You**' if role == 'user' else '🤖 **Assistant**'} · <small>{when}</small>  \n"
+                        f"{text}", unsafe_allow_html=True)
+
+
+def property_bot_page():
     import base64
 
     import bot_brain
     import bot_client
 
-    st.title("WhatsApp chat bot")
     st.caption("Auto-replies on a SEPARATE WhatsApp number: finds listings, quotes condo prices, answers your FAQ and "
                "collects owner listings (saved to WhatsApp → Saved listings). Replies to private chats only - never "
                "groups, never messages anyone first. Runs on your PC: keep it on for instant replies.")
@@ -2380,15 +2495,30 @@ if tool == "Price filter":
 
 
 # ---------- data ----------
+# Only what the page shows / downloads - the long description, photos and amenity lists made loading slow
+LISTING_COLS = ("listing_id,search_key,title,headline,url,address,postcode,district,area,region,nearest_station,"
+                "price_rm,initial_price_rm,previous_price_rm,price_changed_at,psf_rm,floor_area_sqft,bedrooms,"
+                "bathrooms,property_type,furnishing,tenure,title_type,build_year,completed_year,developer,"
+                "agent_name,agency_id,posted_on,first_seen,last_seen,details_scraped_at,latitude,longitude,status")
+
+
 @st.cache_data(ttl=600, show_spinner="Loading listings…")
-def load_listings(_db):
-    rows, start, size = [], 0, 1000  # Supabase returns max 1000 rows per request
-    while True:
-        batch = _db.table("listings").select("*").range(start, start + size - 1).execute().data
-        rows += batch
-        if len(batch) < size:
-            break
-        start += size
+def load_listings(_db, search_key):
+    """One category's listings. Supabase gives max 1000 rows per request, so the batches are fetched side by side."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def query(cols, **kw):
+        q = _db.table("listings").select(cols, **kw)
+        if search_key == "kl-rent-8k":  # older rows have no search_key - they came from this first search
+            return q.or_(f"search_key.eq.{search_key},search_key.is.null")
+        return q.eq("search_key", search_key)
+
+    size = 1000
+    total = query("listing_id", count="exact").limit(1).execute().count or 0
+    with ThreadPoolExecutor(8) as pool:
+        batches = pool.map(lambda start: query(LISTING_COLS).order("listing_id").range(start, start + size - 1)
+                           .execute().data, range(0, total, size))
+        rows = [r for b in batches for r in b]
     df = pd.DataFrame(rows)
     if df.empty:
         return df
@@ -2414,40 +2544,37 @@ CATEGORIES = {
 }
 
 
-df = load_listings(db)
-
 with st.sidebar:
     if st.button("Refresh data"):
         load_listings.clear()
         st.rerun()
 
-if df.empty:
-    st.info("No listings yet - run the scraper first.")
-    st.stop()
+st.title("KL Tracker")
 
-# ---------- filters ----------
-with st.sidebar:
-    st.header("Filters")
-    category = st.radio("Category", list(CATEGORIES))
-    cat_key, cat_kind = CATEGORIES[category]
-    df = df[df.search_key == cat_key]
-    if df.empty:
-        st.info("No listings in this category yet - they appear after the next scrape.")
-        st.stop()
-    active_days = st.slider("Seen in the last N days", 1, 60, 3,
-                            help="Listings not seen recently were probably taken down.")
+# ---------- filters (across the top of the page) ----------
+category = st.radio("Category", list(CATEGORIES), horizontal=True)
+cat_key, cat_kind = CATEGORIES[category]
+df = load_listings(db, cat_key)
+if df.empty:
+    st.info("No listings in this category yet - they appear after the next scrape.")
+    st.stop()
+with st.container(border=True):
+    r1 = st.columns([1, 2, 2])
+    active_days = r1[0].slider("Seen in the last N days", 1, 60, 3,
+                               help="Listings not seen recently were probably taken down.")
     pmin, pmax = int(df.price_rm.min()), int(df.price_rm.max())
     if cat_kind == "rent":
-        price = st.slider("Monthly rent (RM)", pmin, max(pmax, pmin + 1), (pmin, min(max(pmax, pmin + 1), 50000)),
-                          step=500, key=f"price-{cat_key}")
+        price = r1[1].slider("Monthly rent (RM)", pmin, max(pmax, pmin + 1),
+                             (pmin, min(max(pmax, pmin + 1), 50000)), step=500, key=f"price-{cat_key}")
     else:
-        price = st.slider("Price (RM)", pmin, max(pmax, pmin + 1), (pmin, max(pmax, pmin + 1)), step=100_000,
-                          key=f"price-{cat_key}", format="%d")
-    districts = st.multiselect("District", sorted(df.district.dropna().unique()), key=f"dist-{cat_key}")
-    beds = st.multiselect("Bedrooms", sorted(df.bedrooms.dropna().astype(int).unique()), key=f"beds-{cat_key}")
-    types = st.multiselect("Property type", sorted(df.property_type.dropna().unique()), key=f"type-{cat_key}")
-    furnish = st.multiselect("Furnishing", sorted(df.furnishing.dropna().unique()), key=f"furn-{cat_key}")
-    text = st.text_input("Search name / address")
+        price = r1[1].slider("Price (RM)", pmin, max(pmax, pmin + 1), (pmin, max(pmax, pmin + 1)), step=100_000,
+                             key=f"price-{cat_key}", format="%d")
+    text = r1[2].text_input("Search name / address")
+    r2 = st.columns(4)
+    districts = r2[0].multiselect("District", sorted(df.district.dropna().unique()), key=f"dist-{cat_key}")
+    beds = r2[1].multiselect("Bedrooms", sorted(df.bedrooms.dropna().astype(int).unique()), key=f"beds-{cat_key}")
+    types = r2[2].multiselect("Property type", sorted(df.property_type.dropna().unique()), key=f"type-{cat_key}")
+    furnish = r2[3].multiselect("Furnishing", sorted(df.furnishing.dropna().unique()), key=f"furn-{cat_key}")
 
 cutoff = datetime.now(timezone.utc) - timedelta(days=active_days)
 f = df[(df.last_seen >= cutoff) & df.price_rm.between(*price)]
@@ -2463,8 +2590,6 @@ if text:
     f = f[f.title.str.contains(text, case=False, na=False) | f.address.str.contains(text, case=False, na=False)]
 
 # ---------- page ----------
-st.title("KL Tracker")
-st.caption(category)
 price_word = "rent" if cat_kind == "rent" else "price"
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Listings", f"{len(f):,}")
@@ -2484,9 +2609,31 @@ LINK = {"Property": st.column_config.LinkColumn("Property", display_text=r"^[^#]
 tab_list, tab_map, tab_drops, tab_district = st.tabs(["Listings", "Map", "Price changes", "By district"])
 
 with tab_list:
-    st.dataframe(f.sort_values("price_rm")[list(COLS)].rename(columns=COLS),
-                 column_config=LINK, hide_index=True, width="stretch", height=600)
-    st.download_button("Download CSV", f.drop(columns="property_link").to_csv(index=False).encode("utf-8-sig"),
+    PER_PAGE = 10
+    pages_n = max(1, -(-len(f) // PER_PAGE))
+    # back to page 1 whenever the filters change
+    sig = (cat_key, active_days, price, tuple(districts), tuple(beds), tuple(types), tuple(furnish), text)
+    if st.session_state.get("lst-sig") != sig:
+        st.session_state["lst-sig"], st.session_state["lst-page"] = sig, 1
+    st.session_state["lst-page"] = min(st.session_state.get("lst-page", 1), pages_n)
+
+    def turn(step):
+        st.session_state["lst-page"] = min(max(1, st.session_state["lst-page"] + step), pages_n)
+
+    page_no = st.session_state["lst-page"]
+    first = (page_no - 1) * PER_PAGE
+    st.dataframe(f.sort_values("price_rm").iloc[first:first + PER_PAGE][list(COLS)].rename(columns=COLS),
+                 column_config=LINK, hide_index=True, width="stretch")
+    p1, p2, p3, p4, p5 = st.columns([1, 1, 2, 1, 1], vertical_alignment="center")
+    p1.button("⏮ First", on_click=turn, args=(-pages_n,), disabled=page_no == 1, width="stretch")
+    p2.button("◀ Back", on_click=turn, args=(-1,), disabled=page_no == 1, width="stretch")
+    p3.markdown(f"<div style='text-align:center'>Page <b>{page_no}</b> of {pages_n:,} · listings "
+                f"{first + 1 if len(f) else 0:,}–{min(first + PER_PAGE, len(f)):,} of {len(f):,}</div>",
+                unsafe_allow_html=True)
+    p4.button("Next ▶", on_click=turn, args=(1,), disabled=page_no == pages_n, width="stretch")
+    p5.button("Last ⏭", on_click=turn, args=(pages_n,), disabled=page_no == pages_n, width="stretch")
+    st.download_button("Download CSV (all filtered)",
+                       lambda: f.drop(columns="property_link").to_csv(index=False).encode("utf-8-sig"),
                        "listings.csv", "text/csv")
 
 with tab_map:

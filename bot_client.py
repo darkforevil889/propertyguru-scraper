@@ -13,12 +13,13 @@ DATA = ROOT / "wa_bot_data"
 URL = "http://127.0.0.1:3079"
 
 
-def _call(method, path, timeout=5):
+def _call(method, path, timeout=5, body=None):
     try:
         token = (DATA / ".token").read_text().strip()
     except OSError:
         token = ""
-    req = urllib.request.Request(URL + path, data=b"{}" if method == "POST" else None, method=method,
+    data = json.dumps(body or {}).encode() if method == "POST" else None
+    req = urllib.request.Request(URL + path, data=data, method=method,
                                  headers={"Content-Type": "application/json", "X-Bridge-Token": token})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
@@ -54,6 +55,16 @@ def logout():
         _call("POST", "/logout", timeout=20)
     except Exception:
         pass
+
+
+def assistant_say(text):
+    """Your assistant sends you this text (and maybe one of your stickers) - e.g. a test."""
+    return _call("POST", "/assistant_say", timeout=10, body={"text": text})
+
+
+def assistant_nudge():
+    """Your assistant sends you one reminder now (the bot words and sends it in the background)."""
+    return _call("POST", "/assistant_nudge", timeout=10)
 
 
 def load_settings():

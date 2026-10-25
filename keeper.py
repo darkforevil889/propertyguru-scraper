@@ -79,6 +79,15 @@ def blast_sync_loop():
             if str(e) != last_ai_error:
                 log(f"ai call sync problem: {str(e)[:300]}")
                 last_ai_error = str(e)
+        if n % 4 == 2:  # ipline calls you started: progress to your WhatsApp (reads ipline every 10 min, see the file)
+            try:
+                import ai_call_watch
+                importlib.reload(ai_call_watch)
+                ai_call_watch.check(log)
+            except Exception as e:
+                if str(e) != last_ai_error:
+                    log(f"ai call watch problem: {str(e)[:300]}")
+                    last_ai_error = str(e)
         try:  # WhatsApp page: chat list up every minute, scans / settings asked for online every 15 s
             importlib.reload(wa_scan)
             wa_scan.run_requests(db, log)

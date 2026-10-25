@@ -205,15 +205,20 @@ def _models():
     return list(dict.fromkeys([main] + [m.strip() for m in backups.split(",") if m.strip()]))
 
 
-def _llm(messages):
+def _llm(messages, tools=None, temperature=0.3, max_tokens=450):
+    """One AI answer (with tool calls). tools=None: the property bot's tools; [] = none (just text)."""
     base = os.environ.get("BOT_LLM_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
     wait = 0
     for attempt in range(2):  # every model busy -> wait (as told by the server, max 20 s) and try once more
         if wait:
             time.sleep(wait)
         for model in _models():
-            body = json.dumps({"model": model, "messages": messages, "tools": TOOLS, "tool_choice": "auto",
-                               "temperature": 0.3, "max_tokens": 450}).encode()
+            payload = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+            if tools != []:
+                payload.update(tools=TOOLS if tools is None else tools, tool_choice="auto")
+            if "gpt-oss" in model:
+                payload["reasoning_effort"] = "low"  # its thinking counts in max_tokens - keep room for the answer
+            body = json.dumps(payload).encode()
             req = urllib.request.Request(f"{base}/chat/completions", data=body, headers={
                 "Content-Type": "application/json", "Authorization": f"Bearer {os.environ.get('BOT_LLM_API_KEY', '')}",
                 # Groq's firewall rejects Python's default user agent (error 1010)
@@ -222,12 +227,22 @@ def _llm(messages):
                 with urllib.request.urlopen(req, timeout=60) as r:
                     return json.load(r)["choices"][0]["message"]
             except urllib.error.HTTPError as e:
+                if e.code == 400:  # e.g. this model wrote a broken tool call - the next model usually doesn't
+                    try:
+                        why = e.read().decode("utf-8", "replace")[:300]
+                    except Exception:
+                        why = ""
+                    print(f"AI {model} rejected (400): {why}", flush=True)
+                    last_400 = why
+                    continue
                 if e.code not in (429, 503):
                     raise
                 try:
                     wait = max(wait, min(20, float(e.headers.get("retry-after") or 5)))
                 except ValueError:
                     wait = 5
+    if "last_400" in locals():
+        raise RuntimeError(f"every AI model rejected the request: {last_400[:200]}")
     raise RuntimeError("all AI models busy (rate limit)")
 
 

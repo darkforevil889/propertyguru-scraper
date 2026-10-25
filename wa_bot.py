@@ -7,6 +7,8 @@
 Control API on 127.0.0.1:3079, protected by wa_bot_data/.token. Start it from the dashboard's "Chat bot" page.
 """
 import json
+import random
+import re
 import os
 import secrets
 import sqlite3
@@ -32,6 +34,7 @@ from neonize.proto.waCompanionReg.WAWebProtobufsCompanionReg_pb2 import DevicePr
 from neonize.utils.enum import ChatPresence, ChatPresenceMedia  # noqa: E402
 import segno  # noqa: E402
 
+import assistant  # noqa: E402
 import bot_brain  # noqa: E402
 
 TOKEN = secrets.token_hex(24)
@@ -228,6 +231,28 @@ def on_message(c, ev):
             m = getattr(m, w).message
     name = ev.Info.Pushname or None
     info = {"jid": src.Chat, "name": name, "phone": phone}
+    owner = is_owner_chat(chat, phone)
+    if m.HasField("stickerMessage") and owner:  # your stickers: kept for the assistant to use
+        try:
+            save_sticker(c.download_any(m))
+            log(assistant.HISTORY_KEY, name, "user", "[sent a sticker]")
+            if random.random() < 0.5:  # sometimes a sticker back
+                threading.Thread(target=send_sticker, args=(src.Chat,), daemon=True).start()
+        except Exception as e:
+            print("sticker:", str(e)[:200], flush=True)
+        return
+    if m.HasField("imageMessage") and owner:  # your photo / screenshot: the assistant looks at it
+        try:
+            folder = ROOT / "data" / "assistant_photos"  # in the project, so a change request can show it to Claude Code
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / f"{time.strftime('%Y%m%d-%H%M%S')}_{ev.Info.ID[:10]}.jpg"
+            path.write_bytes(c.download_any(m))
+            log(assistant.HISTORY_KEY, name, "user",
+                f"[sent a photo: {path.relative_to(ROOT).as_posix()}] {m.imageMessage.caption or ''}".strip())
+            threading.Thread(target=assistant_reply, args=(info, 10), daemon=True).start()  # several photos: wait a bit
+        except Exception as e:
+            print("owner photo:", str(e)[:200], flush=True)
+        return
     if m.HasField("imageMessage"):
         try:
             path = MEDIA / f"{''.join(ch for ch in chat if ch.isalnum())[:30]}_{ev.Info.ID}.jpg"
@@ -246,8 +271,112 @@ def on_message(c, ev):
         text = m.buttonsResponseMessage.selectedDisplayText
     if not text.strip():
         return
+    if owner:  # your own number: your personal assistant (works even with the bot OFF)
+        log(assistant.HISTORY_KEY, name, "user", text.strip())
+        threading.Thread(target=assistant_reply, args=(info,), daemon=True).start()
+        return
     log(chat, name, "user", text.strip())
     threading.Thread(target=route_reply, args=(chat, info, phone, text), daemon=True).start()
+
+
+# ---------- your personal assistant (assistant.py): only your own number ----------
+assistant_lock = threading.Lock()  # one answer at a time
+
+
+OWNER_CHATS = DATA / "owner_chats.json"  # the ids WhatsApp uses for your number (often a hidden '...@lid')
+
+
+def is_owner_chat(chat, phone):
+    """Your own number? By phone - or by a chat id already known to be yours (the phone isn't always given)."""
+    try:
+        known = set(json.loads(OWNER_CHATS.read_text()))
+    except (OSError, ValueError):
+        known = set()
+    if assistant.is_owner(phone):
+        if chat not in known:
+            OWNER_CHATS.write_text(json.dumps(sorted(known | {chat})))
+        return True
+    return chat in known
+
+
+def send_photos(jid, photos):
+    """Pictures the assistant found (listing photos) -> you, one by one."""
+    for data, caption in photos:
+        try:
+            time.sleep(random.uniform(1, 2.5))
+            client.send_image(jid, data, caption=caption or None)
+        except Exception as e:
+            print("send photo:", str(e)[:200], flush=True)
+
+
+STICKERS = DATA / "stickers"  # the stickers you sent the bot - it uses them instead of emojis
+
+
+def save_sticker(data):
+    import hashlib
+    STICKERS.mkdir(exist_ok=True)
+    (STICKERS / f"{hashlib.sha1(data).hexdigest()[:16]}.webp").write_bytes(data)  # each sticker once
+
+
+def send_sticker(jid):
+    files = list(STICKERS.glob("*.webp")) if STICKERS.exists() else []
+    if files:
+        time.sleep(random.uniform(1.5, 4))
+        try:
+            client.send_sticker(jid, random.choice(files).read_bytes())
+        except Exception as e:
+            print("send sticker:", str(e)[:200], flush=True)
+
+
+def send_to_owner(text, jid=None, sticker=False):
+    """A message from the assistant to you - several thoughts = several bubbles, with typing pauses; sticker=True
+    adds one of your own stickers after it."""
+    from neonize.utils import build_jid
+    jid = jid or build_jid(re.sub(r"\D", "", assistant.load().get("number") or ""))
+    for i, part in enumerate(p.strip() for p in text.split("\n\n") if p.strip()):
+        try:
+            client.send_chat_presence(jid, ChatPresence.CHAT_PRESENCE_COMPOSING,
+                                      ChatPresenceMedia.CHAT_PRESENCE_MEDIA_TEXT)
+        except Exception:
+            pass
+        time.sleep(min(5, 1.2 + len(part) / 45))
+        client.send_message(jid, part)
+    log(assistant.HISTORY_KEY, "assistant", "assistant", text)
+    if sticker:
+        send_sticker(jid)
+
+
+def assistant_reply(info, wait=4):
+    time.sleep(wait)  # you often send a few lines / photos - answer them together
+    if not assistant_lock.acquire(blocking=False):
+        return  # already answering; it reads the newest lines too
+    try:
+        for _ in range(3):  # you sent more while it was answering -> one more round for those
+            hist = history(assistant.HISTORY_KEY, 20)
+            if not hist or hist[-1]["role"] != "user":
+                return
+            text = assistant.reply(hist, lambda t: send_to_owner(t, info["jid"]),
+                                   send_photos=lambda photos: send_photos(info["jid"], photos))
+            if text:
+                send_to_owner(text, info["jid"], sticker=random.random() < 0.12)
+            else:
+                return
+    except Exception as e:
+        print("assistant reply failed:", str(e)[:300], flush=True)
+    finally:
+        assistant_lock.release()
+
+
+def assistant_clock():
+    """Every minute: time for one of today's reminders? (assistant.tick decides and words it)."""
+    while True:
+        time.sleep(60)
+        if state.get("status") != "ready":
+            continue
+        try:
+            assistant.tick(send_to_owner)
+        except Exception as e:
+            print("assistant clock:", str(e)[:300], flush=True)
 
 
 def route_reply(chat, info, phone, text):
@@ -298,6 +427,18 @@ class Api(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.headers.get("X-Bridge-Token") != TOKEN:
             return self._send(403, {"error": "forbidden"})
+        if self.path == "/assistant_say":  # a given text from the assistant to you (tests)
+            try:
+                text = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}").get("text")
+            except ValueError:
+                text = None
+            if text:
+                threading.Thread(target=send_to_owner, args=(assistant.no_emoji(text),),
+                                 kwargs={"sticker": True}, daemon=True).start()
+            return self._send(200, {"ok": bool(text)})
+        if self.path == "/assistant_nudge":  # dashboard: "Send one now"
+            threading.Thread(target=lambda: assistant.tick(send_to_owner, force=True), daemon=True).start()
+            return self._send(200, {"ok": True})
         if self.path == "/logout":
             try:
                 client.logout()
@@ -314,6 +455,7 @@ if __name__ == "__main__":
     threading.Thread(target=qr_watchdog, daemon=True).start()
     import wa_blast
     threading.Thread(target=wa_blast.worker, args=(client, "bot", state), daemon=True).start()
+    threading.Thread(target=assistant_clock, daemon=True).start()
     print(f"wa_bot listening on 127.0.0.1:{PORT}", flush=True)
     try:
         client.connect()
