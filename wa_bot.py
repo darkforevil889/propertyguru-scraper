@@ -254,6 +254,20 @@ def send_to_owner(text, jid=None, sticker=False):
         send_sticker(jid)
 
 
+def send_file_to_owner(f, caption=""):
+    """A file from this PC -> you, as a document (keeps full quality; WhatsApp allows documents up to 2 GB)."""
+    import mimetypes
+    from neonize.utils import build_jid
+    jid = build_jid(re.sub(r"\D", "", assistant.load().get("number") or ""))
+    try:
+        client.send_document(jid, f.read_bytes(), caption=caption or None, filename=f.name, title=f.name,
+                             mimetype=mimetypes.guess_type(f.name)[0] or "application/octet-stream")
+        print(f"sent {f.name} to you", flush=True)
+    except Exception as e:
+        print("send file:", str(e)[:300], flush=True)
+        send_to_owner(f"Couldn't send {f.name}: {str(e)[:150]}")
+
+
 def assistant_reply(info, wait=1.5):
     time.sleep(wait)  # you often send a few lines / photos - answer them together
     if not assistant_lock.acquire(blocking=False):
@@ -319,6 +333,16 @@ class Api(BaseHTTPRequestHandler):
                 threading.Thread(target=send_to_owner, args=(assistant.no_emoji(text),),
                                  kwargs={"sticker": True}, daemon=True).start()
             return self._send(200, {"ok": bool(text)})
+        if self.path == "/assistant_file":  # a file on this PC -> you, as a document (no WhatsApp video size limit)
+            try:
+                req = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+            except ValueError:
+                req = {}
+            f = Path(req.get("path") or "")
+            if not f.is_file():
+                return self._send(200, {"ok": False, "error": "no such file"})
+            threading.Thread(target=send_file_to_owner, args=(f, req.get("caption") or ""), daemon=True).start()
+            return self._send(200, {"ok": True})
         if self.path == "/assistant_nudge":  # dashboard: "Send one now"
             threading.Thread(target=lambda: assistant.tick(send_to_owner, force=True), daemon=True).start()
             return self._send(200, {"ok": True})

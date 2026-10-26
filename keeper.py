@@ -171,20 +171,22 @@ def ai_backlog():
                    max_new=b.get("daily", 200), before=b.get("before"))
 
 
-def start_ai_check(start, pages, quick=False, text_only=False, max_new=None, before=None):
+def start_ai_check(start, pages, quick=False, text_only=False, max_new=None, before=None, today=False):
     """Run ai_call.py in the background (asked for on the online dashboard, or the backlog)."""
     import ai_call
     ai_call.OUT.mkdir(parents=True, exist_ok=True)
     ai_call._save(ai_call.STATUS, {"state": "running", "at": time.time(), "page": start, "call": 0,
                                    "calls": "?", "of_pages": "?", "phone": "logging in…"})
     python = ROOT / ".venv" / "Scripts" / "python.exe"
-    subprocess.Popen([str(python), "-u", str(ROOT / "ai_call.py"), "--pages", str(pages), "--start", str(start)]
+    subprocess.Popen([str(python), "-u", str(ROOT / "ai_call.py")]
+                     + (["--today"] if today else ["--pages", str(pages), "--start", str(start)])
                      + (["--quick"] if quick else []) + (["--text"] if text_only else [])
                      + (["--max-new", str(max_new)] if max_new else []) + (["--before", before] if before else []),
                      cwd=ROOT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                      stdout=open(LOGS / "ai_call.log", "a", encoding="utf-8"), stderr=subprocess.STDOUT)
-    log(f"ai call {'text-only ' if text_only else 'quick ' if quick else ''}check started: page {start}, "
-        f"{pages} page(s)" + (f", up to {max_new} new calls" if max_new else ""))
+    log(f"ai call {'text-only ' if text_only else 'quick ' if quick else ''}check started: "
+        + ("today's calls" if today else f"page {start}, {pages} page(s)")
+        + (f", up to {max_new} new calls" if max_new else ""))
 
 
 def main():

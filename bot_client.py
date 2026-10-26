@@ -105,3 +105,8 @@ def conversations(limit=40):
                                (chat,)).fetchall()
             out.append({"chat": chat, "name": name, "last_ts": last, "messages": list(reversed(msgs))})
     return out
+
+
+def send_file(path, caption=""):
+    """A file on this PC -> you on WhatsApp, as a document (full quality, no video size limit)."""
+    return _call("POST", "/assistant_file", timeout=10, body={"path": str(path), "caption": caption})

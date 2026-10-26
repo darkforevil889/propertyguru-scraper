@@ -2045,23 +2045,30 @@ def ai_call_page():
     running = stt.get("state") == "running" and time_now() - stt.get("at", 0) < 600
     with st.container(border=True):
         c1, c2, c3 = st.columns([1, 1, 2])
-        start = c1.number_input("Start from page", 1, 999, 1, help="Page 1 = the newest calls")
-        pages = c2.number_input("How many pages (30 calls each)", 1, 200, 1)
-        quick = c1.radio("Check", ["Full", "Quick"], horizontal=True, help=(
+        today = c1.radio("Which calls", ["Today", "By page"], horizontal=True, help=(
+            "Today: every A-grade call made today (Malaysia time), however many pages that is. "
+            "By page: page 1 = the newest calls.")) == "Today"
+        start, pages = (1, 1) if today else (c1.number_input("Start from page", 1, 999, 1, help="Page 1 = the newest calls"),
+                                             c2.number_input("How many pages (30 calls each)", 1, 200, 1))
+        quick = c2.radio("Check", ["Full", "Quick"], horizontal=True, help=(
             "Full: listens to the whole call twice (most accurate, ~250-300 calls a day on the free AI). "
             "Quick: only listens to what they said from 'Do you want to sell or rent your property?' on - about "
             "2x faster and ~500 calls a day, but misses about 1 in 4 real leads (ones only the whole recording "
             "hears clearly). Good for the old backlog; run Full on those pages later to check them properly.")) \
             == "Quick"
-        c3.caption(f"About {pages * (2 if quick else 4)} minutes. Calls already checked are skipped, so you can run "
-                   "it again any time to pick up new calls." + ("" if on_pc else " Your PC does the checking - keep it on."))
+        c3.caption(("Each answer is heard as English, Chinese and Malay (Groq), then on your PC - about half a minute "
+                    "per call. " if today else f"About {pages * (2 if quick else 4)} minutes. ")
+                   + "Calls already checked are skipped, so you can run it again any time to pick up new calls."
+                   + ("" if on_pc else " Your PC does the checking - keep it on."))
         if running or waiting:
             @st.fragment(run_every="5s")
             def progress_box():
                 s = pc_check_status()
                 if s.get("state") == "running" and time_now() - s.get("at", 0) < 600:
-                    st.info(f"⏳ Checking page {s.get('page')} (of {s.get('of_pages')}) - call {s.get('call')} of "
-                            f"{s.get('calls')}: {s.get('phone')}. You can leave this page; it carries on.")
+                    where = (f"today's calls (page {s.get('page')})" if s.get("today")
+                             else f"page {s.get('page')} (of {s.get('of_pages')})")
+                    st.info(f"⏳ Checking {where} - call {s.get('call')} of {s.get('calls')}: {s.get('phone')}. "
+                            "You can leave this page; it carries on.")
                 elif not on_pc and ai_call_remote.pending_requests(db):
                     st.info("⏳ Sent to your PC - it starts within about 15 seconds (if the PC is on).")
                 else:
@@ -2076,13 +2083,14 @@ def ai_call_page():
                 ai_call._save(ai_call.STATUS, {"state": "running", "at": time_now(), "page": start, "call": 0,
                                                "calls": "?", "of_pages": "?", "phone": "logging in…"})
                 flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
-                subprocess.Popen([str(QUIET_PY), "-u", str(ROOT_DIR / "ai_call.py"), "--pages", str(pages),
-                                  "--start", str(start)] + (["--quick"] if quick else []), cwd=ROOT_DIR,
+                subprocess.Popen([str(QUIET_PY), "-u", str(ROOT_DIR / "ai_call.py")]
+                                 + (["--today"] if today else ["--pages", str(pages), "--start", str(start)])
+                                 + (["--quick"] if quick else []), cwd=ROOT_DIR,
                                  creationflags=flags,
                                  stdout=open(ROOT_DIR / "logs" / "ai_call.log", "a", encoding="utf-8"),
                                  stderr=subprocess.STDOUT)
             else:
-                ai_call_remote.request_check(db, start, pages, quick)
+                ai_call_remote.request_check(db, start, pages, quick, today)
             st.rerun()
         if stt.get("state") == "error":
             c3.error(f"Last check stopped: {stt.get('error')}")
@@ -2116,6 +2124,8 @@ def ai_call_page():
     zh_turns = [ai_call.after_q1(t, "heard_zh") if isinstance(t, list) else "" for t in turns_col]
     df["chinese"] = [c if isinstance(c, str) and c else z
                      for c, z in zip(df["chinese"] if "chinese" in df else [""] * len(df), zh_turns)]
+    df["malay"] = [ai_call.after_q1(t, "heard_ms") if isinstance(t, list) else "" for t in turns_col]
+    df["pc"] = [ai_call.after_q1(t, "heard_local") if isinstance(t, list) else "" for t in turns_col]
     df["said"] = df.said.map(ai_call.clean_said)
     df["ai_want"] = df.verdict == "interested"
     df["keep"] = [ticks.get(i, w) for i, w in zip(df.call_id, df.ai_want)]
@@ -2157,8 +2167,8 @@ def ai_call_page():
     table = pd.DataFrame({
         "✔ Keep": view.keep.map({True: "✅", False: "⬜"}).values, "Phone": view.phone.values,
         "AI says": view.ai_want.map({True: "✅ Want", False: "❌ Fake"}).values,
-        "English": view.english.values, "Chinese": view.chinese.values, "ipline": view.ipline_said.values,
-        "Why": view.reason.values,
+        "English": view.english.values, "Chinese": view.chinese.values, "Malay": view.malay.values,
+        "My PC": view.pc.values, "ipline": view.ipline_said.values, "Why": view.reason.values,
         "Called": view.called.values, "Sec": view.seconds.values,
         "Checked by me": view.reviewed.map({True: "✔", False: ""}).values})
     st.caption("👆 Click a **number** (or anywhere on its row) to listen to that call · click the **✔ Keep** box "
@@ -2192,9 +2202,13 @@ def ai_call_page():
         on_select=on_click, selection_mode="single-cell",
         column_config={"✔ Keep": st.column_config.TextColumn(width="small"),
                        "English": st.column_config.TextColumn(
-                           width="large", help="Their own voice clips heard again (English / Malay)"),
+                           width="large", help="Groq: their own voice clips heard again (English / Malay)"),
                        "Chinese": st.column_config.TextColumn(
-                           width="large", help="The same clips heard as Chinese - right when they spoke Chinese"),
+                           width="large", help="Groq: the same clips heard as Chinese - right when they spoke Chinese"),
+                       "Malay": st.column_config.TextColumn(
+                           width="large", help="Groq: the same clips heard as Malay - right when they spoke Malay"),
+                       "My PC": st.column_config.TextColumn(
+                           width="large", help="Your PC (Qwen): a different speech model on the same clips"),
                        "ipline": st.column_config.TextColumn(width="large", help="ipline's own text of their words"),
                        "Why": st.column_config.TextColumn(width="medium")},
         key=tbl_key)
@@ -2242,17 +2256,22 @@ def ai_call_page():
         if st.toggle("✔ Keep this number", value=keep_this, key=f"aicall-keep-{pick}") != keep_this:
             save_ticks({pick: not keep_this})
             st.rerun()
-        st.caption("Three hearings of the same call - phone lines blur similar words, so they can differ. "
+        st.caption("Several hearings of the same call - phone lines blur similar words, so they can differ. "
                    "The AI goes by what they agree on; the recording above is the real thing.")
-        l1, l2, l3, l4 = st.columns(4)
-        l1.markdown("**Person's voice clips, re-heard**")
+        l1, l2, l3 = st.columns(3)
+        l1.markdown("**Groq · English**")
         l1.text(r.heard or "(nothing)")
-        l2.markdown("**Heard as Chinese**")
+        l2.markdown("**Groq · Chinese**")
         l2.text(r.chinese.replace(" / ", "\n") if r.chinese else "(not heard as Chinese)")
-        l3.markdown("**Whole recording, re-heard**")
-        l3.text(r.full or "(nothing)")
-        l4.markdown("**ipline's own text**")
-        l4.text(r.ipline or "(nothing)")
+        l3.markdown("**Groq · Malay**")
+        l3.text(r.malay.replace(" / ", "\n") if r.malay else "(not heard as Malay)")
+        l4, l5, l6 = st.columns(3)
+        l4.markdown("**My PC (Qwen)**")
+        l4.text(r.pc.replace(" / ", "\n") if r.pc else "(not heard on the PC)")
+        l5.markdown("**ipline's own text**")
+        l5.text(r.ipline or "(nothing)")
+        l6.markdown("**Why**")
+        l6.text(f"{'✅ Want' if r.ai_want else '❌ Fake'} - {r.reason}\n\nWhole recording, re-heard:\n{r.full or '(nothing)'}")
     if jump:  # scroll the page down to this section
         st.iframe("<script>setTimeout(() => {const el = window.parent.document.getElementById('aicall-listen');"
                   "if (el) el.scrollIntoView({behavior: 'smooth', block: 'start'});}, 300);</script>", height=1)

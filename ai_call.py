@@ -135,16 +135,32 @@ LISTEN = 4  # 4 = + answer hint for the clips; 2 = the person's own voice clips,
 LANGS = ("english", "malay", "chinese", "mandarin", "cantonese", "indonesian", "tamil")  # anything else = misheard
 
 
+_LOCAL = False  # Groq's listening allowance is used up today -> Qwen on this PC (local_asr.py) for the rest of the run
+
+
 def _whisper(name, data, mime, prompt, language=None):
-    form = {"model": "whisper-large-v3", "response_format": "verbose_json", "prompt": prompt}
-    if language:
-        form["language"] = language
-    j = _groq("POST", "/audio/transcriptions", files={"file": (name, data, mime)}, data=form)
-    lang = (j.get("language") or "").lower()
-    if not language and lang and not any(x in lang for x in LANGS):
-        return _whisper(name, data, mime, prompt, "ms")  # e.g. Malay heard as Swedish - try again as Malay
-    return [s for s in j.get("segments") or []
-            if s.get("text", "").strip() and s.get("no_speech_prob", 0) <= 0.6 and not NOISE.search(s["text"])]
+    global _LOCAL
+    if not _LOCAL:
+        form = {"model": "whisper-large-v3", "response_format": "verbose_json", "prompt": prompt}
+        if language:
+            form["language"] = language
+        try:
+            j = _groq("POST", "/audio/transcriptions", files={"file": (name, data, mime)}, data=form)
+        except DailyLimit:
+            import local_asr
+            if not local_asr.available():
+                raise
+            print("Groq's free listening allowance is used up for today - listening on this PC instead (slower)",
+                  flush=True)
+            _LOCAL = True
+        else:
+            lang = (j.get("language") or "").lower()
+            if not language and lang and not any(x in lang for x in LANGS):
+                return _whisper(name, data, mime, prompt, "ms")  # e.g. Malay heard as Swedish - try again as Malay
+            return [s for s in j.get("segments") or []
+                    if s.get("text", "").strip() and s.get("no_speech_prob", 0) <= 0.6 and not NOISE.search(s["text"])]
+    import local_asr
+    return [s for s in local_asr.transcribe(name, data, prompt, language) if not NOISE.search(s["text"])]
 
 
 def hear(audio):
@@ -213,10 +229,31 @@ def hear_person(ip, turns):
         raise
     except Exception:
         pass  # the English hearing is enough to go on
+    # ... and as Malay: left to itself Whisper often writes a Malay answer as English look-alikes
+    try:
+        ms = [s for s in _whisper("person.wav", audio, "audio/wav", MS_HINT, "ms") if not MS_ECHO.search(s["text"])]
+        put_back(ms, "heard_ms")
+    except DailyLimit:
+        raise
+    except Exception:
+        pass
+    # A third hearing on this PC (Qwen3-ASR, local_asr.py): a different speech model, so it catches what Whisper
+    # misses - it keeps Chinese and Malay answers in their own language. Not needed when Qwen already did the two above.
+    import local_asr
+    if not _LOCAL and local_asr.available():
+        try:
+            put_back([s for s in local_asr.transcribe("person.wav", audio, LOCAL_HINT) if not NOISE.search(s["text"])],
+                     "heard_local")
+        except Exception as e:
+            print("hearing on this PC skipped:", str(e)[:150], flush=True)
 
 
 ZH_HINT = "马来西亚的一通房产电话，这是接电话的人说的话。"
+# No answer words for Qwen: with PERSON_HINT's Malay examples it turned a Chinese answer into Malay
+LOCAL_HINT = "Answers on a phone call in Malaysia about selling or renting property. English, Malay, Mandarin or Cantonese."
 ZH_ECHO = re.compile(r"问：|回答：|房产电话|接电话的人")
+MS_HINT = "Panggilan telefon di Malaysia tentang hartanah. Ini kata-kata orang yang menjawab panggilan."
+MS_ECHO = re.compile(r"panggilan telefon|kata-kata orang|menjawab panggilan", re.I)
 
 
 # Greetings / goodbyes say nothing about interest - left out of what the dashboard shows
@@ -268,9 +305,12 @@ def conversation(turns, which="both"):
             elif which == "heard":
                 out.append(f"PERSON: {heard or '(nothing clear)'}")
             else:
-                zh = (t.get("heard_zh") or "").strip()
+                zh, ms = (t.get("heard_zh") or "").strip(), (t.get("heard_ms") or "").strip()
+                loc = (t.get("heard_local") or "").strip()
                 out.append(f"PERSON: re-heard \"{heard or '(nothing clear)'}\""
-                           + (f"  |  re-heard as Chinese \"{zh}\"" if zh else "") + f"  |  ipline guessed \"{guess}\"")
+                           + (f"  |  re-heard as Chinese \"{zh}\"" if zh else "")
+                           + (f"  |  re-heard as Malay \"{ms}\"" if ms else "")
+                           + (f"  |  heard on this PC \"{loc}\"" if loc else "") + f"  |  ipline guessed \"{guess}\"")
     return "\n".join(out)
 
 
@@ -290,7 +330,11 @@ The person's own voice clips ("re-heard" in A) are the most accurate for THEIR w
 whole recording (B) mixes both voices and often mishears them. When the clips and B disagree, trust the clips.
 Some PERSON lines also have "re-heard as Chinese" = the same clip heard as Chinese. If the person spoke Chinese, that \
 one is right (the plain "re-heard" then turns Chinese into English-sounding nonsense, e.g. "Hampshire resident?"); \
-if they spoke English or Malay, ignore it.
+if they spoke English or Malay, ignore it. Likewise "re-heard as Malay" = the same clip heard as Malay: right if they \
+spoke Malay ("tak ada", "boleh", "mana?"), ignore it if they spoke English or Chinese.
+Some PERSON lines also have "heard on this PC" = the same clip heard by a different speech model. It writes Chinese \
+and Malay answers in their own language and is often right when the others disagree, but it sometimes mishears a \
+very short English answer (e.g. "No" heard as "Boleh"). Use it as an extra vote, not on its own.
 Work out what the person really said: prefer what two hearings agree on (also when they only sound alike, e.g. \
 "Detail and so" ~ "Detail untuk?"); otherwise prefer the version that makes sense as a reply to the robot. \
 Phone lines blur similar words: a short reply to Q1 like "we property" / "where property" / "what property" is \
@@ -332,7 +376,8 @@ VOICEMAIL = re.compile(r"leave (a |your )?message|after the (beep|tone)|voice ?m
 QUICK_JUDGE = """Phone call by a Malaysian property agent's robot. Q1 = "Do you want to sell or rent your \
 property?", Q2 = "How about I WhatsApp you details?". Below: the call from Q1 on. Each PERSON line is heard twice: \
 "re-heard" (more accurate) and "ipline guessed" (often wrong); some also "re-heard as Chinese" (right if they spoke \
-Chinese, ignore it otherwise). People answer late, so an answer to Q1 may come after \
+Chinese, ignore it otherwise), "re-heard as Malay" (right if they spoke Malay) and "heard on this PC" (a third speech model - an extra vote; it can mishear very short \
+English answers). People answer late, so an answer to Q1 may come after \
 Q2. English / Malay / Chinese / a mix.
 
 Facts (true / false), each on its own:
@@ -619,22 +664,23 @@ def audio_file(call_id):
 
 
 def check(pages=1, start_page=1, progress=print, headless=True, quick=False, text_only=False, max_new=None,
-          before=None):
+          before=None, since=None):
     """Check A-grade calls page by page (already-checked calls are skipped). Returns (results, csv_path, txt_path).
     quick = only the answer to "Do you want to sell or rent your property?" (about 5x faster, a few leads missed);
-    calls checked quickly are checked again in full by a later full check."""
+    calls checked quickly are checked again in full by a later full check.
+    since = only calls made from then on (unix time): pages are read newest first until an older call shows up."""
     OUT.mkdir(parents=True, exist_ok=True)
     AUDIO.mkdir(exist_ok=True)
     cache, results = _load_cache(), []
 
     def step(**kw):
         _save(STATUS, {"state": "running", "at": time.time(), "start": start_page, "pages": pages,
-                       "mode": "text" if text_only else "quick" if quick else "full", **kw})
+                       "mode": "text" if text_only else "quick" if quick else "full", "today": bool(since), **kw})
 
-    new_count, capped = 0, False
+    new_count, capped, older = 0, False, False
     with Ipline(headless=headless) as ip:
         for page_no in range(start_page, start_page + pages):
-            if capped:
+            if capped or older:
                 break
             calls, total, n_pages = ip.calls(page_no)
             progress(f"Page {page_no} of {n_pages} ({total:,} A-grade calls in total): {len(calls)} calls")
@@ -646,6 +692,9 @@ def check(pages=1, start_page=1, progress=print, headless=True, quick=False, tex
                 entry = cache.get(key) or {}
                 if before and c.get("dialtime", 0) / 1000 >= before:
                     continue  # newer than the cut-off (e.g. still has its recording) - left for normal checks
+                if since and c.get("dialtime", 0) / 1000 < since:
+                    older = True  # newest first - everything from here on is from before today
+                    break
                 needs_work = (entry.get("listen") not in (LISTEN, "quick", "text")) if (quick or text_only) \
                     else entry.get("listen") != LISTEN
                 if needs_work and max_new is not None and new_count >= max_new:
@@ -675,7 +724,7 @@ def check(pages=1, start_page=1, progress=print, headless=True, quick=False, tex
                                 facts["verdict"], facts["reason"] = decide(facts)
                             else:
                                 facts = quick_judge(answer, text_only)
-                        entry = {"turns": [{k: t.get(k, "") for k in ("who", "text", "heard", "heard_zh")} for t in turns],
+                        entry = {"turns": [{k: t.get(k, "") for k in ("who", "text", "heard", "heard_zh", "heard_ms", "heard_local")} for t in turns],
                                  "full": "", "listen": "text" if text_only else "quick", "rules": QUICK_RULES, **facts}
                         mp3 = AUDIO / f"{key}.mp3"
                         if not text_only and not mp3.exists():  # for listening on the dashboard (no AI needed)
@@ -686,7 +735,7 @@ def check(pages=1, start_page=1, progress=print, headless=True, quick=False, tex
                         progress(f"  {i}/{len(calls)} {c['phone']}: listening…")
                         turns = ip.transcript(c)
                         hear_person(ip, turns)
-                        entry["turns"] = [{k: t.get(k, "") for k in ("who", "text", "heard", "heard_zh")} for t in turns]
+                        entry["turns"] = [{k: t.get(k, "") for k in ("who", "text", "heard", "heard_zh", "heard_ms", "heard_local")} for t in turns]
                         mp3 = AUDIO / f"{key}.mp3"
                         if not mp3.exists():
                             audio = ip.recording(c)  # whole call - also for listening on the dashboard
@@ -736,11 +785,14 @@ if __name__ == "__main__":
     ap.add_argument("--text", action="store_true", help="old calls whose recordings are gone: ipline's text only")
     ap.add_argument("--max-new", type=int, help="stop after checking this many calls not checked before")
     ap.add_argument("--before", help="only calls made before this date (YYYY-MM-DD, Malaysia time)")
+    ap.add_argument("--today", action="store_true", help="every call made today (Malaysia time), however many pages")
     a = ap.parse_args()
     cutoff = datetime.strptime(a.before, "%Y-%m-%d").replace(tzinfo=MYT).timestamp() if a.before else None
+    midnight = datetime.now(MYT).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() if a.today else None
     try:
-        res, csv_path, txt_path = check(a.pages, a.start, headless=not a.show, quick=a.quick, text_only=a.text,
-                                        max_new=a.max_new, before=cutoff)
+        res, csv_path, txt_path = check(200 if a.today else a.pages, 1 if a.today else a.start, headless=not a.show,
+                                        quick=a.quick, text_only=a.text, max_new=a.max_new, before=cutoff,
+                                        since=midnight)
     except DailyLimit:
         _save(STATUS, {"state": "error", "at": time.time(),
                        "error": "Today's free AI allowance is used up. Calls checked so far are saved - press "
