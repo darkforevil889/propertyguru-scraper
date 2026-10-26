@@ -1066,6 +1066,8 @@ def whatsapp_chats_page():
     import wa_client
     try:
         import neonize  # noqa: F401 - only installed on the PC
+        if os.environ.get("KL_ONLINE_VIEW"):  # try the online page on the PC
+            raise ImportError
     except ImportError:
         return whatsapp_chats_online()  # online dashboard: what your PC copied up, replies sent by the PC
     try:
@@ -1085,110 +1087,52 @@ def whatsapp_chats_page():
 
 
 def whatsapp_chats_online():
-    """WhatsApp chats on the online dashboard: what your PC copied up (wa_chat_sync.py); replies go to the PC, which
-    sends them within about 15 seconds."""
+    """WhatsApp chats on the online dashboard, full screen (wa_chat_view.py): what your PC copied up
+    (wa_chat_sync.py); replies go to the PC, which sends them within about 15 seconds."""
     import time
 
     import wa_chat_sync
-    st.title("WhatsApp chats")
-    ix = wa_chat_sync.index(db)
-    if not ix.get("chats"):
-        st.info("Your PC hasn't copied your chats up yet - make sure it's on, then reload in a minute.")
-        return
-    age = time.time() - (ix.get("at") or 0)
-    if age > 300:
-        st.warning(f"🖥️ Your PC was last seen {age / 60:.0f} minutes ago - new messages and your replies wait until "
-                   "it's back on.")
-    st.markdown("<style>.st-key-wco-list img, .st-key-wco-head img, .st-key-wco-thread "
-                "[data-testid='stChatMessageAvatarCustom'] img {border-radius: 50%; object-fit: cover;}</style>",
+    from wa_chat_view import chat_view
+    st.markdown("<style>.stMainBlockContainer {padding-top: 3rem; padding-bottom: 0.5rem;}</style>",
                 unsafe_allow_html=True)
 
-    def when(ts):
-        d = datetime.fromtimestamp(ts or 0, MYT)
-        return d.strftime("%I:%M %p").lstrip("0") if d.date() == datetime.now(MYT).date() else d.strftime("%d %b")
+    def opened():
+        st.session_state["wco-chat"] = st.session_state["wco-view"].open
 
-    chats = ix["chats"]
-    pics = signed_urls([c["avatar"] for c in chats if c.get("avatar")])
-    left, right = st.columns([1, 2.2])
-    with left:
-        q = st.text_input("Search", placeholder="🔍 Search…", label_visibility="collapsed", key="wco-q")
-        shown = [c for c in chats if not q or q.lower() in (c["name"] or "").lower() or q in (c["phone"] or "")]
-        if not shown:
-            st.caption("No chats.")
+    def sent():
+        v = st.session_state["wco-view"].send or {}
+        c = next((c for c in st.session_state.get("wco-chats", []) if c["key"] == v.get("key")), None)
+        if c and (v.get("text") or "").strip():
+            wa_chat_sync.request_send(db, c["send_to"], v["text"].strip())
+
+    @st.fragment(run_every="8s")
+    def view():
+        ix = wa_chat_sync.index(db)
+        chats = ix.get("chats") or []
+        st.session_state["wco-chats"] = chats
+        if not chats:
+            st.info("Your PC hasn't copied your chats up yet - make sure it's on, then reload in a minute.")
             return
-        if st.session_state.get("wco-chat") not in {c["key"] for c in shown}:
-            st.session_state["wco-chat"] = shown[0]["key"]
-        with st.container(height=640, key="wco-list"):
-            for c in shown:
-                a, b, t = st.columns([0.17, 0.6, 0.23], vertical_alignment="center", gap="small")
-                if pics.get(c.get("avatar")):
-                    a.image(pics[c["avatar"]], width=42)
-                else:
-                    a.markdown("### 👥" if c["is_group"] else "### 👤")
-                name = ("👥 " if c["is_group"] else "") + (c["name"] or f"+{c['phone']}")
-                if b.button(name, key=f"wco-{c['key']}", width="stretch",
-                            type="primary" if c["key"] == st.session_state["wco-chat"] else "tertiary"):
-                    st.session_state["wco-chat"] = c["key"]
-                    st.rerun()
-                b.caption(c.get("preview") or " ")
-                t.caption(when(c["last_ts"]))
-    cur = next(c for c in shown if c["key"] == st.session_state["wco-chat"])
-    title = ("👥 " if cur["is_group"] else "") + (cur["name"] or f"+{cur['phone']}")
-    with right:
-        with st.container(key="wco-head"):
-            h1, h2 = st.columns([0.1, 0.9], vertical_alignment="center")
-            if pics.get(cur.get("avatar")):
-                h1.image(pics[cur["avatar"]], width=48)
-            h2.subheader(title)
-            if cur["phone"] and not cur["is_group"]:
-                h2.caption(f"+{cur['phone']}")
-
-        @st.fragment(run_every="10s")
-        def thread():
-            data = wa_chat_sync.chat(db, cur["key"])
-            msgs = data.get("messages") or []
-            files = signed_urls([m["file"] for m in msgs if m.get("file")])
-            waiting = [t["params"]["text"] for t in wa_chat_sync.pending_sends(db)
-                       if (t.get("params") or {}).get("to") == cur["send_to"]]
-            with st.container(height=500, key="wco-thread"):
-                if not msgs:
-                    st.caption("No messages copied for this chat yet.")
-                for m in msgs:
-                    with st.chat_message("assistant" if m["me"] else "user",
-                                         avatar="🟢" if m["me"] else (pics.get(cur.get("avatar")) or "👤")):
-                        if cur["is_group"] and not m["me"] and m.get("who"):
-                            st.caption(m["who"])
-                        url = files.get(m.get("file"))
-                        if url and m["kind"] == "photo":
-                            st.image(url, width=260)
-                        elif url and m["kind"] == "sticker":
-                            st.image(url, width=120)
-                        elif url and m["kind"] == "voice":
-                            st.audio(url)
-                        elif m["kind"]:
-                            st.write({"photo": "📷 Photo", "pdf": "📄 PDF", "video": "🎬 Video", "zip": "🗂 Files",
-                                      "voice": "🎤 Voice message", "sticker": "Sticker"}.get(m["kind"], ""))
-                        if m.get("text"):
-                            st.write(m["text"])
-                        st.caption(("You · " if m["me"] else "") + when(m["ts"]))
-                for text in waiting:
-                    with st.chat_message("assistant", avatar="⏳"):
-                        st.write(text)
-                        st.caption("sending through your PC…")
-            if data.get("suggest") and msgs and not msgs[-1]["me"]:
-                for s_ in data["suggest"]:
-                    if st.button(f"⚡ {s_}", key=f"wco-sug-{cur['key']}-{hash(s_)}",
-                                 help="Put it in the message box - you still press Send"):
-                        st.session_state["wco-box"] = s_
-                        st.rerun(scope="app")
-        thread()
-        with st.form("wco-send", clear_on_submit=True, border=False):
-            f1, f2 = st.columns([0.85, 0.15], vertical_alignment="bottom")
-            text = f1.text_area("Message", key="wco-box", placeholder=f"Type a message to {title}", height=68,
-                                label_visibility="collapsed")
-            if f2.form_submit_button("Send ➤", type="primary", width="stretch") and text.strip():
-                wa_chat_sync.request_send(db, cur["send_to"], text.strip())
-                st.toast("Sending through your PC (about 15 seconds)…")
+        if st.session_state.get("wco-chat") not in {c["key"] for c in chats}:
+            st.session_state["wco-chat"] = chats[0]["key"]
+        cur = next(c for c in chats if c["key"] == st.session_state["wco-chat"])
+        thread = wa_chat_sync.chat(db, cur["key"])
+        msgs = thread.get("messages") or []
+        pics = signed_urls([c["avatar"] for c in chats if c.get("avatar")] + [m["file"] for m in msgs if m.get("file")])
+        age = time.time() - (ix.get("at") or 0)
+        chat_view(key="wco-view", on_open_change=opened, on_send_change=sent, data={
+            "chats": [{k: c.get(k) for k in ("key", "name", "phone", "is_group", "last_ts", "preview")}
+                      | {"pic": pics.get(c.get("avatar"))} for c in chats],
+            "current": cur["key"],
+            "messages": [{k: m.get(k) for k in ("id", "me", "who", "text", "kind", "ts")} | {"url": pics.get(m.get("file"))}
+                         for m in msgs],
+            "suggest": thread.get("suggest") or [],
+            "waiting": [t["params"]["text"] for t in wa_chat_sync.pending_sends(db)
+                        if (t.get("params") or {}).get("to") == cur["send_to"]],
+            "dark": getattr(st.context.theme, "type", None) == "dark",
+            "warning": f"🖥️ Your PC was last seen {age / 60:.0f} minutes ago - new messages and your replies wait "
+                       "until it's back on." if age > 300 else ""})
+    view()
 
 
 def whatsapp_page():
