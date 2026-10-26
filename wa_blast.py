@@ -44,6 +44,40 @@ def _write(path, obj):
 
 
 # ---------- dashboard side ----------
+# Opt-out: someone replying "stop" / "jangan hantar" / "不要再发" is never sent a blast again (wa_service.py checks
+# every incoming message; the sender skips these numbers). Kept in wa_blast/optout.json as local numbers (012...).
+OPTOUT = DIR / "optout.json"
+STOP_WORDS = re.compile(
+    r"^\W*(stop|unsubscribe|remove me|berhenti)\W*$|don'?t (message|text|contact|whatsapp|send)|not interested.*stop|"
+    r"stop (message|messaging|texting|sending|contact)|jangan (hantar|mesej|msg|whatsapp|ganggu|kacau)|"
+    r"tak (nak|mahu) (terima|dapat) (mesej|msg)|不要再?(发|發|传|傳|联系|聯繫|打扰|打擾)|别再?(发|發|打扰)|退订|退訂", re.I)
+
+
+def _local(phone):
+    """60123456789 / +60123456789 -> 0123456789 (how blast lists keep numbers)."""
+    d = re.sub(r"\D", "", phone or "")
+    return d[1:] if d.startswith("60") else d
+
+
+def opted_out():
+    return set(_read(OPTOUT, []))
+
+
+def opt_out(phone, add=True):
+    """Add (or, add=False, remove) a number on the opt-out list."""
+    nums = opted_out()
+    (nums.add if add else nums.discard)(_local(phone))
+    _write(OPTOUT, sorted(nums))
+
+
+def check_opt_out(phone, text):
+    """An incoming message: a short "stop" kind of reply -> on the opt-out list. -> True if it was one."""
+    if phone and text and len(text) <= 120 and STOP_WORDS.search(text.strip()):
+        opt_out(phone)
+        return True
+    return False
+
+
 def parse_numbers(lines):
     """Lines like '012-345 6789', '0123456789 Ali', 'Ali, +60123456789' ->
     ([{'phone': '0123456789', 'name': 'Ali' or None}], rejected [(raw, reason)], duplicate count)."""
@@ -342,6 +376,13 @@ def worker(client, sender, state):
                     continue
             item = next(n for n in job["numbers"] if n["phone"] not in prog["results"])
             phone = item["phone"]
+            if _local(phone) in opted_out():  # they asked not to be messaged: skipped, nothing sent
+                prog["results"][phone] = {"status": "opted out", "error": "Asked not to be messaged",
+                                          "at": time.time()}
+                if len(prog["results"]) >= len(job["numbers"]):
+                    prog["state"], prog["finished"] = "Finished", time.time()
+                _write(prog_path, prog)
+                continue
             prog["state"] = "Sending"
             res = _send_one(client, job, item)
             if res.pop("retry", False):

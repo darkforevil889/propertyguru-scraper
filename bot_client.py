@@ -40,6 +40,18 @@ def ensure_running():
     except ImportError:
         raise RuntimeError("The WhatsApp bot only runs on the PC it was set up on.")
     (ROOT / "logs").mkdir(exist_ok=True)
+    starting = DATA / ".starting"  # the dashboard (every 3 s) and keeper both call this - only one start at a time
+    try:
+        recent = time.time() - float(starting.read_text()) < 45
+    except (OSError, ValueError):
+        recent = False
+    if recent:
+        for _ in range(30):
+            time.sleep(1)
+            if s := status():
+                return s
+        raise RuntimeError("The bot didn't start - see logs/wa_bot.log")
+    starting.write_text(str(time.time()))
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
     quiet = Path(sys.executable).with_name("pythonw.exe")  # no console window popping up
     subprocess.Popen([str(quiet if quiet.exists() else sys.executable), "-u", str(ROOT / "wa_bot.py")], cwd=ROOT,

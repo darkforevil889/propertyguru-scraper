@@ -3,6 +3,8 @@
 * links by QR as a linked device ("KL Tracker Bot") - its own session in wa_bot_data/
 * reads and answers ONLY your own number (assistant.py "number"); everyone else's messages are ignored, never
   read, kept or answered
+* smart reply by approval (reply_approval.py): a customer messages your main number -> you get the smart reply
+  here first, and it's sent to them only when you answer "ok"
 * also sends blasts set to go "from the bot's number" (wa_blast.py)
 Control API on 127.0.0.1:3079, protected by wa_bot_data/.token. Linked from the dashboard's "AI Chat bot" page.
 """
@@ -33,8 +35,7 @@ import segno  # noqa: E402
 
 import assistant  # noqa: E402
 
-TOKEN = secrets.token_hex(24)
-(DATA / ".token").write_text(TOKEN)
+TOKEN = secrets.token_hex(24)  # written to .token only once the port is ours - a second copy mustn't overwrite it
 STARTED = time.time()
 state = {"status": "starting", "qr": None, "me": None, "error": None}
 
@@ -162,15 +163,28 @@ def on_message(c, ev):
             path.write_bytes(c.download_any(m))
             log(assistant.HISTORY_KEY, name, "user",
                 f"[sent a photo: {path.relative_to(ROOT).as_posix()}] {m.imageMessage.caption or ''}".strip())
-            threading.Thread(target=assistant_reply, args=(info, 10), daemon=True).start()  # several photos: wait a bit
+            threading.Thread(target=assistant_reply, args=(info, 4), daemon=True).start()  # several photos: wait a bit
         except Exception as e:
             print("owner photo:", str(e)[:200], flush=True)
         return
     text = text_of(m)
     if not text.strip():
         return
-    log(assistant.HISTORY_KEY, name, "user", text.strip())
-    threading.Thread(target=owner_text, args=(info, text), daemon=True).start()
+    threading.Thread(target=owner_text, args=(info, name, text.strip()), daemon=True).start()
+
+
+def owner_text(info, name, text):
+    """Your "ok" / "no" for a waiting smart reply (reply_approval.py) - or anything else, for the assistant."""
+    import reply_approval
+    try:
+        said = reply_approval.answer(text)
+    except Exception as e:
+        said = f"Couldn't do that: {str(e)[:150]}"
+    log(assistant.HISTORY_KEY, name, "user", text)
+    if said is None:
+        assistant_reply(info)
+    elif said:  # "" = sent, nothing to say
+        send_to_owner(said, info["jid"])
 
 
 # ---------- your personal assistant (assistant.py): only your own number ----------
@@ -233,31 +247,14 @@ def send_to_owner(text, jid=None, sticker=False):
                                       ChatPresenceMedia.CHAT_PRESENCE_MEDIA_TEXT)
         except Exception:
             pass
-        time.sleep(min(5, 1.2 + len(part) / 45))
+        time.sleep(min(2, 0.5 + len(part) / 100))  # a short typing moment - you want answers fast
         client.send_message(jid, part)
     log(assistant.HISTORY_KEY, "assistant", "assistant", text)
     if sticker:
         send_sticker(jid)
 
 
-def owner_text(info, text):
-    """Your message: practice mode (customer_reply.py - you play the owner, it gives you 5 options) or else your
-    assistant as usual."""
-    def say(t):
-        send_to_owner(t, info["jid"])
-        log(assistant.HISTORY_KEY, "assistant", "assistant", t)
-    try:
-        import customer_reply
-        if customer_reply.whatsapp(assistant._db(), text, say):
-            return
-    except Exception as e:
-        print("practice:", str(e)[:300], flush=True)
-        say(f"practice check failed - {str(e)[:150]}")
-        return
-    assistant_reply(info)
-
-
-def assistant_reply(info, wait=4):
+def assistant_reply(info, wait=1.5):
     time.sleep(wait)  # you often send a few lines / photos - answer them together
     if not assistant_lock.acquire(blocking=False):
         return  # already answering; it reads the newest lines too
@@ -336,12 +333,26 @@ class Api(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Api)
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", PORT), Api)
+    except OSError:
+        print(f"wa_bot already running on {PORT} - this copy exits", flush=True)
+        sys.exit(0)
+    (DATA / ".token").write_text(TOKEN)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     threading.Thread(target=qr_watchdog, daemon=True).start()
     import wa_blast
     threading.Thread(target=wa_blast.worker, args=(client, "bot", state), daemon=True).start()
     threading.Thread(target=assistant_clock, daemon=True).start()
+    import reply_approval
+    mine = {"at": 0, "st": None}  # your number, read once a minute (not once per chat)
+
+    def is_mine(phone):
+        if time.time() - mine["at"] > 60:
+            mine.update(at=time.time(), st=assistant.load())
+        return assistant.is_owner(phone, mine["st"])
+    threading.Thread(target=reply_approval.watch, args=(lambda t: send_to_owner(t), is_mine),
+                     kwargs={"log": lambda t: print(t, flush=True)}, daemon=True).start()
     print(f"wa_bot listening on 127.0.0.1:{PORT}", flush=True)
     try:
         client.connect()

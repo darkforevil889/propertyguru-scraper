@@ -134,7 +134,8 @@ def restart(changed):
     return done
 
 
-BOT_FILES = ("wa_bot.py", "assistant.py", "bot_brain.py", "wa_blast.py", "bot_client.py")
+BOT_FILES = ("wa_bot.py", "assistant.py", "bot_brain.py", "wa_blast.py", "bot_client.py", "reply_approval.py",
+             "smart_reply.py")
 
 
 def restart_bot():

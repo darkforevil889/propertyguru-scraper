@@ -554,7 +554,7 @@ def judge(listing, units, prop, left_out=0):
 
 def run(db, ids=None, progress=print, rows=None, store=True):
     """Compare saved listings (all, or only `ids`) - opens Chrome on this PC. Returns {message_id: result}.
-    rows: listings given directly (e.g. a practice customer message) instead of saved ones; store=False keeps the
+    rows: listings given directly instead of saved ones; store=False keeps the
     results out of the dashboard's saved comparison."""
     from patchright.sync_api import sync_playwright
     import scraper

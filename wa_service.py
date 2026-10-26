@@ -35,8 +35,7 @@ from neonize.proto.waCompanionReg.WAWebProtobufsCompanionReg_pb2 import DevicePr
 from neonize.proto.waE2E.WAWebProtobufsE2E_pb2 import Message as WAMessage  # noqa: E402
 import segno  # noqa: E402
 
-TOKEN = secrets.token_hex(24)
-(DATA / ".token").write_text(TOKEN)
+TOKEN = secrets.token_hex(24)  # written to .token only once the port is ours - a second copy mustn't overwrite it
 
 state = {"status": "starting", "qr": None, "me": None, "error": None,
          "history": {"batches": 0, "messages": 0, "progress": None}}
@@ -256,6 +255,18 @@ def on_message(c, ev):
                     src.IsFromMe, ev.Message):
         with db_lock:
             db.commit()
+    if not src.IsGroup and not src.IsFromMe:
+        threading.Thread(target=opt_out_check, args=(c, src.Sender, alt, ev.Message), daemon=True).start()
+
+
+def opt_out_check(c, sender, alt, message):
+    """A customer replying "stop" (etc.) goes on the blast opt-out list (wa_blast.py) - never blasted again."""
+    import wa_blast
+    text, _ = unwrap(message)
+    if text:
+        phone = phone_of(alt) or pn_of(c, sender)
+        if wa_blast.check_opt_out(phone, text):
+            print(f"opt-out: {phone} asked not to be messaged", flush=True)
 
 
 def pn_of(c, jid):
@@ -398,7 +409,12 @@ class Api(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(("127.0.0.1", PORT), Api)
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", PORT), Api)
+    except OSError:
+        print(f"wa_service already running on {PORT} - this copy exits", flush=True)
+        sys.exit(0)
+    (DATA / ".token").write_text(TOKEN)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     threading.Thread(target=qr_watchdog, daemon=True).start()
     import wa_blast

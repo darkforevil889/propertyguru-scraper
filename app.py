@@ -1531,21 +1531,27 @@ def condo_prices_page():
 # ---------- WhatsApp chat bot (auto-replies on a separate number) ----------
 def chat_bot_page():
     st.title("AI Chat bot")
-    mine, smart, practice = st.tabs(["🙋 My assistant", "⚡ Smart reply", "💬 Customer reply"])
+    mine, smart = st.tabs(["🙋 My assistant", "⚡ Smart reply"])
     with mine:
         assistant_tab()
     with smart:
         smart_reply_tab()
-    with practice:
-        customer_reply_tab()
 
 
 def smart_reply_tab():
     """Your smart reply rules (smart_reply.py): shown as tap-to-use buttons in the WhatsApp chats window."""
     import smart_reply
     st.caption("When a customer writes, the reply whose rule fits shows as a ⚡ button above the message box in "
-               "**WhatsApp chats**. Tap it, change it if you like, then press send yourself - nothing is ever sent "
-               "by itself. Add a rule on the last row, delete with the bin, then **Save**.")
+               "**WhatsApp chats**, and your assistant WhatsApps it to you to answer \"ok\" - or, with **Auto send** "
+               "on, sends it by itself. Add a rule on the last row, delete with the bin, then **Save**.")
+    auto = smart_reply.auto_on(db)
+    on = st.toggle("🤖 Auto send - reply to customers by itself (you get a WhatsApp note of each one)", value=auto,
+                   key="sr-auto")
+    if on != auto:
+        smart_reply.save(db, auto=on)
+        st.toast("Auto send ON" if on else "Auto send OFF - replies wait for your ok again")
+    st.caption("Auto send: max 4 per customer a day, never the same reply twice in one chat, groups / opted-out "
+               "numbers left out. Market price replies still wait for your ok. Takes up to 1 min to switch.")
     rules = smart_reply.load(db)
     edited = st.data_editor(
         pd.DataFrame(rules or [{"when": "", "reply": ""}]), num_rows="dynamic", hide_index=True, width="stretch",
@@ -1560,80 +1566,6 @@ def smart_reply_tab():
     if c2.button("↩️ Back to the original rules", key="sr-reset"):
         smart_reply.save(db, smart_reply.DEFAULT)
         st.rerun()
-
-
-def customer_reply_tab():
-    """Practice: what an owner / customer says -> PropertyGuru now + 3 reply drafts -> you pick the best
-    (customer_reply.py). Drafts only - nothing is sent."""
-    import importlib
-    import customer_reply
-    importlib.reload(customer_reply)
-    on_pc = (ROOT_DIR / "market_check.py").exists() and bool(os.environ.get("SUPABASE_SECRET_KEY"))
-    st.caption("Practise a WhatsApp chat with an owner, step by step: type what the owner says, pick the best of 3 "
-               "replies (or write your own), then type the owner's next answer. While the building, rent or sale, "
-               "or size is still missing, it asks only that one thing. Once all three are known it checks "
-               "PropertyGuru & iProperty right now - the 5 lowest prices, fake ones marked, the lowest real one and "
-               "a suggested price - and the replies give the price advice. Your picks teach it your style. "
-               "Practice only - nothing is sent to anyone. Also on WhatsApp: tell your assistant "
-               "\"customer: Axon 650sf\".")
-    data = customer_reply.load(db)
-    for c in data["chats"][-6:]:
-        for line in customer_reply._lines(c):
-            if line["who"] == "customer":
-                with st.chat_message("user", avatar="🧑"):
-                    st.write(line["text"])
-            else:
-                with st.chat_message("assistant", avatar="✅"):
-                    st.write(line["text"])
-        m = c.get("market")
-        if m or c.get("missing"):
-            practice_market_box(c, m)
-        for i, opt in enumerate(c.get("options") or []):
-            with st.chat_message("assistant", avatar="💬"):
-                st.write(opt)
-                if st.button("👍 Pick this one", key=f"cr-pick-{c['id']}-{i}"):
-                    customer_reply.pick(db, c["id"], opt)
-                    st.rerun()
-        if c.get("options"):
-            with st.expander("✏️ My own better reply", expanded=False):
-                mine = st.text_area("Your reply", key=f"cr-own-{c['id']}", label_visibility="collapsed")
-                if st.button("Save as my pick", key=f"cr-own-btn-{c['id']}", disabled=not mine.strip()):
-                    customer_reply.pick(db, c["id"], mine.strip())
-                    st.rerun()
-        st.divider()
-    last = data["chats"][-1] if data["chats"] else None
-    who = st.radio("Next message is from", ["The same owner (continue)", "A new owner"], horizontal=True,
-                   index=0 if last and not last.get("options") else 1, key="cr-who", disabled=not last)
-    said = st.chat_input("What does the owner say?", disabled=not on_pc)
-    if said:
-        with st.status("Thinking…", expanded=True) as box:
-            try:
-                customer_reply.analyse(db, said, progress=lambda t: box.update(label=t),
-                                       chat_id=last["id"] if last and who.startswith("The same") else None)
-                box.update(label="Done", state="complete")
-            except Exception as e:
-                box.update(label=f"Couldn't check: {e}", state="error")
-                st.stop()
-        st.rerun()
-
-
-def practice_market_box(c, m):
-    """The market check of a practice chat (or what's still missing before it can check)."""
-    with st.chat_message("assistant", avatar="📊"):
-        if m and m.get("five"):
-            st.markdown(f"**{m.get('property') or c['details'].get('place')}** · {m['kind']} · lowest real "
-                        f"**RM{m['lowest_real'] or 0:,.0f}** · typical RM{m.get('typical') or 0:,.0f} · "
-                        f"suggested **RM{m.get('suggested') or 0:,.0f}**"
-                        + (f" · _{m['note']}_" if m.get("note") else ""))
-            st.dataframe(pd.DataFrame([{"Price (RM)": u["price"], "Size (sf)": u.get("sqft"), "Rooms": u.get("beds"),
-                                        "Real?": "❌ fake / bait" if u["fake"] else "✅", "Why": u.get("why") or "",
-                                        "Link": u.get("url")} for u in m["five"]]),
-                         hide_index=True, width="stretch",
-                         column_config={"Link": st.column_config.LinkColumn("Link", display_text="open")})
-        elif m:
-            st.write(m.get("why") or "Nothing to compare with on PropertyGuru right now.")
-        else:
-            st.write("Price check waits until it knows: " + ", ".join(c["missing"]))
 
 
 def assistant_tab():
@@ -1896,7 +1828,8 @@ def whatsapp_blast_page():
                     unable = count["not on WhatsApp"] + count["failed"]
                     st.progress(len(res) / max(total, 1),
                                 text=f"✅ {count['sent']} sent · ❌ {unable} unable to message · "
-                                     f"⏳ {total - len(res)} still to send")
+                                     f"⏳ {total - len(res)} still to send"
+                                     + (f" · 🚫 {count['opted out']} opted out" if count["opted out"] else ""))
                     if unable:
                         names = {n["phone"]: n.get("name") for n in j["numbers"]}
                         st.error(f"❌ **Unable to message {unable}:**\n\n" + "\n".join(
@@ -1932,7 +1865,7 @@ def whatsapp_blast_page():
                         if b[1].button("✖️ Cancel", key=f"can-{j['id']}"):
                             store.set_control(j["id"], "cancel")
                             st.rerun()
-                    label = {"sent": "✅ Sent", "not on WhatsApp": "❌ Unable to message",
+                    label = {"sent": "✅ Sent", "not on WhatsApp": "❌ Unable to message", "opted out": "🚫 Opted out",
                              "failed": "❌ Unable to message"}
                     rows = [{"Number": n["phone"], "Name": n.get("name") or "",
                              "Result": label.get((res.get(n["phone"]) or {}).get("status"), "⏳ Waiting"),

@@ -300,20 +300,6 @@ TOOLS = [
         "Scan the WhatsApp listing group(s) on the PC now for the last N days and save the owner listings; the "
         "result is sent to Kelvin when done (a few minutes)."),
         "parameters": {"type": "object", "properties": {"days": {"type": "integer"}}}}},
-    {"type": "function", "function": {"name": "practice_customer_reply", "description": (
-        "PRACTICE chat with a pretend owner, step by step: Kelvin writes what the owner says ('customer: Axon 650sf'; "
-        "'customer: rent' = the same owner's next answer; 'new customer: ...' = a different owner -> new_customer). "
-        "Returns 3 drafts for Kelvin's next message; while something is missing they ask only that. Once all is "
-        "known it checks PropertyGuru & iProperty live (about a minute) and returns the 5 lowest prices (fake "
-        "marked), the lowest real for that size and a suggested price. Show any prices given and the 3 drafts "
-        "numbered 1-3 exactly as given. Drafts only - nothing is sent."),
-        "parameters": {"type": "object", "properties": {"message": {"type": "string"},
-                                                        "new_customer": {"type": "boolean"}},
-                       "required": ["message"]}}},
-    {"type": "function", "function": {"name": "pick_customer_reply", "description": (
-        "Kelvin chose the best draft of the last practice ('2 is best', 'pick 1') or wrote his own better reply - "
-        "saved so later drafts sound like him."), "parameters": {"type": "object", "properties": {
-            "number": {"type": "integer"}, "own_text": {"type": "string"}}}}},
     {"type": "function", "function": {"name": "call_progress", "description": (
         "Today's ipline AI calls (单任务外呼): numbers left, on the line now, called today, finished or not, "
         "ipline's message. Read only - calls are started / stopped by Kelvin himself on ipline, never by you."),
@@ -389,38 +375,6 @@ def _blasts():
                     "sent": sent, "failed": sum(1 for r in res.values() if r.get("status") != "sent"),
                     "to_go": len(j["numbers"]) - len(res), "state": wa_blast.state_of(j)})
     return out or {"result": "no blasts"}
-
-
-def _practice(message, new_customer=False):
-    import customer_reply
-    db = _db()
-    chats = customer_reply.load(db)["chats"]
-    last = chats[-1] if chats else None
-    same = last and not new_customer and time.time() - last.get("at", 0) < 6 * 3600
-    c = customer_reply.analyse(db, re.sub(r"^\s*(new\s+)?customer\s*:\s*", "", message, flags=re.I),
-                               chat_id=last["id"] if same else None)
-    m = c.get("market") or {}
-    out = {"still_missing": c.get("missing"), "drafts": c.get("options")}
-    if not c.get("missing") and m:  # price facts only once everything is known
-        out.update(building=m.get("property"), rent_or_sale=m.get("kind"),
-                   five_lowest=[f"RM{u['price']:,}" + (" fake/bait" if u["fake"] else "") for u in m.get("five") or []],
-                   lowest_real_for_size=m.get("lowest_real"), typical=m.get("typical"), suggested=m.get("suggested"))
-    return out
-
-
-def _practice_pick(number=None, own_text=None):
-    import customer_reply
-    db = _db()
-    chats = customer_reply.load(db)["chats"]
-    if not chats:
-        return {"error": "no practice yet"}
-    c = chats[-1]
-    text = own_text or ((c.get("options") or [])[number - 1] if number and 0 < number <= len(c.get("options") or [])
-                        else None)
-    if not text:
-        return {"error": "which one? 1, 2 or 3 - or his own words"}
-    customer_reply.pick(db, c["id"], text)
-    return {"ok": True, "saved_as_his_style": text}
 
 
 def _blast_control(blast_id=None, action="run"):
@@ -877,7 +831,7 @@ def _tidy(text):
 
 HIS_DATA = {"whatsapp_listings", "find_saved_listing", "search_pg_listings", "condo_price", "propertyguru_posts",
             "propertyguru_overview", "ai_call_results", "blast_status", "leads_today", "google_maps_results",
-            "call_progress", "practice_customer_reply"}
+            "call_progress"}
 
 
 def _made_up(text, real, prices=True):
@@ -989,7 +943,6 @@ def reply(history, send, send_photos=None):
         "list_tasks": lambda: st["tasks"], "whatsapp_listings": lambda days=1: _listings(days),
         "scan_listing_group": lambda days=1: _scan(days, send), "blast_status": _blasts,
         "call_progress": lambda: __import__("ai_call_watch").progress(),
-        "practice_customer_reply": _practice, "pick_customer_reply": _practice_pick,
         "blast_control": lambda action, blast_id=None: _blast_control(blast_id, action),
         "condo_price": lambda name: bot_brain.condo_price(name), "propertyguru_posts": lambda day: _posts(day),
         "leads_today": lambda: {"count": len(leads_today()), "places": [r["place"] for r in leads_today()][:15]},

@@ -1,8 +1,9 @@
 """Smart reply: your rules "when the customer ... -> reply ...". In the WhatsApp chats window the reply whose rule
 fits the customer's latest message shows as a button above the message box - you tap it, change it if you like and
-press send yourself. Nothing is ever sent by itself.
+press send yourself. reply_approval.py WhatsApps it to you for an "ok", or sends it by itself when "auto" is on.
 
-Rules: Supabase storage owner-photos/data/smart_reply.json, edited on the AI Chat bot page -> "Smart reply".
+Rules + auto switch: Supabase storage owner-photos/data/smart_reply.json, edited on the AI Chat bot page ->
+"Smart reply".
 """
 import json
 import re
@@ -20,20 +21,34 @@ DEFAULT = [
 ]
 
 
-def load(db):
+def _read(db):
     try:
-        rules = json.loads(db.storage.from_(BUCKET).download(PATH)).get("rules")
+        return json.loads(db.storage.from_(BUCKET).download(PATH))
     except Exception:
-        rules = None
+        return {}
+
+
+def load(db):
+    rules = _read(db).get("rules")
     return rules if rules is not None else [dict(r) for r in DEFAULT]
 
 
-def save(db, rules):
-    rules = [{"when": r["when"].strip(), "reply": r["reply"].strip()} for r in rules
-             if (r.get("when") or "").strip() and (r.get("reply") or "").strip()]
-    db.storage.from_(BUCKET).upload(PATH, json.dumps({"rules": rules}, ensure_ascii=False).encode(),
+def auto_on(db):
+    """Auto send on? Then the fitting reply goes to the customer by itself (reply_approval.py), no "ok" needed."""
+    return bool(_read(db).get("auto"))
+
+
+def save(db, rules=None, auto=None):
+    """Save the rules and/or the auto send switch (None = keep what's there)."""
+    d = _read(db)
+    if rules is not None:
+        d["rules"] = [{"when": r["when"].strip(), "reply": r["reply"].strip()} for r in rules
+                      if (r.get("when") or "").strip() and (r.get("reply") or "").strip()]
+    if auto is not None:
+        d["auto"] = bool(auto)
+    db.storage.from_(BUCKET).upload(PATH, json.dumps(d, ensure_ascii=False).encode(),
                                     {"content-type": "application/json", "upsert": "true"})
-    return rules
+    return d.get("rules") if d.get("rules") is not None else [dict(r) for r in DEFAULT]
 
 
 def suggest(rules, msgs):
