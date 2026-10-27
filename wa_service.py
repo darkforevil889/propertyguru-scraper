@@ -408,9 +408,13 @@ class Api(BaseHTTPRequestHandler):
             self._send(500, {"error": str(e)})
 
 
+class OwnPort(ThreadingHTTPServer):
+    allow_reuse_address = False  # on Windows reuse lets a second copy "bind" the same port and overwrite .token
+
+
 if __name__ == "__main__":
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", PORT), Api)
+        server = OwnPort(("127.0.0.1", PORT), Api)
     except OSError:
         print(f"wa_service already running on {PORT} - this copy exits", flush=True)
         sys.exit(0)

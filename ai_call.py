@@ -218,26 +218,10 @@ def hear_person(ip, turns):
             t[field] = " ".join(got[id(t)])
 
     audio = buf.getvalue()
+    # ONE Groq hearing (Whisper works out the language itself) - the separate forced Chinese / Malay hearings were
+    # dropped 2026-10-28 to save the daily allowance; the judge writes what they said with an English translation.
     put_back(_whisper("person.wav", audio, "audio/wav", PERSON_HINT), "heard")
-    # The same clips heard as Chinese: with the English hint a Chinese answer comes out as English-sounding nonsense
-    # ("Boleh boleh" / "有,在哪里的?" heard as "Hampshire resident?"). The hint has no answer words - forced to
-    # Chinese, Whisper sometimes just repeats its hint back, and those lines are dropped.
-    try:
-        zh = [s for s in _whisper("person.wav", audio, "audio/wav", ZH_HINT, "zh") if not ZH_ECHO.search(s["text"])]
-        put_back(zh, "heard_zh")
-    except DailyLimit:
-        raise
-    except Exception:
-        pass  # the English hearing is enough to go on
-    # ... and as Malay: left to itself Whisper often writes a Malay answer as English look-alikes
-    try:
-        ms = [s for s in _whisper("person.wav", audio, "audio/wav", MS_HINT, "ms") if not MS_ECHO.search(s["text"])]
-        put_back(ms, "heard_ms")
-    except DailyLimit:
-        raise
-    except Exception:
-        pass
-    # A third hearing on this PC (Qwen3-ASR, local_asr.py): a different speech model, so it catches what Whisper
+    # A second hearing on this PC (Qwen3-ASR, local_asr.py): a different speech model, so it catches what Whisper
     # misses - it keeps Chinese and Malay answers in their own language. Not needed when Qwen already did the two above.
     import local_asr
     if not _LOCAL and local_asr.available():
@@ -248,12 +232,8 @@ def hear_person(ip, turns):
             print("hearing on this PC skipped:", str(e)[:150], flush=True)
 
 
-ZH_HINT = "马来西亚的一通房产电话，这是接电话的人说的话。"
 # No answer words for Qwen: with PERSON_HINT's Malay examples it turned a Chinese answer into Malay
 LOCAL_HINT = "Answers on a phone call in Malaysia about selling or renting property. English, Malay, Mandarin or Cantonese."
-ZH_ECHO = re.compile(r"问：|回答：|房产电话|接电话的人")
-MS_HINT = "Panggilan telefon di Malaysia tentang hartanah. Ini kata-kata orang yang menjawab panggilan."
-MS_ECHO = re.compile(r"panggilan telefon|kata-kata orang|menjawab panggilan", re.I)
 
 
 # Greetings / goodbyes say nothing about interest - left out of what the dashboard shows

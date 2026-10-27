@@ -94,12 +94,13 @@ def watch(tell, is_owner, log=print):
                 if now - rules["at"] > 60:
                     db = bot_brain._db()
                     rules.update(at=now, rules=smart_reply.load(db), auto=smart_reply.auto_on(db))
-                reply = (smart_reply.suggest(rules["rules"], msgs) or [None])[0]
-                if not reply:
+                got = smart_reply.suggest_full(rules["rules"], msgs)
+                if not got:
                     continue
+                reply = got["reply"]
                 said = " / ".join(m["text"] or f"[{m['kind']}]" for m in msgs[-3:] if not m["me"])[-200:]
                 name = c["name"] or f"+{c['phone']}"
-                if rules["auto"] and _auto_ok(s, c, reply, msgs, now):
+                if rules["auto"] and not got["needs_kelvin"] and _auto_ok(s, c, reply, msgs, now):   # prices / dates / unsure: asks you
                     res = wa_client.send(c["send_to"], reply)
                     s["items"].append({"n": 0, "jid": c["jid"], "send_to": c["send_to"], "name": name, "said": said,
                                        "reply": reply, "at": now, "done": now,

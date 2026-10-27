@@ -204,7 +204,10 @@ def is_owner_chat(chat, phone):
         if chat not in known:
             OWNER_CHATS.write_text(json.dumps(sorted(known | {chat})))
         return True
-    return chat in known
+    if phone and chat in known:  # the number IS known and it isn't yours: a wrongly saved id - forget it (once let Ben in)
+        OWNER_CHATS.write_text(json.dumps(sorted(known - {chat})))
+        return False
+    return chat in known and not phone   # only when WhatsApp didn't say whose number it is
 
 
 def send_photos(jid, photos):
@@ -356,9 +359,13 @@ class Api(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
 
+class OwnPort(ThreadingHTTPServer):
+    allow_reuse_address = False  # on Windows reuse lets a second copy "bind" the same port and overwrite .token
+
+
 if __name__ == "__main__":
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", PORT), Api)
+        server = OwnPort(("127.0.0.1", PORT), Api)
     except OSError:
         print(f"wa_bot already running on {PORT} - this copy exits", flush=True)
         sys.exit(0)

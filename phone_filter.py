@@ -80,17 +80,30 @@ def read_tables(filename, data):
     return list(sheets.values())
 
 
+def cells(filename, data):
+    """Every cell of an Excel / CSV file, or every text line of a PDF / picture (read by OCR when scanned)."""
+    ext = Path(filename).suffix.lower()
+    if ext == ".txt":
+        return data.decode("utf-8", "replace").splitlines()
+    if ext in (".pdf", ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"):
+        import phone_ocr  # PDF text / OCR - the OCR part needs the PC's extra packages (requirements-local.txt)
+        return phone_ocr.text_lines(filename, data)[0]
+    return [v for table in read_tables(filename, data) for v in table.to_numpy().ravel()]
+
+
 def filter_file(filename, data):
     """Return (numbers in first-seen order, rejected list of (raw, reason), duplicate count)."""
     seen, numbers, rejected, dupes = set(), [], [], 0
-    for table in read_tables(filename, data):
-        for value in table.to_numpy().ravel():
-            for num, reason, raw in extract_from_text(value):
-                if num is None:
-                    rejected.append((raw, reason))
-                elif num in seen:
-                    dupes += 1
-                else:
-                    seen.add(num)
-                    numbers.append(num)
+    scanned = Path(filename).suffix.lower() not in (".xlsx", ".xls", ".csv", ".txt")
+    for value in cells(filename, data):
+        for num, reason, raw in extract_from_text(value):
+            if num is None:
+                if scanned and len(re.sub(r"\D", "", str(raw))) < 6:
+                    continue  # row numbers, unit numbers, dates on a printed page - not phone attempts
+                rejected.append((raw, reason))
+            elif num in seen:
+                dupes += 1
+            else:
+                seen.add(num)
+                numbers.append(num)
     return numbers, rejected, dupes

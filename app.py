@@ -1,4 +1,5 @@
 """Streamlit dashboard for scraped listings. Run: streamlit run app.py"""
+import contextlib
 import io
 import os
 import re
@@ -23,14 +24,55 @@ st.set_page_config(page_title="KL Tracker", page_icon="🏙️", layout="wide")
 
 # ---------- login ----------
 # "Keep me logged in": the Supabase refresh token is kept in a browser cookie for 30 days. Supabase refresh
-# tokens are single-use, so every time it changes the cookie is rewritten in the same page run.
+# tokens are single-use - and using one twice makes Supabase cancel the whole login (logged out everywhere). Two
+# tabs, or a reconnect, each renewing their own copy did exactly that. So one login is shared on the server: every
+# token it has had points to the same client, renewals happen one at a time, and the cookie gets the current token
+# on every page run.
 COOKIE = "kt_session"
 COOKIE_DAYS = 30
 
 
 def new_client():
-    # No background token refresh: refreshes happen during page runs, so the cookie is always updated with them
+    # Renewed by keep_fresh() below (not supabase's own timer), so every new token is registered for the other tabs
     return create_client(SUPABASE_URL, SUPABASE_KEY, options=ClientOptions(auto_refresh_token=False))
+
+
+@st.cache_resource
+def logins():
+    """Server-wide: refresh token -> the shared client of that login, plus the lock renewals take turns on."""
+    import threading
+    return {"by_token": {}, "lock": threading.Lock(), "renewing": set()}
+
+
+def register(client):
+    """The client's session (renewed first if it's about to run out); its token now leads back to this client.
+    Call with logins()["lock"] held."""
+    sess = client.auth.get_session()
+    if sess:
+        logins()["by_token"][sess.refresh_token] = client
+    return sess
+
+
+def keep_fresh(client):
+    """Renew the login in the background before it runs out, so pages that refresh by themselves (WhatsApp chats,
+    progress boxes) keep working without a full page run. Stops once logged out."""
+    import threading
+    import time as _time
+    L = logins()
+    if id(client) in L["renewing"]:
+        return
+    L["renewing"].add(id(client))
+
+    def loop():
+        while any(c is client for c in list(L["by_token"].values())):
+            _time.sleep(30)
+            try:
+                with L["lock"]:
+                    register(client)
+            except Exception:
+                pass  # network blip - next round
+        L["renewing"].discard(id(client))
+    threading.Thread(target=loop, daemon=True).start()
 
 
 def write_cookie(value, days=COOKIE_DAYS):
@@ -50,12 +92,11 @@ def flush_cookie():
 
 
 def remember(client):
-    """Save the current refresh token to the cookie if it changed (or forget it if 'keep me logged in' is off)."""
-    if not st.session_state.get("keep_login", True):
-        return
-    sess = client.auth.get_session()  # also refreshes an expired access token
-    if sess and sess.refresh_token != st.session_state.get("cookie_token"):
-        st.session_state.cookie_token = sess.refresh_token
+    """Put the current refresh token in the cookie - on every page run, so a write the browser missed (the page
+    moved on before it ran) is made good next time (or forget it if 'keep me logged in' is off)."""
+    with logins()["lock"]:
+        sess = register(client)  # also renews a login that's about to run out
+    if sess and st.session_state.get("keep_login", True):
         write_cookie(sess.refresh_token)
 
 
@@ -64,13 +105,21 @@ def restore_from_cookie():
     if not token or st.session_state.get("logged_out") or st.session_state.get("cookie_tried"):
         return
     st.session_state.cookie_tried = True
-    client = new_client()
-    try:
-        res = client.auth.refresh_session(token)
-        st.session_state.client = client
-        st.session_state.email = res.user.email if res.user else ""
-    except Exception:
-        write_cookie("", days=0)  # expired / already used - forget it, show the login form
+    L = logins()
+    with L["lock"]:
+        client = L["by_token"].get(token)  # this login is already open (another tab / before a reconnect)
+        if client is None:
+            client = new_client()
+            try:
+                client.auth.refresh_session(token)
+            except Exception:
+                write_cookie("", days=0)  # expired / already used - forget it, show the login form
+                return
+            L["by_token"][token] = client  # a tab still holding this (now used) token gets this login too
+        sess = register(client)
+    keep_fresh(client)
+    st.session_state.client = client
+    st.session_state.email = sess.user.email if sess and sess.user else ""
 
 
 def login_screen():
@@ -83,6 +132,9 @@ def login_screen():
             client = new_client()
             try:
                 client.auth.sign_in_with_password({"email": email, "password": password})
+                with logins()["lock"]:
+                    register(client)
+                keep_fresh(client)
                 st.session_state.update(client=client, email=email, keep_login=keep, logged_out=False)
                 st.rerun()
             except Exception as e:
@@ -107,6 +159,9 @@ with st.sidebar:
             db.auth.sign_out()
         except Exception:
             pass
+        L = logins()
+        with L["lock"]:
+            L["by_token"] = {k: c for k, c in L["by_token"].items() if c is not db}  # also ends keep_fresh
         for k in ("client", "cookie_token"):
             st.session_state.pop(k, None)
         st.session_state.logged_out = True
@@ -125,9 +180,11 @@ def phone_filter_page():
     from phone_filter import filter_file
 
     st.title("Phone filter")
-    st.caption("Upload one or more Excel or CSV files. Every cell on every sheet is scanned; only Malaysian mobile "
-               "numbers are kept, cleaned to 0XXXXXXXXX, with duplicates removed. Nothing is saved.")
-    uploads = st.file_uploader("Excel / CSV files", type=["xlsx", "xls", "csv"], accept_multiple_files=True)
+    st.caption("Upload Excel / CSV files, PDFs or photos of a phone list. Every cell (or every line of the PDF / photo) is "
+               "scanned; only Malaysian mobile numbers are kept, cleaned to 0XXXXXXXXX, with duplicates removed. "
+               "Scanned PDFs and photos are read by OCR on this PC (free, offline). Nothing is saved.")
+    uploads = st.file_uploader("Excel / CSV / PDF / photos", type=["xlsx", "xls", "csv", "txt", "pdf", "jpg", "jpeg", "png", "webp"],
+                               accept_multiple_files=True)
     if not uploads:
         with st.expander("What gets kept and removed"):
             st.markdown(
@@ -141,7 +198,12 @@ def phone_filter_page():
     results, used_names = [], set()
     for up in uploads:
         try:
-            numbers, rejected, dupes = filter_file(up.name, up.getvalue())
+            slow = up.name.lower().endswith(("pdf", "jpg", "jpeg", "png", "webp"))  # may need OCR: show it's working
+            with st.spinner(f"Reading {up.name}…") if slow else contextlib.nullcontext():
+                numbers, rejected, dupes = filter_file(up.name, up.getvalue())
+        except ImportError:  # online copy: no OCR packages there
+            st.error(f"{up.name}: PDFs and photos are read on the PC version of KL Tracker (the OCR runs on the PC).")
+            continue
         except Exception as e:
             st.error(f"Couldn't read {up.name}: {e}")
             continue
@@ -2127,6 +2189,8 @@ def ai_call_page():
     df["malay"] = [ai_call.after_q1(t, "heard_ms") if isinstance(t, list) else "" for t in turns_col]
     df["pc"] = [ai_call.after_q1(t, "heard_local") if isinstance(t, list) else "" for t in turns_col]
     df["said"] = df.said.map(ai_call.clean_said)
+    # one column: what they said in their own words (+ English in brackets), else the best single hearing
+    df["heard_one"] = [s or e or c or ip for s, e, c, ip in zip(df.said, df.english, df.chinese, df.ipline_said)]
     df["ai_want"] = df.verdict == "interested"
     df["keep"] = [ticks.get(i, w) for i, w in zip(df.call_id, df.ai_want)]
     df["reviewed"] = df.call_id.isin(ticks.keys())
@@ -2167,8 +2231,7 @@ def ai_call_page():
     table = pd.DataFrame({
         "✔ Keep": view.keep.map({True: "✅", False: "⬜"}).values, "Phone": view.phone.values,
         "AI says": view.ai_want.map({True: "✅ Want", False: "❌ Fake"}).values,
-        "English": view.english.values, "Chinese": view.chinese.values, "Malay": view.malay.values,
-        "My PC": view.pc.values, "ipline": view.ipline_said.values, "Why": view.reason.values,
+        "Heard": view.heard_one.values, "My PC": view.pc.values, "ipline": view.ipline_said.values, "Why": view.reason.values,
         "Called": view.called.values, "Sec": view.seconds.values,
         "Checked by me": view.reviewed.map({True: "✔", False: ""}).values})
     st.caption("👆 Click a **number** (or anywhere on its row) to listen to that call · click the **✔ Keep** box "
@@ -2240,7 +2303,7 @@ def ai_call_page():
         st.session_state.aicall_box = ids[0] if ids else None
     labels = {i: f"{p} · {c} · {'✅ Want' if w else '❌ Fake'} · {s[:60]}"  # all at once (one lookup per call was slow)
               for i, p, c, w, s in zip(view.call_id, view.phone, view.called, view.ai_want,
-                                       [e or z or ip for e, z, ip in zip(view.english, view.chinese, view.ipline_said)])}
+                                       view.heard_one)}
     pick = st.selectbox("Call", ids, key="aicall_box", format_func=labels.get)
     jump = st.session_state.pop("aicall_scroll", False)
     if pick:
@@ -2256,22 +2319,14 @@ def ai_call_page():
         if st.toggle("✔ Keep this number", value=keep_this, key=f"aicall-keep-{pick}") != keep_this:
             save_ticks({pick: not keep_this})
             st.rerun()
-        st.caption("Several hearings of the same call - phone lines blur similar words, so they can differ. "
-                   "The AI goes by what they agree on; the recording above is the real thing.")
-        l1, l2, l3 = st.columns(3)
-        l1.markdown("**Groq · English**")
-        l1.text(r.heard or "(nothing)")
-        l2.markdown("**Groq · Chinese**")
-        l2.text(r.chinese.replace(" / ", "\n") if r.chinese else "(not heard as Chinese)")
-        l3.markdown("**Groq · Malay**")
-        l3.text(r.malay.replace(" / ", "\n") if r.malay else "(not heard as Malay)")
-        l4, l5, l6 = st.columns(3)
-        l4.markdown("**My PC (Qwen)**")
-        l4.text(r.pc.replace(" / ", "\n") if r.pc else "(not heard on the PC)")
-        l5.markdown("**ipline's own text**")
-        l5.text(r.ipline or "(nothing)")
-        l6.markdown("**Why**")
-        l6.text(f"{'✅ Want' if r.ai_want else '❌ Fake'} - {r.reason}\n\nWhole recording, re-heard:\n{r.full or '(nothing)'}")
+        l1, l2, l3 = st.columns(3)   # three hearings side by side to compare
+        l1.markdown("**Heard** (their words, English in brackets)")
+        l1.text((r.heard_one or "(nothing clear)").replace(" / ", "\n"))
+        l2.markdown("**My PC (Qwen)**")
+        l2.text(r.pc.replace(" / ", "\n") if r.pc else "(not heard on the PC)")
+        l3.markdown("**ipline's own text**")
+        l3.text(r.ipline or "(nothing)")
+        st.caption(f"Why: {'✅ Want' if r.ai_want else '❌ Fake'} - {r.reason}")
     if jump:  # scroll the page down to this section
         st.iframe("<script>setTimeout(() => {const el = window.parent.document.getElementById('aicall-listen');"
                   "if (el) el.scrollIntoView({behavior: 'smooth', block: 'start'});}, 300);</script>", height=1)
